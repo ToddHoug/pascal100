@@ -13,6 +13,7 @@
 #   cheatsheet.md            the quick reference as plain text, for the AI assistant to read
 #   LICENSE                  ours (MIT)
 #   LICENSE-SDL3             SDL3's, because SDL3 is linked STATICALLY INTO the program
+#   LICENSE-CLK              Clock Signal's (third_party/clk), the 8088 code compiled into it
 #   examples/cpm22/          \
 #   examples/cpm86/           |
 #   examples/cpm8-16/         |  the examples, each a self-contained folder: a machine file

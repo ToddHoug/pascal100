@@ -159,6 +159,7 @@ FILE  DRIVING-WITH-AI.md   <=  docs/DRIVING-WITH-AI.md
 FILE  cheatsheet.md        <=  docs/manual/ref/cheatsheet.md
 FILE  LICENSE              <=  LICENSE
 FILE  LICENSE-SDL3         <=  LICENSE-SDL3
+FILE  LICENSE-CLK          <=  third_party/clk/LICENCE
 
 # The cheatsheet ALSO ships as a rendered PDF, pascal100-cheatsheet.pdf -- the same content a
 # person can open in a file manager. It is NOT a FILE line: like pascal100-manual.pdf and
@@ -171,6 +172,10 @@ FILE  LICENSE-SDL3         <=  LICENSE-SDL3
 # There is no library beside the program to point at; this file is the only notice the
 # package carries. It was harmless to omit while every shipped binary was headless, and it
 # stopped being harmless the moment one was not.
+
+# LICENSE-CLK is the MIT licence of Clock Signal (CLK, Thomas Harte). pascal100's 8088 is CLK's
+# x86 instruction set, compiled into the binary (third_party/clk), so its notice ships for the
+# same reason as SDL3's.
 
 # ---------------------------------------------------------------------------
 # TOKENS -- a machine/media reference, no longer written into prose.
