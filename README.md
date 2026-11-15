@@ -145,6 +145,9 @@ removes the Altair bus, the Altair machines and the boards that have no use here
 Pascal-100 card with its two processors, the MicroEngine P-machine and IEEE 696 extended
 addressing. Fixes to boards and processor cores in altairsim come into pascal100 by cherry-pick.
 
+In the files of release 0.1.0, an issue or pull request number such as `#543` refers to
+[deltecent/altairsim](https://github.com/deltecent/altairsim/issues), not to this repository.
+
 The 8088 of the CompuPro CPU 8085/88 uses the x86 instruction set of
 **[Clock Signal](https://github.com/TomHarte/CLK)** (CLK) by Thomas Harte, under the MIT License.
 The code is in `third_party/clk`, with its license and a list of our changes.
