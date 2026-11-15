@@ -1,0 +1,39 @@
+# CompuPro CP/M 2.2N on the IEEE 696 bus, with 128K of 16-bit memory in two segments.
+#
+# The memory is set up like the user's CompuPro RAM 23 (128K x 8 / 64K x 16, board 235,
+# 1984): a board that compares A17-A23 with switch S1 and uses A16 inside to pick one of
+# its two 64K halves, and answers SIXTN* for a word whenever it is selected and the master
+# asserts sXTRQ*. On the bus that is the same as two 64K boards at segments 00 and 01, each
+# `sixteen_bit`, which is how it is built here. (Documentation/CompuPro/CompuPro RAM23 Manual.pdf.)
+#
+# The Z80 makes byte cycles only, so CP/M runs in segment 00 exactly as on the 64K machine;
+# segment 01 is reached by physical cycles (memReadX, the monitor in Task 4, a DMA address
+# above 64K) and, in Stage 4, by the Pascal-100's map.
+#
+# Stage 2, Task 3 test machine: tests/acceptance/ieee696.cmake boots it; test_ieee696.cpp
+# loads it.
+#
+#     cd tests/media/ieee696 && pascal100 cpm22n-seg128k.toml
+
+[machine]
+base = "../compupro/cpm22n.toml"
+name = "ieee696-seg128k"
+bus  = "ieee696"
+
+# The low 64K: the base's memory board, now decoding A16-A23 (segment 00 only), 16-bit.
+[[board]]
+id          = "mem0"
+ext         = true
+sixteen_bit = true
+
+# The high 64K: segment 01 (010000-01FFFF), 16-bit.
+[[board]]
+type        = "memory"
+id          = "mem1"
+fill        = "random"
+ext         = true
+sixteen_bit = true
+  [[board.region]]
+  type = "ram"
+  at   = 010000
+  size = "64K"

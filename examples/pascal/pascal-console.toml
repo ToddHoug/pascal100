@@ -1,0 +1,60 @@
+# UCSD Pascal III.0 on the Digicomp Pascal-100, on the terminal where you start the program.
+#
+#     cd examples/pascal && pascal100 pascal-console.toml
+#     -> Pascal starts: "Welcome WORK, to U.C.S.D. Pascal System III.0", then the Command: line.
+#
+# THIS FILE IS THE WHOLE MACHINE. It is the same machine and the same disk as pascal.toml. Only
+# the console is different: channel A of the Interfacer 1 stays on `console`, your stdio. Use
+# this file on a build with no window, or with a VT52 terminal of your own (CONNECT if1:a pty,
+# then open the name that it prints in your terminal program).
+#
+# THE SCREEN CODES are VT52. A terminal that is not set to VT52 shows the Command: line, but it
+# cannot draw the screen of the editor.
+
+[machine]
+name    = "pascal-console"
+bus     = "ieee696"          # IEEE 696 (S-100); the Pascal-100 Map drives A16
+startup = ["RUN 0"]
+
+# THE PASCAL-100 card: a Z80 and the WD MicroEngine (docs/boards/digicomp-pascal100.md).
+[[board]]
+type     = "pascal100"
+id       = "cpu0"
+clock_hz = 0
+
+# THE CONSOLE: channel A of an Interfacer 1 at 00-01, on your stdio. Channel B at 02-03 is not
+# connected.
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "console"
+
+[console]
+bsdel = "bs"
+
+# THE DISK 1 at C0, boot routine 4.
+[[board]]
+type = "disk1"
+id   = "fd0"
+port = C0
+
+  [[board.drive]]
+  unit  = 0
+  mount = "pascal-dd.dsk"
+
+# THE MEMORY: 128K of static RAM on one board, 000000-01FFFF, as in the real machine (a
+# CompuPro RAM 23).
+[[board]]
+type           = "memory"
+id             = "mem0"
+fill           = "random"
+honors_phantom = "read"
+ext            = true
+sixteen_bit    = true
+
+  [[board.region]]
+  type = "ram"
+  at   = 000000
+  size = "128K"

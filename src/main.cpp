@@ -1,0 +1,582 @@
+#include "boards/mits-2sio.h"
+#include "boards/mits-88c700.h"
+#include "boards/gsio.h"
+#include "boards/io4.h"
+#include "boards/compupro-interfacer1.h"
+#include "boards/compupro-interfacer3.h"
+#include "boards/compupro-interfacer4.h"
+#include "boards/compupro-disk1.h"
+#include "boards/compupro-ss1.h"
+#include "boards/terminal-font.h"
+#ifdef PASCAL100_ENABLE_SDL
+#include "host/display_sdl.h"
+#else
+#include "host/display_null.h"
+#endif
+#include "cli/monitor.h"
+#include "config/toml.h"
+#include "core/debuglog.h"
+#include "core/machine.h"
+#include "core/machines.h"
+#include "core/version.h"
+#include "host/console.h"
+#include "host/endpoint.h"
+#include "host/cardimg.h"
+#include "host/media.h"
+#include "platform/home.h"
+#include "host/terminal/emulator.h"
+#include "host/terminal/stream.h"
+#include "host/agent_tap.h"
+#include "mcp/server.h"
+#include "platform/pty.h"
+
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace altair;
+
+// The host video service for any graphics board in the machine (DESIGN.md 7.4).
+// A real window where SDL3 was found; a no-op headless otherwise -- the boards run
+// the same against either. Session-lifetime, so it outlives every Machine.
+#ifdef PASCAL100_ENABLE_SDL
+static SdlDisplay g_display;
+#else
+static NullDisplay g_display;
+#endif
+
+// Version AND the commit it was built from (core/version.h). Most binaries in
+// existence are between releases -- a CI artifact, a local build, one mailed to
+// somebody -- and a bare "0.1.0" names them all the same, so a report against one
+// cannot be traced back to the source that made it.
+static const char* kVersion = versionString();
+
+// The machine you get when you name none: the working directory's, if it has one.
+// See the comment on the fallback in main() for why this is the ONLY file the
+// simulator ever finds rather than is given.
+static const char* kCwdConfig = "./pascal100.toml";
+
+static void usage(std::ostream& o) {
+    o << kVersion << " -- a Digicomp Pascal-100 and IEEE 696 (S-100) simulator\n"
+         "\n"
+         "usage: pascal100 [machine] [options]\n"
+         "\n"
+         "  machine            a built-in name (pascal100, disk1), or a config file if it\n"
+         "                     has a '/' in it or ends in .toml. Omitted: ./pascal100.toml\n"
+         "                     if the working directory has one, else `default`.\n"
+         "\n"
+         "  -m, --machine <n>  ALWAYS a built-in name -- never a file.\n"
+         "  -f, --file <path>  ALWAYS a file -- never a built-in name.\n"
+         "  -n, --none         empty backplane. No boards, no memory, nothing.\n"
+         "  -l, --list         list the built-in machines and exit.\n"
+         "\n"
+         "  -s, --script <f>   run a command script, then exit with its status. Paths in\n"
+         "                     it are relative to the script's folder.\n"
+         "  -x, --exec <cmd>   run one monitor command (repeatable), then exit.\n"
+         "  -i, --interactive  after --script/--exec, stay in the monitor.\n"
+         "      --set <text>   change a setting for this run, before the machine's startup\n"
+         "                     commands (repeatable). The text is what follows SET at the\n"
+         "                     prompt: --set \"cpu0 clock_hz=2000000\".\n"
+         "                     -s, -x, -i and --set cannot be used with --mcp.\n"
+         "\n"
+         "  An interactive launch first runs ~/pascal100.ini if it exists -- monitor commands,\n"
+         "  one per line, for settings such as SET CONSOLE DEBUG. --mcp, -s and -x skip it.\n"
+         "\n"
+         "      --mcp          MCP server on stdio (for Claude).\n"
+         "      --mirror <sink>  with --mcp: mirror the console so a person can watch and\n"
+         "                     take over. socket:PORT (telnet in), or on macOS and Linux\n"
+         "                     pty or pty:LINK (open the link with a terminal program), or\n"
+         "                     serial:DEVICE[?baud=N] (a terminal on a real port, 9600 baud\n"
+         "                     8N1 by default). Add ?ro for watch-only.\n"
+         "      --log <file>   with --mcp: write what the guest prints to a text file, as\n"
+         "                     it prints it. An ordinary file; starts empty each run.\n"
+         "  -v, --version      print the version and exit.\n"
+         "  -h, --help         print this help and exit.\n";
+}
+
+static void list(std::ostream& o) {
+    o << "built-in machines:\n\n";
+    size_t w = 0;
+    for (const auto& b : builtinMachines()) w = std::max(w, std::string(b.name).size());
+    for (const auto& b : builtinMachines()) {
+        o << "  " << b.name;
+        for (size_t i = std::string(b.name).size(); i < w + 2; ++i) o << ' ';
+        o << b.blurb << "\n";
+    }
+    o << "\nA built-in is a TOML file that lives in the binary -- the same format you\n"
+         "would write yourself. `pascal100 -x 'SHOW MACHINE' <name>` shows what is in one.\n";
+}
+
+int main(int argc, char** argv) {
+    std::vector<std::string> a(argv + 1, argv + argc);
+
+    bool mcp = false, none = false, interactive = false;
+    std::string script;
+    std::string mirror;  // --mirror socket:PORT[?ro]: a live console mirror (issue #381)
+    std::string log;     // --log FILE: a text transcript of the console under --mcp (#666)
+    std::vector<std::string> exec;
+    std::vector<std::string> sets;  // --set "<id> <key>=<value>": a SET before `startup` (#736)
+
+    // Three ways in, and only one of them guesses. `positional` is the friendly
+    // form, resolved by looksLikeFile(); -m and -f are the escape hatches and
+    // are never resolved at all.
+    std::string positional, builtin, file;
+
+    auto need = [&](size_t& i, const char* what) -> bool {
+        if (i + 1 >= a.size()) {
+            std::cerr << a[i] << " needs " << what << "\n";
+            return false;
+        }
+        ++i;
+        return true;
+    };
+
+    for (size_t i = 0; i < a.size(); ++i) {
+        // An option name is a word the operator typed, so `--MCP` is `--mcp`. `s` itself
+        // stays as given: a machine name or a file path is not ours to fold.
+        const std::string& given = a[i];
+        const std::string  s     = given.size() > 1 && given[0] == '-' ? lowerAscii(given) : given;
+        if (s == "-h" || s == "--help") {
+            usage(std::cout);
+            return 0;
+        } else if (s == "-v" || s == "--version") {
+            std::cout << kVersion << "\n";
+            return 0;
+        } else if (s == "-l" || s == "--list") {
+            list(std::cout);
+            return 0;
+        } else if (s == "--mcp") {
+            mcp = true;
+        } else if (s == "--mirror") {
+            if (!need(i, "a sink (--mirror socket:2323, --mirror pty or --mirror serial:DEVICE)"))
+                return 2;
+            // Accept a bare port for convenience: `--mirror 2323` is `socket:2323`.
+            // `pty` and `pty:LINK` name the pseudo-terminal sink, and `serial:DEVICE` a real
+            // port (issue #683).
+            const std::string m = canonicalEndpoint(a[i]);
+            mirror              = isMirrorSink(m) ? m : "socket:" + m;
+        } else if (s == "--log") {
+            if (!need(i, "a file (--log session.log)")) return 2;
+            log = a[i];
+        } else if (s == "-n" || s == "--none") {
+            none = true;
+        } else if (s == "-i" || s == "--interactive") {
+            interactive = true;
+        } else if (s == "-m" || s == "--machine") {
+            if (!need(i, "a built-in name")) return 2;
+            builtin = a[i];
+        } else if (s == "-f" || s == "--file") {
+            if (!need(i, "a path")) return 2;
+            file = a[i];
+        } else if (s == "-s" || s == "--script") {
+            if (!need(i, "a script file")) return 2;
+            script = a[i];
+        } else if (s == "-x" || s == "--exec") {
+            if (!need(i, "a command")) return 2;
+            exec.push_back(a[i]);
+        } else if (s == "--set") {
+            if (!need(i, "a setting (--set \"cpu0 clock_hz=2000000\")")) return 2;
+            sets.push_back(a[i]);
+        } else if (s.size() > 1 && s[0] == '-') {
+            std::cerr << "unknown option " << given << "\nTry: pascal100 --help\n";
+            return 2;
+        } else {
+            if (!positional.empty()) {
+                // Nothing is resolved yet, so these are names, not machines: say what
+                // each one looks like (a name check -- looksLikeFile() never probes the
+                // disk), and how to get what the person most likely wanted.
+                auto kind = [](const std::string& n) {
+                    return looksLikeFile(n) ? "a machine file" : "a built-in name";
+                };
+                std::cerr << "Only one machine file or built-in name may be given on the "
+                             "command line.\nGiven: '"
+                          << positional << "' (" << kind(positional) << ") and '" << s << "' ("
+                          << kind(s) << ").\n";
+                const std::string* builtinArg = !looksLikeFile(positional) ? &positional
+                                                : !looksLikeFile(s)        ? &s
+                                                                           : nullptr;
+                if (builtinArg)
+                    std::cerr << "To start from a built-in and change it, put  base = \""
+                              << *builtinArg << "\"  under [machine] in the file.\n";
+                return 2;
+            }
+            positional = s;
+        }
+    }
+
+    // --mirror is a modifier on --mcp: it wraps the console the MCP tools drive so a
+    // person can telnet in and share the session. Without --mcp there is nothing to
+    // mirror -- the interactive console is a real terminal, and `CONNECT <u> <ep>|socket:
+    // PORT` in the monitor is the way to mirror that. Say so rather than ignore the flag.
+    if (!mirror.empty() && !mcp) {
+        std::cerr << "--mirror needs --mcp (it mirrors the console the MCP tools drive).\n"
+                     "Without --mcp, mirror a line from the monitor: CONNECT <u> <ep>|"
+                     "socket:PORT"
+                  << (altair::platform::havePty() ? " (or |pty, |serial:DEVICE)"
+                                                  : " (or |serial:DEVICE)")
+                  << "\n";
+        return 2;
+    }
+
+    // A pseudo-terminal mirror on a host that has none can never work, so it is refused
+    // here -- not left as a session that runs with no mirror and one line on stderr.
+    if (mirror.rfind("pty", 0) == 0 && !platform::havePty()) {
+        std::cerr << "--mirror pty is not available on Windows; use --mirror socket:PORT\n";
+        return 2;
+    }
+
+    // --log is the same kind of modifier: a transcript of the console the MCP tools drive.
+    // Without --mcp the console is the operator's own terminal, which already shows it.
+    if (!log.empty() && !mcp) {
+        std::cerr << "--log needs --mcp (it logs the console the MCP tools drive).\n"
+                     "Without --mcp, log a line from the monitor: CONNECT <u> <ep>|"
+                     "FILE?fmt=text\n";
+        return 2;
+    }
+
+    // -x, -s, -i AND --set ARE THE MONITOR'S, AND --mcp NEVER REACHES THE MONITOR: main() hands
+    // the machine to the server and returns from there. They were accepted and dropped -- a
+    // `-x "SET cpu0 clock_hz=2000000"` changed nothing, a script that did not exist was not
+    // reported, and the exit status was 0 (issue #737). An option that does nothing is
+    // refused, and before the --log file below is emptied for a session that will not start.
+    if (mcp && (!exec.empty() || !script.empty() || interactive || !sets.empty())) {
+        std::string given;
+        auto add = [&](bool on, const char* opt) {
+            if (!on) return;
+            if (!given.empty()) given += ", ";
+            given += opt;
+        };
+        add(!exec.empty(), "-x");
+        add(!script.empty(), "-s");
+        add(interactive, "-i");
+        add(!sets.empty(), "--set");
+        std::cerr << given << " cannot be used with --mcp (stdout is the JSON-RPC transport).\n"
+                              "An MCP client sends monitor commands with the `monitor` tool.\n";
+        return 2;
+    }
+
+    // START THE LOG EMPTY, ONCE, AND REFUSE NOW IF WE CANNOT. The MCP server re-binds its
+    // console after every CONFIG LOAD, so it opens this file to APPEND -- a truncating open
+    // there would wipe the session so far. That leaves the fresh start to be made here. And
+    // a path that cannot be written is said before the session starts: a person who asked
+    // for a log and tails an empty file would otherwise find out an hour in.
+    if (!log.empty()) {
+        std::ofstream probe(log, std::ios::out | std::ios::trunc | std::ios::binary);
+        if (!probe) {
+            std::cerr << "--log: cannot open '" << log << "' for writing\n";
+            return 2;
+        }
+    }
+
+    // Say which one you meant. Silently preferring one over another is how a
+    // person spends twenty minutes editing a config file that was never read.
+    int ways = (!positional.empty()) + (!builtin.empty()) + (!file.empty()) + (none ? 1 : 0);
+    if (ways > 1) {
+        std::cerr << "give ONE machine: a name, -m, -f, or -n -- not several.\n";
+        return 2;
+    }
+
+    // THE ONE FILE THE SIMULATOR FINDS RATHER THAN IS GIVEN -- and it is found only when
+    // the command line NAMES NOTHING.
+    //
+    // looksLikeFile() (core/machines.h) refuses to probe the disk, and the reason is
+    // load-bearing: `pascal100 default` must not become a different machine the day
+    // somebody saves a file called `default` next to it. A command line that changes
+    // meaning because of its surroundings is a trap. That argument holds for every
+    // command that names a machine -- and `pascal100`, alone, names none. It is not
+    // asking for `default`; it is asking for whatever machine is sensible here, and
+    // letting the directory answer that is the make(1) bargain rather than the trap.
+    //
+    // So the rule stays exact where it matters: `pascal100 basic4k` is basic4k in every
+    // directory on earth, and so is -m, -f and -n. Only the empty command line looks
+    // around. And it says so out loud -- see the notice below -- because the failure
+    // this can cause is spending twenty minutes on a machine you did not know you were
+    // running, which is the same thing the `give ONE machine` check above exists to stop.
+    bool discovered = false;
+
+    if (!positional.empty()) {
+        if (looksLikeFile(positional)) file = positional;
+        else builtin = positional;
+    } else if (ways == 0) {
+        if (std::ifstream(kCwdConfig)) {
+            file       = kCwdConfig;
+            discovered = true;
+        } else {
+            builtin = "default";  // no machine named, and none to hand: you get one anyway
+        }
+    }
+
+    // THE COMPOSITION ROOT. The monitor knows the endpoint grammar; the boards do
+    // not, and must not (DESIGN.md 7.7). Wiring the two together is main's job and
+    // nobody else's -- a board that could reach `resolveEndpoint` itself would be
+    // one `#include` away from knowing what a socket is.
+    Sio2Board::setResolver(resolveEndpoint);
+    C700Board::setResolver(resolveEndpoint);
+    StrapSerialBoard::setResolver(resolveEndpoint);  // the gsio / propio strap-serial family's lines
+    InterfacerOneBoard::setResolver(resolveEndpoint);  // the CompuPro Interfacer 1's two UART channels
+    InterfacerThreeBoard::setResolver(resolveEndpoint);  // the CompuPro Interfacer 3's eight 2651s
+    InterfacerFourBoard::setResolver(resolveEndpoint);   // the Interfacer 4's 2651s and parallel ports
+    Io4Board::setResolver(resolveEndpoint);          // the real SSM IO-4's two UART channels
+    CompuProDisk1Board::setResolver(resolveEndpoint);  // the Disk 1's bit-banged port 3 line
+    Ss1Board::setResolver(resolveEndpoint);          // the System Support 1's 2651 serial channel
+    // --mcp: every serial line gets an AgentTap (host/agent_tap.h), so `send`/`recv`/`run`
+    // can reach any unit, not only the console. Before the machine loads, so its lines have one.
+    if (mcp) setAgentTaps(true);
+
+    // The video service, injected the same way (DESIGN.md 7.4): a graphics board
+    // draws into a Display and never learns it is SDL. The shipping binary hands it
+    // an SdlDisplay (a window); a headless build (no SDL3) hands it a NullDisplay, so
+    // the machine runs identically with nothing to draw on. Static so it outlives the
+    // machine, and created once for the whole session.
+
+    // The generic built-in terminal (issue #244) draws into the SAME host video service and
+    // paints with the bundled font. A `terminal:` endpoint reads these statics; on a
+    // headless build g_display is a NullDisplay (isWindowed() false), so CONNECT refuses the
+    // endpoint cleanly rather than opening a serial line with nothing behind it.
+    TerminalStream::setDisplay(&g_display);
+    TerminalStream::setFont(&bundledTerminalFont());
+
+    // 60 frames a second, and no more. A real VDM-1 scanned at the monitor's rate no
+    // matter what the 8080 was doing, and nothing on the S-100 side can read a pixel
+    // back -- so redrawing faster than a person can see is pure cost. It was a large
+    // one: the run loop pumps every 2000 instructions, and repainting all 106,496
+    // pixels that often made a machine with a video card run 94x slower than one
+    // without. Tests leave this unset (tests/main.cpp), because a wall clock is not
+    // deterministic and a test wants a frame every time it asks.
+    g_display.setFrameLimitHz(60.0);
+
+    // Window keystrokes go to the line behind the window they were typed in. A built-in
+    // terminal's window (issue #244) types on THAT terminal's line: keys reach its emulator
+    // and flow to the guest on the serial line it renders, so an MP/M machine with three
+    // terminal windows has three keyboards, and the window with focus is the one that types.
+    // Any other window -- a VDM-1, a Sol -- feeds the single Console, and a Sol-20's keyboard
+    // board reads that Console, so you type in the VDM window and SOLOS sees one stream
+    // (DESIGN.md 7.4). The monitor keeps stdio to itself. A NullDisplay never fires.
+    g_display.setKeySink([](Display::Owner from, const uint8_t* p, size_t n) {
+        if (!TerminalStream::routeKeys(from, p, n)) Console::instance().inject(p, n);
+    });
+
+    // Arrows and Home carry no ASCII, so the window hands them over symbolically
+    // (host/display.h): a terminal encodes each in its own dialect (VT100 ESC[A, VT52 ESCA,
+    // ADM-3A ^K), which the byte table could not do. Any other window injects the table's
+    // guest byte into the Console, exactly as the display would have without this sink.
+    // The mouse and copy: a terminal window selects and copies its own text. Nothing else
+    // uses them yet, so another window's events go nowhere.
+    g_display.setPointerSink([](Display::Owner from, const Display::Pointer& p) {
+        TerminalStream::routePointer(from, (int)p.kind, p.x, p.y);
+    });
+    g_display.setCopySink([](Display::Owner from) { TerminalStream::routeCopy(from); });
+    g_display.setSpecialKeySink([](Display::Owner from, Display::SpecialKey k) {
+        int key = -1;
+        switch (k) {
+            case Display::SpecialKey::Up:    key = (int)TerminalEmulator::Key::Up;    break;
+            case Display::SpecialKey::Down:  key = (int)TerminalEmulator::Key::Down;  break;
+            case Display::SpecialKey::Left:  key = (int)TerminalEmulator::Key::Left;  break;
+            case Display::SpecialKey::Right: key = (int)TerminalEmulator::Key::Right; break;
+            case Display::SpecialKey::Home:  key = (int)TerminalEmulator::Key::Home;  break;
+            // MODE SELECT / CLEAR / LOAD have no terminal-dialect key -- they are literal
+            // 8-bit Sol bytes, so they go raw on the shared console queue, never through
+            // keyAscii() (whose strip7in would strip bit 7 and mangle 80 -> 00).
+            case Display::SpecialKey::Mode:
+            case Display::SpecialKey::Clear:
+            case Display::SpecialKey::Load:
+            case Display::SpecialKey::Count_: break;
+        }
+        if (key >= 0 && TerminalStream::routeSpecial(from, key)) return;
+        uint8_t c = g_display.specialKey(k);
+        if (c) Console::instance().inject(&c, 1);
+    });
+
+    // And the other direction, once a slice: the run loop asks the window whether the
+    // operator closed it, and stops the guest if so -- the same place ATTN lands you
+    // (cli/monitor.h). The board that draws into the window deliberately cannot do
+    // this; only the run loop can stop a machine.
+    Monitor::setDisplay(&g_display);
+
+    // The same seam for the other kind of endpoint: a disk board asks openMedia()
+    // for a path and gets a medium back, and this is the one line that decides where
+    // the bytes live. openHostMedia routes an image that has a `.geo` sidecar to a lazy
+    // CardImage and everything else to a plain host file. A test replaces it with one
+    // made of RAM.
+    setMediaResolver(openHostMedia);
+
+    Machine m;
+    std::string err;
+
+    // The debug facility's PC prefix (core/debuglog.h). Every dbg::line() names the
+    // instruction that produced it -- the bus knows the running PC, published once
+    // per instruction by the run loop. We hand dbg a way to read it, but only WHILE
+    // THE GUEST IS RUNNING: at the monitor prompt there is no current instruction, so
+    // the column shows `----` rather than a stale address left over from the last GO.
+    // Installed once here, against the one live machine; the lambda outlives every
+    // CONFIG LOAD because replaceWith() re-fills `m` in place rather than replacing it.
+    dbg::setPcProvider([&m]() -> std::optional<uint32_t> {
+        if (!m.running) return std::nullopt;
+        return m.bus.instrPc();
+    });
+    // And the terminal: raw while the guest runs, so a report line brings its own CR.
+    dbg::setTerminal({[] { return Console::instance().raw(); },
+                      [] {
+                          Console::instance().flush();
+                          return Console::instance().midLine();
+                      },
+                      [] { Console::instance().atLineStart(); }});
+
+    if (!builtin.empty()) {
+        const BuiltinMachine* b = findMachine(builtin);
+        if (!b) {
+            std::cerr << "no built-in machine '" << builtin << "'.\n";
+            // The likeliest mistake by a mile: they meant a file, and it did not
+            // look like one. Say the exact command that works.
+            if (!looksLikeFile(builtin))
+                std::cerr << "(for a FILE by that name: pascal100 -f " << builtin << ")\n";
+            std::cerr << "\n";
+            list(std::cerr);
+            return 2;
+        }
+        if (!loadMachine(*b, m, err)) {
+            std::cerr << err << "\n";
+            return 2;
+        }
+    } else if (!file.empty()) {
+        // NEVER SILENTLY. This is the only machine nobody asked for by name, so it is the
+        // only one that has to introduce itself -- and BEFORE the load, so that a broken
+        // file names itself too. It goes to stderr: a `-s` script's stdout is a CI
+        // contract and stays exactly what the script printed.
+        if (discovered)
+            std::cerr << "pascal100: no machine named -- using " << kCwdConfig
+                      << " (`-m default` for the built-in).\n";
+        std::vector<std::string> notes;
+        if (!loadToml(file, m, err, &notes)) {
+            std::cerr << err << "\n";
+            return 2;
+        }
+        // The author's `#>` notes, to stdout, once the file is known good. Unlike the
+        // discovery line above -- which is narration and goes to stderr -- these are the
+        // file's own message to whoever runs it, and are meant to be seen. Except under
+        // --mcp: there stdout IS the JSON-RPC transport and carries nothing else, so the
+        // notes go to stderr, still in front of a human running the server (#459).
+        std::ostream& to = mcp ? std::cerr : std::cout;
+        for (const std::string& note : notes) to << note << "\n";
+    } else {
+        // -n: an empty backplane. Every read floats to FF, because nothing is
+        // driving anything. That is not a broken machine, it is an empty one --
+        // and it is where you start if you are building one up with BOARDS ADD.
+        m.name = "none";
+        m.power();
+    }
+
+    // MCP and the monitor sit on the SAME Machine. Not a wrapper, not a second
+    // model of the world -- the same object, reached two ways (DESIGN.md 11).
+    if (mcp) return runMcp(m, std::cin, std::cout, mirror, log);
+
+    Monitor mon(m);
+
+    // The banner reports what is ACTUALLY in the backplane, because a machine with
+    // no CPU card in it is a real machine you can build -- it is the one milestone
+    // 1a ran, with the monitor as bus master -- and saying so is more useful than a
+    // fixed string that goes stale the moment a card lands.
+    auto banner = [&] {
+        std::cout << kVersion << " -- ";
+        if (CpuCore* c = m.cpu()) {
+            std::cout << c->isa() << ", ";
+            // hz() IS A DIVISOR AND IS NEVER 0 (core/clock.h), so it cannot answer this
+            // question -- it reads 2 MHz on a card with no crystal on it, which is how this
+            // line came to report a paced machine while the run loop was flat out. free() is
+            // the policy, and the policy is what an operator wants read back.
+            if (m.clock.free()) std::cout << "full speed.\n";
+            else                std::cout << m.clock.hz() / 1000000.0 << " MHz.\n";
+        }
+        else std::cout << "no CPU in the backplane; the monitor is the bus master.\n";
+        std::cout << "machine: " << m.name << ".  HELP for commands.\n";
+    };
+
+    // The banner goes to launches that reach the interactive repl -- exactly the
+    // negation of the `if (ran && !interactive) return rc;` guard below -- so -x/-s
+    // CI runs keep their silent stdout. WHERE it goes depends on the launch:
+    //
+    //   * A plain launch (nothing on the command line) greets NOW, before runStartup.
+    //     An auto-run machine (a `RUN` in `startup`) blocks in the run loop until ATTN,
+    //     and the operator deserves the banner before that, not after the first stop.
+    //   * A -x/-s launch defers the banner to AFTER its commands run, so it reports
+    //     what they left behind -- `SET cpu0 clock_hz=...` must be reflected, and that
+    //     is what proves the line reads live machine state rather than a fixed string.
+    const bool willRepl = interactive || (exec.empty() && script.empty());
+    const bool hasCliCmds = !exec.empty() || !script.empty();
+    if (willRepl && !hasCliCmds) banner();
+
+    // The operator's own `~/pascal100.ini` -- DEBUG sinks and the like. Only on a plain
+    // launch: -x/-s output is a CI transcript, and --mcp returned above (its stdout is the
+    // JSON-RPC transport). A file in the home directory must never change either.
+    if (exec.empty() && script.empty()) {
+        const std::string home = platform::homeDir();
+        if (!home.empty()) mon.runUserInit(home + "/pascal100.ini", std::cout);
+    }
+
+    // --set IS A `SET`, RUN BEFORE `startup`. A machine file that says `startup = ["RUN FF00"]`
+    // has booted its guest by the time a -x command runs, so `-x "SET cpu0 clock_hz=2000000"`
+    // is too late for it (issue #736). These are applied here, in the order given.
+    //
+    // AFTER THE BANNER AND AFTER ~/pascal100.ini, on purpose. The plain-launch banner reports
+    // the machine as the file (or the built-in) made it; the operator's ini file and then the
+    // command line change that, each shown on its own line, and the command line is last so
+    // that it wins.
+    //
+    // A setting that fails stops the program. A wrong key must not boot the machine with the
+    // setting the operator meant to change, so nothing after it runs -- no `startup`, no -x.
+    // The text is a typed command, as -x is: a path in it starts at the machine's folder.
+    for (const auto& s : sets) {
+        const std::string cmd = "SET " + s;
+        std::stringstream said;
+        mon.exec(cmd, said);
+        if (mon.failed()) {
+            std::cerr << "set> " << cmd << "\n"
+                      << said.str() << "--set failed; the machine was not started.\n";
+            return 2;
+        }
+        std::cout << "set> " << cmd << "\n" << said.str();
+    }
+
+    mon.runStartup(std::cout);
+
+    // -x and -s are the same thing: commands, from somewhere. -x first, then the
+    // script. A failure in either is a non-zero exit, which is the CI contract.
+    int rc = 0;
+    bool ran = false;
+
+    if (!exec.empty()) {
+        std::stringstream ss;
+        for (const auto& c : exec) ss << c << "\n";
+        rc = mon.repl(ss, std::cout, false);
+        ran = true;
+    }
+
+    if (rc == 0 && !script.empty()) {
+        std::ifstream f(script);
+        if (!f) {
+            std::cerr << "cannot open '" << script << "'\n";
+            return 2;
+        }
+        // The script FILE is a command-line argument, so it is named from where you
+        // launched, like the machine file. The paths WRITTEN IN it are relative to the
+        // script's own folder -- a path written in a file is relative to that file, as in
+        // DO and a startup list -- so a shipped .ini runs from anywhere (#575). -x is the
+        // other kind: typed commands, rooted at the machine's directory.
+        rc = mon.runScript(f, script, std::cout);
+        ran = true;
+    }
+
+    if (ran && !interactive) return rc;
+
+    // The deferred banner: a -x/-s launch that stays interactive (-i) is greeted here,
+    // after its commands ran, so the line reflects them. The plain-launch banner was
+    // printed above, before runStartup.
+    if (willRepl && hasCliCmds) banner();
+
+    // Line editing, history and BOTH backspace bytes live in cli/lineedit.cpp.
+    // TODO: tab completion, driven by properties() (DESIGN.md 10.4).
+    return mon.repl(std::cin, std::cout, true);
+}

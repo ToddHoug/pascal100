@@ -1,0 +1,17 @@
+# CompuPro CP/M 2.2N on the IEEE 696 bus, with 64K of 8-bit memory that ALIASES.
+#
+# The Disk 1 machine of ../compupro/cpm22n.toml, unchanged except for the bus type. Its one
+# memory board keeps `ext = false` (the default): it decodes A0-A15 only, so it answers in
+# every 64K segment -- IEEE 696's behaviour for a slave that does not decode the extended
+# address (2.2.2.4; reference/IEEE_696_1983.md). The Z80 drives A8-A15 on I/O cycles here
+# (B or A, as the chip does) and every board still decodes its ports from A0-A7.
+#
+# Stage 2, Task 3 test machine: tests/acceptance/ieee696.cmake boots it; test_ieee696.cpp
+# loads it.
+#
+#     cd tests/media/ieee696 && pascal100 cpm22n-alias64k.toml
+
+[machine]
+base = "../compupro/cpm22n.toml"
+name = "ieee696-alias64k"
+bus  = "ieee696"

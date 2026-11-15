@@ -1,0 +1,894 @@
+#include "test.h"
+
+#include "boards/s100-memory.h"
+#include "boards/mits-2sio.h"
+#include "core/machine.h"
+#include "core/roms.h"
+#include "host/console.h"
+#include "host/endpoint.h"
+#include "cli/monitor.h"
+#include "host/stream.h"
+
+#include <cstdio>
+#include <sstream>
+
+using namespace altair;
+
+namespace {
+
+// A machine with a 2SIO in it, and a scripted terminal on channel A. Built by
+// hand rather than from a .toml, so that a config bug cannot make these go red.
+struct Rig {
+    Machine          m;
+    Sio2Board*       sio = nullptr;
+    MemoryBoard*     mem = nullptr;
+    ScriptedStream*  tty = nullptr;
+    uint8_t          base = 0x10;   // channel A's status/control port
+
+    Rig(uint8_t port = 0x10) : base(port) {
+        std::string err;
+
+        // PARANOID MODE, PERMANENTLY ON IN THIS SUITE. The 2SIO is the card that
+        // drives pin 73, and it is the one that has to remember to say so -- after a
+        // register access, after a character lands, when a deadline comes due, when
+        // a jumper moves. Miss one and the guest waits forever for an interrupt that
+        // already happened. This re-derives the whole wire on every instruction and
+        // aborts the moment the card and the backplane disagree about it.
+        m.bus.setVerify(true);
+
+        mem = dynamic_cast<MemoryBoard*>(m.add("memory", "mem0", err));
+        Region r;
+        r.kind = RegionKind::Ram;
+        r.at   = 0;
+        r.size = 0x10000;
+        mem->addRegion(r, err);
+        setProperty(*mem, "fill", "zero", err);
+
+        sio = dynamic_cast<Sio2Board*>(m.add("2sio", "sio0", err));
+
+        // HEX. A port is ON THE WIRE (DESIGN.md 10.0.1), so `port`'s radix is 16 --
+        // and the first draft of this test wrote std::to_string(0x10), which is
+        // "16", which the property layer correctly read as 0x16 and put the card
+        // four ports up the address space. Every status read then floated to FF,
+        // which has every bit set, so half the assertions passed for the worst
+        // possible reason. The rule is not decoration.
+        char hex[8];
+        std::snprintf(hex, sizeof hex, "%02X", port);
+        CHECK(setProperty(*sio, "port", hex, err), "the base port is a hex jumper");
+
+        auto s = std::make_unique<ScriptedStream>();
+        tty    = s.get();
+        sio->channel("a")->connect(std::move(s));
+
+        m.add("z80", "cpu0", err);
+        m.power();
+    }
+
+    void run(int steps) {
+        for (int i = 0; i < steps; ++i) {
+            StepResult s = m.master()->step(m.bus);
+            m.clock.advance(s.tStates);
+        }
+    }
+
+    // Let one character finish arriving on the line.
+    //
+    // A test that feeds two characters and expects both to be there AT ONCE is
+    // asking a 9600-baud line to deliver them in zero time. The receiver is paced
+    // by the clock exactly as the transmitter is -- that is the same mechanism
+    // TDRE is built on -- so a second character cannot land until the first one's
+    // character time has passed. 5000 T-states is comfortably more than any
+    // character time at 9600 baud (the longest is 11 bits = 2,291).
+    void lineTime() { m.clock.advance(5000); }
+
+    // The first character on a quiet line takes a character-time to shift in, and
+    // poll() measures that from the moment the receiver first SEES the byte, not
+    // from a delivery deadline left stale by the lull (issue #469). So a test lets
+    // the chip observe the byte (the first poll starts the shift-in clock), advances
+    // one character-time, and polls again -- the poll it lands on -- exactly what the
+    // run loop's own polling does in the microseconds after a key arrives. A
+    // continuously full line never idles and never needs this; it is only ever the
+    // first byte after quiet. Leaves RDRF set, the byte waiting at the data port.
+    void settle(uint8_t statusPort) {
+        (void)m.bus.ioRead(statusPort);  // the receiver notices the byte...
+        lineTime();                       // ...a character-time passes...
+        (void)m.bus.ioRead(statusPort);  // ...and this is the poll it lands on
+    }
+    void settle() { settle(base); }
+
+    void load(std::initializer_list<uint8_t> code, uint16_t at = 0) {
+        uint16_t a = at;
+        for (uint8_t b : code) m.bus.memWrite(a++, b);
+        m.cpu()->setPc(at);
+    }
+};
+
+} // namespace
+
+void test_sio2() {
+    SECTION("88-2SIO -- the card");
+    {
+        Rig g;
+        CHECK(g.sio->units().size() == 2, "two channels");
+        CHECK(g.sio->units()[0].name == "a", "named 'a', not 0");
+        CHECK(g.sio->units()[0].kind == UnitKind::Serial, "a serial unit");
+
+        // Four ports and not one more. A card that decoded a fifth would be
+        // stealing an address from whatever was next in the machine.
+        BusCycle c;
+        c.type = Cycle::IoRead;
+        for (uint8_t p = 0x10; p <= 0x13; ++p) {
+            c.addr = p;
+            CHECK(g.sio->decodes(c), "decodes its own four ports");
+        }
+        c.addr = 0x14;
+        CHECK(!g.sio->decodes(c), "does NOT decode the port after them");
+        c.addr = 0x0F;
+        CHECK(!g.sio->decodes(c), "does NOT decode the port before them");
+
+        // It is an I/O card. It answers no memory address at all.
+        c.type = Cycle::MemRead;
+        c.addr = 0x10;
+        CHECK(!g.sio->decodes(c), "decodes no MEMORY -- it is not there");
+    }
+
+    SECTION("88-2SIO -- status, true sense");
+    {
+        Rig g;
+        // Nothing typed yet: RDRF clear, TDRE set. An idle UART is READY TO SEND
+        // and has NOTHING TO SAY, and both of those are the true-sense bits.
+        uint8_t s = g.m.bus.ioRead(0x10);
+        CHECK((s & 0x01) == 0, "RDRF clear -- nobody has typed");
+        CHECK((s & 0x02) != 0, "TDRE set -- the transmitter is idle");
+        CHECK((s & 0x04) == 0, "DCD clear -- carrier present (the pin is /DCD)");
+        CHECK((s & 0x08) == 0, "CTS clear -- clear to send (the pin is /CTS)");
+
+        g.tty->feed("A");
+        g.settle();
+        s = g.m.bus.ioRead(0x10);
+        CHECK((s & 0x01) != 0, "RDRF set once a character arrives");
+        CHECK(g.m.bus.ioRead(0x11) == 'A', "and the data port yields it");
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) == 0, "reading the data clears RDRF");
+    }
+
+    SECTION("88-2SIO -- TDRE is a DEADLINE, not a flag");
+    {
+        // THE BUG THIS TEST EXISTS TO PREVENT. The Python prototype hardwired
+        // TDRE=1. The Mike Douglas CP/M BIOS INFERS THE LINE SPEED by timing how
+        // long TDRE stays clear -- so hardwiring it does not merely approximate
+        // the hardware, it silently changes what the guest decides to do.
+        Rig g;
+        g.m.bus.ioWrite(0x10, 0x11);  // 8N2 -- 11 bits on the wire per character
+
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) != 0, "TDRE set before we send");
+
+        // The 6850 is DOUBLE-buffered (reference/6850.md): a byte to an idle transmitter
+        // moves to the shift register "within 1 bit-time of the write", and only that
+        // transfer sets TDRE. A real MC68B50 measured on #899 had TDRE back 0.6 to 1.5
+        // bit times after the write. A second byte waits in the transmit data register
+        // until the first has left.
+        const uint64_t bitT = (uint64_t)(2000000 / 9600);  // 208 T-states
+        g.m.bus.ioWrite(0x11, 'X');
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) == 0, "one byte: TDRE clear until the transfer");
+        g.m.clock.advance(bitT - 1);
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) == 0, "still clear one T-state before one bit time");
+        g.m.clock.advance(1);
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) != 0, "one bit time later: X is in the shift register");
+        g.m.bus.ioWrite(0x11, 'Y');
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) == 0, "TDRE CLEAR the instant a second byte waits");
+
+        // 9600 baud, 11 bits, 2 MHz -> 2,291 T-states. Just short of it: still busy.
+        uint64_t charT = (uint64_t)(2000000 * 11 / 9600);
+        g.m.clock.advance(charT - 2);
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) == 0, "still clear one T-state early");
+
+        g.m.clock.advance(2);
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) != 0, "set once the first character has left");
+
+        CHECK(g.tty->out() == "XY", "and both bytes really went out the line");
+    }
+
+    SECTION("88-2SIO -- write-then-poll pays one bit time per byte, poll-then-write none (#899)");
+    {
+        // The reporter's test on a real 88-2SIO (MC68B50, 9600 baud, 8N2): send bytes
+        // with 3,000 T-states of work after each, longer than a character. Poll first and
+        // then write, and the line is always free. Write first and then poll, and each
+        // byte also waits for the transfer to the shift register. The real board measured
+        // 129 us (258 T-states) more per byte. The model must give one bit time, to within
+        // one pass of the poll loop (IN + ANI + JZ = 27 T-states).
+        auto perByte = [](bool writeFirst) {
+            Rig g;
+            g.m.bus.ioWrite(0x10, 0x11);  // 8N2
+            const uint8_t n = 20;
+            if (writeFirst)
+                g.load({
+                    0x06, n,           // 0000: MVI B,n
+                    0x3E, 'U',         // 0002: MVI A,'U'
+                    0xD3, 0x11,        // 0004: OUT 11
+                    0xDB, 0x10,        // 0006: IN 10
+                    0xE6, 0x02,        // 0008: ANI 02
+                    0xCA, 0x06, 0x00,  // 000A: JZ 0006
+                    0x0E, 200,         // 000D: MVI C,200  -- 15 x 200 = 3,000 T of work
+                    0x0D,              // 000F: DCR C
+                    0xC2, 0x0F, 0x00,  // 0010: JNZ 000F
+                    0x05,              // 0013: DCR B
+                    0xC2, 0x02, 0x00,  // 0014: JNZ 0002
+                    0x76,              // 0017: HLT
+                });
+            else
+                g.load({
+                    0x06, n,           // 0000: MVI B,n
+                    0xDB, 0x10,        // 0002: IN 10
+                    0xE6, 0x02,        // 0004: ANI 02
+                    0xCA, 0x02, 0x00,  // 0006: JZ 0002
+                    0x3E, 'U',         // 0009: MVI A,'U'
+                    0xD3, 0x11,        // 000B: OUT 11
+                    0x0E, 200,         // 000D: MVI C,200
+                    0x0D,              // 000F: DCR C
+                    0xC2, 0x0F, 0x00,  // 0010: JNZ 000F
+                    0x05,              // 0013: DCR B
+                    0xC2, 0x02, 0x00,  // 0014: JNZ 0002
+                    0x76,              // 0017: HLT
+                });
+            uint64_t t0 = g.m.clock.now();
+            for (int i = 0; i < 1000000 && !g.m.cpu()->halted(); ++i) g.run(1);
+            CHECK(g.tty->out() == std::string(n, 'U'), "every byte went out");
+            return (long long)(g.m.clock.now() - t0) / n;
+        };
+        long long pollFirst  = perByte(false);
+        long long writeFirst = perByte(true);
+        long long extra      = writeFirst - pollFirst;
+        const long long bitT = 2000000 / 9600;
+        // On the Z80 (pascal100: no 8080) the 200-pass DCR/JNZ wait is 200 * 14 = 2800 T-states;
+        // measured 2867 per byte with the rest of the loop (2026-11-09).
+        CHECK(pollFirst > 2800 && pollFirst < 3000, "poll, then write: the work and the loop only");
+        CHECK(extra >= bitT - 27 && extra <= bitT + 27,
+              "write, then poll: one bit time more per byte, to within one poll pass");
+    }
+
+    SECTION("88-2SIO -- THERE IS NO baud = 0, and the receiver's gap is why");
+    {
+        // TWO ASSERTIONS, AND THE SECOND ONE IS THE REASON FOR THE FIRST.
+        //
+        // `clock_hz = 0` is free-running and is the default, so `baud = 0` looks like the
+        // obvious next tidy-up. IT IS NOT THE SAME KIND OF NUMBER. clock_hz only maps
+        // emulated time onto wall-clock time and NO GUEST CAN OBSERVE IT. baud is a
+        // duration in T-STATES -- inside emulated time -- and the guest can time it, which
+        // is the entire basis of TDRE (above) and of the receiver's inter-character gap
+        // (below). The 6850 has no handshaking: THE RATE IS THE ONLY FLOW CONTROL IT HAS.
+        //
+        // What a 0 actually buys you is an INFINITELY FAST SERIAL LINE. MITS PS2 hands
+        // characters from its ISR to its foreground through a ONE-BYTE mailbox and a
+        // semaphore, and that handoff needs the foreground to RUN between characters. Give
+        // it a zero character time and it gets zero instructions: nine of the ten characters
+        // of a typed line are overwritten in the mailbox and the monitor spins for ever.
+        // That is not a bug in the card, it is what an infinitely fast line does -- so the
+        // card refuses to be one.
+        Rig g;
+        std::string err;
+        CHECK(!setPropertyIn(g.sio->unitProperties("a"), "sio0:a", "baud", "0", err),
+              "baud = 0 is REFUSED: there is no free-running serial line");
+        CHECK(g.sio->channel("a")->baud() == 9600, "and the strap is untouched by the refusal");
+        CHECK(setPropertyIn(g.sio->unitProperties("a"), "sio0:a", "baud", "1200", err),
+              "a real rate is taken -- it is the ZERO that is refused, not the property");
+        CHECK(setPropertyIn(g.sio->unitProperties("a"), "sio0:a", "baud", "9600", err),
+              "...and back to 9600 for the gap assertions below");
+
+        // THE GAP IS THE POINT. A second character cannot land until the first one's
+        // character time has passed -- and those T-states are the guest's, to run its
+        // interrupt handler and whatever the handler hands off to. This is the property a
+        // zero baud destroys, so it is asserted on the clock and not on a vague "eventually".
+        g.m.bus.ioWrite(0x10, 0x11);  // 8N2 -- 11 bits on the wire
+        g.tty->feed("HI");
+
+        g.settle();
+        CHECK(g.m.bus.ioRead(0x11) == 'H', "the first character arrives");
+
+        const uint64_t charT = (uint64_t)(2000000 * 11 / 9600);  // 2,291 T-states
+        g.m.clock.advance(charT - 2);
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) == 0,
+              "the SECOND is still on the wire one T-state early -- the guest owns this gap");
+
+        g.m.clock.advance(2);
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) != 0, "and lands when its character time is up");
+        CHECK(g.m.bus.ioRead(0x11) == 'I', "...and it is the byte that was sent");
+    }
+
+    SECTION("88-2SIO -- the character time follows the WORD FORMAT");
+    {
+        // 7 bits + parity + 1 stop = 10 on the wire; 8 bits + 2 stop = 11. A guest
+        // that configures a Teletype gets a Teletype's timing, and nothing here was
+        // told what a Teletype is -- it falls out of the control register.
+        Rig g;
+        g.m.bus.ioWrite(0x10, 0x08);  // word select 010: 7 data, even parity, 1 stop
+        g.m.bus.ioWrite(0x11, 'X');   // to the shift register, one bit time later...
+        g.m.clock.advance((uint64_t)(2000000 / 9600));
+        g.m.bus.ioWrite(0x11, 'Y');   // ...and this one waits for it to leave
+        uint64_t ten = (uint64_t)(2000000 * 10 / 9600);
+        g.m.clock.advance(ten - 1);
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) == 0, "7E1: still busy at 10 bits - 1");
+        g.m.clock.advance(1);
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) != 0, "7E1: done at 10 bit times, not 11");
+    }
+
+    SECTION("88-2SIO -- master reset is not decoration");
+    {
+        // The Python prototype ignored the control register entirely. ALTMON's very
+        // first two instructions are `MVI A,3 / OUT 10h` -- if that write does
+        // nothing, every machine that starts with a master reset starts wrong.
+        Rig g;
+        g.tty->feed("Z");
+        g.settle();  // the receiver sees it, a character-time passes -> RDRF set
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) != 0, "a character is waiting");
+
+        g.m.bus.ioWrite(0x10, 0x03);  // divide field == 11 == MASTER RESET
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) == 0, "master reset clears RDRF");
+
+        // ...AND THE CHIP IS NOW HELD IN RESET, WHICH INHIBITS TDRE (MC6850 data
+        // sheet, reference/6850.pdf: the TDRE bit "indicates the current status of the
+        // Transmit Data Register except when inhibited by Clear-to-Send being high or
+        // the ACIA being maintained in the Reset condition").
+        //
+        // This test used to assert the OPPOSITE -- "master reset leaves TDRE set" --
+        // and the data sheet says otherwise, so the data sheet wins (DESIGN.md 0.1).
+        // The divide field is not a pulse, it is a LATCH: 11 sits there holding the
+        // chip down until a second write selects a real ratio. Which is precisely why
+        // every 6850 driver does two OUTs, and why ALTMON's `MVI A,3` is only half an
+        // init sequence.
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) == 0, "held in reset: TDRE is INHIBITED");
+
+        g.m.bus.ioWrite(0x10, 0x15);  // /16, 8 data, 1 stop -- the other half of the init
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) != 0, "...and released, the transmitter is ready");
+
+        // A master reset does NOT clear the rest of the byte it arrived in: "Master
+        // reset does not affect other Control Register bits" (data sheet). So the
+        // receive interrupt enable in bit 7 survives the reset it was written with.
+        g.m.bus.ioWrite(0x10, 0x83);  // master reset + RIE, in one OUT. Legal.
+        g.m.bus.ioWrite(0x10, 0x95);  // release, keeping RIE
+        // RIE is write-only, so we read it back the only way the guest can: arm it,
+        // put a character on the line, and see the chip raise its IRQ bit. With RIE
+        // thrown away by the reset -- the old behaviour -- bit 7 would stay clear.
+        g.tty->feed("Q");
+        g.sio->pump();
+        g.settle();
+        CHECK((g.m.bus.ioRead(0x10) & 0x80) != 0, "RIE survived the reset it rode in on");
+
+        // ...and it does NOT unplug the terminal. A warm reset that dropped the
+        // console would be a baffling thing to debug.
+        CHECK(g.sio->channel("a")->endpoint() == "scripted", "the endpoint survives a reset");
+    }
+
+    SECTION("88-2SIO -- the RESET switch cannot touch a 6850, because there is no pin");
+    {
+        // THE MC6850 HAS NO RESET PIN. Twenty-four pins: Vss, RxD, RxCLK, TxCLK, RTS,
+        // TxD, IRQ, CS0-CS2, RS, Vcc, R/W, E, D0-D7, /DCD, /CTS. That is the whole
+        // list, and RESET is not on it (reference/6850.pdf). So the S-100 RESET* line
+        // reaches this card's address decoding and NOTHING ELSE: a bus reset leaves the
+        // control register, the word format, the interrupt enables and even a character
+        // sitting in the receive register exactly where they were.
+        //
+        // This card used to reset both chips on a bus reset, and it was wrong twice
+        // over -- it threw away the guest's configuration, and it ate a received byte.
+        // (DESIGN.md 0.1 and 6.1: the data sheet wins, and a bus reset does what the
+        // board actually does, which here is nothing.)
+        Rig g;
+
+        g.m.bus.ioWrite(0x10, 0x03);  // master reset...
+        g.m.bus.ioWrite(0x10, 0x95);  // ...then /16, 8N1, RIE on. The guest's setup.
+
+        g.tty->feed("K");
+        g.sio->pump();
+        g.settle();
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) != 0, "a character is waiting in the receiver");
+
+        g.sio->reset(Reset::Bus);  // THE RESET SWITCH
+
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) != 0, "the received byte is STILL THERE");
+        CHECK(g.m.bus.ioRead(0x11) == 'K', "...and it is the byte that was sent");
+
+        // RIE is write-only, so read it back the only way a guest can -- put another
+        // character on the line and watch the chip raise the IRQ bit in the status
+        // register. If the bus reset had zeroed the control register, RIE would be gone.
+        //
+        // settle() is not decoration here, and its absence is what this test caught
+        // first: the receiver is PACED, and reading 'K' left the line quiet, so 'W'
+        // shifts in on its own character time from when the receiver next sees it
+        // (issue #469). A bus reset does not rewind that -- there is no pin for it to
+        // rewind it WITH -- so the line needs its character time exactly as it would on
+        // the bench. (The master-reset section above reinitializes the receiver, but
+        // still has to let the byte after it shift in, which is why it settles too.)
+        g.tty->feed("W");
+        g.sio->pump();
+        g.settle();
+        CHECK((g.m.bus.ioRead(0x10) & 0x80) != 0, "RIE survived the RESET switch");
+
+        // And the word format survived with it -- the chip is not back in the reset
+        // condition, so the transmitter is still ready.
+        CHECK((g.m.bus.ioRead(0x10) & 0x02) != 0, "the transmitter is still programmed");
+
+        // POWER, though, is a different signal. The machine was switched OFF and ON.
+        g.m.power();
+        CHECK((g.m.bus.ioRead(0x10) & 0x01) == 0, "power-on-clear: the receiver IS empty");
+        CHECK(g.sio->channel("a")->endpoint() == "scripted", "...and the terminal is still plugged in");
+    }
+
+    SECTION("88-2SIO -- both channels, independent");
+    {
+        Rig g;
+        auto s = std::make_unique<LoopbackStream>();
+        g.sio->channel("b")->connect(std::move(s));
+
+        g.m.bus.ioWrite(0x13, 'q');  // b's data port -- straight back round the loop
+        g.settle(0x12);              // b's line was idle: let the looped byte shift in
+        CHECK((g.m.bus.ioRead(0x12) & 0x01) != 0, "b: loopback returns the byte");
+        CHECK(g.m.bus.ioRead(0x13) == 'q', "b: and it is the byte we sent");
+
+        // A's line never saw it. Two chips, not one chip with an index.
+        CHECK(g.tty->out().empty(), "a: heard nothing -- the channels are independent");
+    }
+
+    SECTION("88-2SIO -- the base port is a jumper");
+    {
+        Rig g(0x14);
+        BusCycle c;
+        c.type = Cycle::IoRead;
+        c.addr = 0x14;
+        CHECK(g.sio->decodes(c), "moved to 14");
+        c.addr = 0x10;
+        CHECK(!g.sio->decodes(c), "and is no longer at 10 -- two cards can coexist");
+    }
+
+    SECTION("88-2SIO -- interrupts, with NO VI board in the machine");
+    {
+        // THE ALTAIR'S ACTUAL INTERRUPT PATH (DESIGN.md 4.4). The 6850 raises IRQ,
+        // the jumper takes it to pINT, nobody claims the IntAck cycle, the bus
+        // floats FF, and the 8080 executes RST 7. No vector logic exists anywhere,
+        // and none is needed.
+        Rig g;
+        std::string err;
+
+        CHECK(!g.m.bus.intPending(), "quiet to start with");
+
+        // Through the PROPERTY PATH, which is how an operator moves this jumper --
+        // and which is what tells the card to re-settle its pin and re-aim its
+        // timers. Poking the field directly would work here and would be a lie about
+        // how the card is configured.
+        CHECK(setUnitProperty(*g.sio, "a", "interrupt", "int", err), "jumper A -> pINT");
+
+        g.m.bus.ioWrite(0x10, 0x91);  // RIE (bit 7) + 8N2, receive interrupt enabled
+        CHECK(!g.m.bus.intPending(), "RIE on, but nothing has arrived");
+
+        g.tty->feed("!");
+        g.settle();  // the character lands one character-time after the receiver sees it
+        CHECK(g.m.bus.intPending(), "a character arrived -> the card pulls pINT");
+        CHECK((g.m.bus.ioRead(0x10) & 0x80) != 0, "and status bit 7 (IRQ) says so");
+
+        // An interrupt is a LEVEL, not an event. It stays asserted until the guest
+        // reads the character -- which is why a board cannot 'lose' one.
+        CHECK(g.m.bus.intPending(), "still asserted -- it is a level on a wire");
+        (void)g.m.bus.ioRead(0x11);
+        CHECK(!g.m.bus.intPending(), "and it drops when the character is read");
+
+        // The un-jumpered case: the CHIP still raises IRQ (it is a pin, and it does
+        // not care what you soldered to it), but the WIRE goes nowhere.
+        CHECK(setUnitProperty(*g.sio, "a", "interrupt", "none", err), "jumper A pulled");
+        g.tty->feed("?");
+        g.settle();  // '!' was read and the line went quiet: the next byte shifts in afresh
+        CHECK((g.m.bus.ioRead(0x10) & 0x80) != 0, "chip still raises IRQ in its status");
+        CHECK(!g.m.bus.intPending(), "but with no jumper, pINT stays high");
+    }
+
+    SECTION("88-2SIO -- NOBODY IS ASKING: the card acts on its own deadline");
+    {
+        // THE CASE THE OLD MODEL COULD NOT HAVE HANDLED, and the reason the event
+        // queue came back (DESIGN.md 7.5).
+        //
+        // The transmit interrupt is jumpered. The guest writes a character and
+        // HALTS. TDRE goes true when the character has finished going out -- and at
+        // that moment NOBODY IS TOUCHING THE CHIP. No bus cycle happens. No register
+        // is read. The CPU is parked in a HLT waiting for exactly this interrupt.
+        //
+        // If the only way the card could act were to be asked, and the only thing
+        // that would ask is the CPU that is halted waiting for it, the machine would
+        // be dead. It wakes because the card set itself an alarm.
+        Rig g;
+        std::string err;
+        CHECK(setUnitProperty(*g.sio, "a", "interrupt", "int", err), "jumper A -> pINT");
+
+        // Control: 8N2, transmit interrupt ENABLED (bits 5-6 = 01), RIE off.
+        g.m.bus.ioWrite(0x10, 0x36);
+        CHECK(g.m.bus.intPending(), "TDRE is true on an idle transmitter, so it is already asking");
+
+        g.m.bus.ioWrite(0x11, 'A');  // the data register is full until the transfer
+        CHECK(!g.m.bus.intPending(), "one character: TDRE clear until the shift register takes it");
+        g.m.clock.advance((uint64_t)(2000000 / 9600));  // one bit time
+        CHECK(g.m.bus.intPending(), "one bit time later the data register is empty: asking again");
+        g.m.bus.ioWrite(0x11, 'B');  // a second one waits; the register is now busy
+        CHECK(!g.m.bus.intPending(), "TDRE fell: a character waits behind the one on the wire");
+
+        // EI ; HLT. The guest is now doing nothing whatever, and neither is the bus:
+        // no cycle runs, no register is touched, and the CPU is parked. The ONLY
+        // thing left in the machine that can still act is the alarm the card set for
+        // itself -- and the interrupt is still ~2,000 T-states away.
+        g.load({0xFB, 0x76});
+        g.m.debug.add(BreakKind::Pc, 0x0038, 0x0038);  // where RST 7 lands
+
+        RunResult r = g.m.debug.run(2000);
+        CHECK(r.why == StopReason::Breakpoint,
+              "the HLT did NOT end the program: the card woke it with nobody asking");
+        CHECK(g.m.cpu()->pc() == 0x0038, "unvectored -> the floating bus reads FF = RST 7");
+        CHECK(g.m.clock.now() >= 2000,
+              "and it really did have to WAIT -- a whole character time at 9600 baud");
+    }
+
+    SECTION("88-2SIO -- an unconnected line is not an error");
+    {
+        // An unconnected 6850 sits there with TDRE set forever, and software that
+        // writes to it works fine and talks to nobody. There is no null pointer in
+        // the stream path and no branch anywhere for 'what if nothing is plugged in'.
+        Rig g;
+        CHECK(g.sio->channel("b")->endpoint() == "null", "b starts unconnected");
+        CHECK((g.m.bus.ioRead(0x12) & 0x02) != 0, "and is READY TO SEND");
+        g.m.bus.ioWrite(0x13, 'x');  // must not crash, must not block
+        CHECK((g.m.bus.ioRead(0x12) & 0x01) == 0, "and never has anything to say");
+    }
+
+    SECTION("88-2SIO -- the LINE IS 8-BIT CLEAN. The transforms are the console's");
+    {
+        // THE INVERSE OF WHAT THIS TEST USED TO ASSERT, deliberately. It used to set
+        // `upper` on the LINE and check the guest saw a fold on a non-console stream --
+        // "the fold lives on the line, so it works on a socket too". That is exactly
+        // the bug: the same line carries XMODEM, and a transform on it corrupts every
+        // 8-bit transfer through the card, silently.
+        //
+        // A 6850's line now carries what was put on it. Nothing else.
+        Rig g;
+        std::string err;
+
+        CHECK(!setUnitProperty(*g.sio, "a", "upper", "true", err),
+              "there is no UPPER on the line -- SET sio0:a UPPER=ON is refused");
+        CHECK(!setUnitProperty(*g.sio, "a", "strip7out", "true", err),
+              "and no STRIP7OUT either -- it would corrupt XMODEM through this port");
+
+        // THE HIGH BIT SURVIVES THE LINE. 0xC5 is 'E'|0x80 -- the last character of
+        // MITS BASIC's "MEMORY SIZE?", and the exact byte that started all of this.
+        // Inbound it is just as important: it is the first byte of an XMODEM block's
+        // payload as often as any other value.
+        g.tty->feed(std::string(1, '\xC5'));  // char literal, not (char)0xC5: MSVC C4310 casts
+        g.settle();
+        CHECK(g.m.bus.ioRead(0x11) == 0xC5, "0xC5 reaches the guest with bit 7 intact");
+    }
+
+    // -----------------------------------------------------------------------
+    // THE HOST'S KEYBOARD BUFFER (Patrick, 2026-07-12)
+    // -----------------------------------------------------------------------
+    // The host owns the keyboard; a card takes characters FROM it. That is what
+    // lets the simulator watch for ATTN whether or not anybody is reading, and it
+    // is what lets anything -- a script, MCP's send/expect -- type for you.
+    SECTION("the console is a keyboard buffer, and a board cannot tell who typed");
+    {
+        Machine m;
+        std::string err;
+        m.add("2sio", "sio0", err);
+        m.add("memory", "mem0", err);
+        m.power();
+
+        Monitor mon(m);
+        std::ostringstream out;
+        mon.exec("CONNECT sio0:a console", out);
+
+        Console& con = Console::instance();
+        CHECK(con.pending() == 0, "the buffer starts empty");
+
+        // Type for the operator. The board is reading a REAL console -- there is no
+        // test double anywhere in this path.
+        con.inject("HI");
+        CHECK(con.pending() == 2, "two keys are waiting");
+
+        // THE LINE STILL PACES THEM. The host's buffer does not give the 6850 a FIFO
+        // it never had: the card takes ONE character, and the next cannot land until
+        // a character time has passed at the configured baud rate. Reading both back
+        // to back with no clock between them is asking a 9600-baud line to deliver
+        // two characters in zero time -- and the first draft of this test did exactly
+        // that, and hung forever waiting for a byte that was not due yet.
+        (void)m.bus.ioRead(0x10);   // the receiver notices 'H' -> the shift-in clock starts
+        m.clock.advance(5000);      // ...and a character time passes before it lands (issue #469)
+        CHECK((m.bus.ioRead(0x10) & 0x01) != 0, "the 6850 says a character is ready");
+        CHECK(m.bus.ioRead(0x11) == 'H', "and the guest reads it");
+        CHECK(con.pending() == 1, "one key still on the line -- the UART holds ONE");
+
+        m.clock.advance(5000);  // a character time at 9600 baud, and then some
+        (void)m.bus.ioRead(0x10);
+        CHECK(m.bus.ioRead(0x11) == 'I', "the next one arrives in its own time");
+        CHECK(con.pending() == 0, "and the buffer is drained");
+        CHECK((m.bus.ioRead(0x10) & 0x01) == 0, "RDRF goes clear again");
+
+        // A REAL keyboard buffer is finite, and a dropped keystroke is COUNTED --
+        // not silently swallowed, which is how you get a bug report about "flaky
+        // input" that nobody can ever reproduce.
+        uint64_t before = con.dropped();
+        con.inject(std::string(1000, 'x'));
+        CHECK(con.dropped() > before,
+              "typing past the end of the buffer drops keys, and says how many");
+        CHECK(con.pending() == 256, "and holds a teletype's worth: 256");
+
+        // Drain it: the Console is a singleton, because there is exactly one
+        // keyboard, and the next test must not inherit this one's typing.
+        while (con.pending()) {
+            m.clock.advance(5000);
+            (void)m.bus.ioRead(0x10);
+            (void)m.bus.ioRead(0x11);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // THE IDLE SIGNAL (Patrick, 2026-07-13) -- host/console.h, DESIGN.md 8.
+    // -----------------------------------------------------------------------
+    // A guest at a prompt does nothing but read the status register, and before this
+    // the run loop obliged it at forty million instructions a second: 8 MB CP/M
+    // sitting at `A0>` pinned a host core at 100%. The run loop can only stand down
+    // if it can TELL, and this is what it asks: how often did the guest come to the
+    // keyboard and find nothing there.
+    SECTION("a status read on an empty keyboard is the guest saying it has nothing to do");
+    {
+        Machine m;
+        std::string err;
+        m.add("2sio", "sio0", err);
+        m.add("memory", "mem0", err);
+        m.power();
+
+        Monitor mon(m);
+        std::ostringstream out;
+        mon.exec("CONNECT sio0:a console", out);
+
+        Console& con = Console::instance();
+        CHECK(con.pending() == 0, "nobody has typed");
+
+        // The guest polls the status register: exactly what a CP/M CONIN loop does,
+        // three instructions at a time, for as long as you leave it there.
+        uint64_t hungry0 = con.hungry();
+        (void)m.bus.ioRead(0x10);
+        (void)m.bus.ioRead(0x10);
+        CHECK(con.hungry() > hungry0, "asking an empty keyboard COUNTS -- that is the signal");
+
+        // ...AND IT IS NOT starved(). starved() means empty AND ENDED -- a guest begging
+        // at a pipe that has hung up, which is how a SCRIPTED run knows it may leave. A
+        // terminal never ends, so a machine at a prompt is not begging; it is waiting for
+        // you. Widen starved() to mean this and a cassette load dies three slices in.
+        CHECK(con.starved() == 0, "a live keyboard never starves, however long it sits idle");
+
+        // A key arrives. Now the guest is NOT waiting -- it has work -- and the counter
+        // must go still, or the run loop would nap through the operator's typing.
+        con.inject("K");
+        uint64_t hungry1   = con.hungry();
+        uint64_t consumed0 = con.consumed();
+        (void)m.bus.ioRead(0x10);   // the receiver notices 'K'...
+        m.clock.advance(5000);      // ...and it shifts in a character time later (issue #469)
+        CHECK((m.bus.ioRead(0x10) & 0x01) != 0, "the 6850 has the key");
+        CHECK(con.hungry() == hungry1, "a keyboard with a key in it is not an idle one");
+        CHECK(m.bus.ioRead(0x11) == 'K', "and the guest reads it");
+
+        // AND THE BYTE ITSELF IS COUNTED, which is the signal that saves a TRANSFER.
+        //
+        // A guest receiving XMODEM is hungry hundreds of times a slice (it is waiting on
+        // the next byte, 130 us away at 76,800 bps) and says nothing for a whole block --
+        // so by hungry() and written() alone it is a prompt, and the run loop napped
+        // straight through one until this counter existed. The difference is that bytes
+        // ARE ARRIVING, and here is where that becomes visible.
+        CHECK(con.consumed() == consumed0 + 1, "a byte crossing into the guest is counted");
+    }
+
+    // ATTN IS THE CONSOLE'S, AND ONLY THE CONSOLE'S (Patrick, 2026-07-12).
+    SECTION("a line that is not the console passes ATTN through as data");
+    {
+        // 0x05 down a socket is a byte of somebody's protocol. A line that scanned
+        // for a key which only exists on the operator's terminal would be corrupting
+        // the data, and it would do it silently.
+        Rig g;
+        CHECK(Console::instance().attn() == 0x05, "ATTN is ^E");
+
+        g.tty->feed("\x05");  // a ScriptedStream: a socket, a modem, anything but the console
+        g.settle();
+        CHECK(g.m.bus.ioRead(0x11) == 0x05, "the guest gets the 05 -- unaltered, uneaten");
+    }
+
+    SECTION("EXACTLY ONE unit may hold the console");
+    {
+        // Two boards reading one keyboard would each get half the characters. This
+        // is not hypothetical -- it is what happens the first time a machine has
+        // two 2SIOs and you forget -- and it is invisible until you are debugging
+        // why every other keystroke vanished.
+        //
+        // The first version of the arbitration was DEAD CODE and this test is why
+        // it isn't now: it read `is(a[2], "console")`, and `is()` uppercases its
+        // token before comparing, so the literal had to be uppercase or it could
+        // never match. Both units held the console and nothing said a word.
+        Machine m;
+        std::string err;
+        auto* s0 = dynamic_cast<Sio2Board*>(m.add("2sio", "sio0", err));
+        auto* s1 = dynamic_cast<Sio2Board*>(m.add("2sio", "sio1", err));
+        CHECK(setProperty(*s1, "port", "14", err), "the second card moves out of the way");
+
+        Monitor mon(m);
+        std::ostringstream out;
+        mon.exec("CONNECT sio0:a console", out);
+        CHECK(s0->channel("a")->endpoint() == "console", "sio0:a has the console");
+
+        out.str("");
+        mon.exec("CONNECT sio1:a console", out);
+        CHECK(s1->channel("a")->endpoint() == "console", "sio1:a takes it");
+        CHECK(s0->channel("a")->endpoint() != "console", "and sio0:a NO LONGER has it");
+        CHECK(out.str().find("taken from sio0:a") != std::string::npos,
+              "and it says who it took it from, out loud");
+    }
+
+    SECTION("88-2SIO -- an INTERRUPT-DRIVEN echo, end to end, with no VI board");
+    {
+        // ACCEPTANCE TEST 4 (docs/boards/mits-2sio.md), and the one the whole
+        // interrupt design stands or falls on. Nothing here is arranged: the 6850
+        // raises IRQ because a character arrived, the jumper takes that to pINT,
+        // the 8080 acknowledges at an instruction boundary, NOBODY claims the
+        // IntAck cycle because there is no 88-VI card in this machine, the bus
+        // floats to FF, and FF is `RST 7`.
+        //
+        // So the vector is not chosen by anything. It is what an empty backplane
+        // reads as, and RST 7 is where the Altair's interrupt went. There is no
+        // vector logic in the bus, the board, or the CPU -- and this test would
+        // fail if anybody added some.
+        Rig g;
+        Mc6850* a = g.sio->channel("a");
+        a->jumper = IrqJumper::Int;
+
+        // RST 7 lands at 0038. Read the character and send it straight back.
+        g.m.bus.memWrite(0x0038, 0xDB);  // IN 11    -- read the char (clears RDRF, drops IRQ)
+        g.m.bus.memWrite(0x0039, 0x11);
+        g.m.bus.memWrite(0x003A, 0xD3);  // OUT 11   -- echo it
+        g.m.bus.memWrite(0x003B, 0x11);
+        g.m.bus.memWrite(0x003C, 0xFB);  // EI
+        g.m.bus.memWrite(0x003D, 0xC9);  // RET
+
+        // The mainline does NOTHING but wait to be interrupted.
+        g.load({
+            0x31, 0x00, 0x02,  // LXI SP,0200   -- RST 7 pushes; it needs somewhere
+            0x3E, 0x91,        // MVI A,91      -- RIE + 8 data, no parity, 2 stop
+            0xD3, 0x10,        // OUT 10        -- arm the receive interrupt
+            0xFB,              // EI
+            0xC3, 0x08, 0x01,  // JMP 0108      -- spin here forever
+        }, 0x0100);
+
+        g.tty->feed("Hi!");
+        g.run(20000);
+
+        CHECK(g.tty->out() == "Hi!", "every character came back, driven by RST 7");
+        CHECK(g.m.cpu()->pc() >= 0x0108 && g.m.cpu()->pc() <= 0x010A,
+              "and the mainline is still spinning where we left it");
+    }
+
+    SECTION("88-2SIO -- THE NEGATIVE CONTROL: jumper OUT, and the guest stays DEAF");
+    {
+        // THIS IS acceptance-2sio-echo's silent phase, PINNED AT THE BOARD LEVEL.
+        //
+        // The .exp negative control (tests/acceptance/2sio-echo.exp:silent) runs the
+        // interrupt-driven ECHOINT with the interrupt jumper OUT and asserts NOTHING
+        // comes back: the 6850 receives the character and raises its own IRQ pin, but
+        // that pin now reaches no backplane wire, so the 8080 is never interrupted, the
+        // ISR at 0038h never runs, and the guest NOPs on, deaf. It was seen to echo
+        // about one run in twenty under load -- and "under load" means only
+        // that the host delivered the keystroke at a different instruction each time.
+        //
+        // A real 6850 cannot care WHEN in the guest's execution the byte lands: the
+        // strap gate (Sio2Port::assertsInt) consults ch.jumper == Int and nothing else,
+        // and irq() -- which DOES go true, jumper or no jumper -- never reaches pin 73
+        // without it. So the way to settle "interrupt-strap gate vs receiver pacing" is
+        // to reproduce the exact scenario deterministically and SWEEP the one variable
+        // the acceptance test cannot pin: the T-state at which the character arrives.
+        //
+        // Rig runs with bus.setVerify(true), so if the board ever drove pin 73 with the
+        // jumper out -- for ONE instruction, at ONE arrival offset -- verifyInt() aborts
+        // the moment the wire disagrees with the strap. This is the guard the acceptance
+        // test lacks (the shipped binary does not verify), and it is why the board level
+        // is where this belongs.
+        //
+        // The guest is byte-for-byte the interrupt echo above; only the jumper changes.
+        for (int arriveAfter = 0; arriveAfter <= 6000; arriveAfter += 250) {
+            Rig g;
+            Mc6850* a = g.sio->channel("a");
+            a->jumper = IrqJumper::None;  // THE WIRE IS CUT. Everything below turns on this.
+            g.sio->configChanged();       // ...and the card re-settles pin 73 for the strap
+
+            g.m.bus.memWrite(0x0038, 0xDB);  // IN 11    -- the ISR, if it ever ran, would echo
+            g.m.bus.memWrite(0x0039, 0x11);
+            g.m.bus.memWrite(0x003A, 0xD3);  // OUT 11
+            g.m.bus.memWrite(0x003B, 0x11);
+            g.m.bus.memWrite(0x003C, 0xFB);  // EI
+            g.m.bus.memWrite(0x003D, 0xC9);  // RET
+
+            g.load({
+                0x31, 0x00, 0x02,  // LXI SP,0200
+                0x3E, 0x95,        // MVI A,95      -- RIE on: the SAME control byte ECHOINT writes
+                0xD3, 0x10,        // OUT 10        -- arm the receive interrupt
+                0xFB,              // EI            -- 8080 interrupts enabled
+                0xC3, 0x08, 0x01,  // JMP 0108      -- and now do nothing but spin
+            }, 0x0100);
+
+            // Let the guest arm the chip and start spinning, THEN drop the character in --
+            // at a different point in the loop on every pass. arriveAfter=0 lands it before
+            // the guest has even run; 6000 lands it deep into the spin. Not one offset may
+            // wake it.
+            g.run(arriveAfter);
+            g.tty->feed("!");
+            g.sio->pump();  // the byte arrives through the ONE DOOR (DESIGN.md 7.1) -- which is
+                            // what arms the receiver's deadline while the guest only spins
+
+            // Run it out, and check the wire on EVERY instruction boundary -- a leak that
+            // lasted a single step and cleared itself would still have fired an interrupt,
+            // and this is the loop that catches it (verifyInt runs inside intPending()).
+            for (int i = 0; i < 4000; ++i) {
+                CHECK(!g.m.bus.intPending(), "jumper out: pin 73 NEVER lifts, whatever the chip's IRQ says");
+                CHECK(g.m.cpu()->pc() != 0x0038, "so the CPU never vectors to the ISR");
+                StepResult s = g.m.master()->step(g.m.bus);
+                g.m.clock.advance(s.tStates);
+            }
+
+            // The character was received all right -- the chip is not dead, it is UNWIRED.
+            CHECK((g.m.bus.ioRead(0x10) & 0x80) != 0, "the chip DID raise its own IRQ bit (it is a pin)");
+            CHECK((g.m.bus.ioRead(0x10) & 0x01) != 0, "and the byte is sitting in the receiver, unread");
+            // Nothing ever went back out the transmitter: the ISR never ran.
+            CHECK(g.tty->out().empty(), "and NOTHING was echoed -- no jumper, no interrupt, no echo");
+        }
+    }
+
+    SECTION("ALTMON -- the ROM runs, and talks");
+    {
+        // THE ACCEPTANCE TEST. A real 1K monitor PROM, written for real hardware in
+        // 2016 by someone who owns one, driving a real 6850 through our bus. It is
+        // not a test we wrote; it is a program that either works or does not.
+        Machine m;
+        std::string err;
+
+        auto* mem = dynamic_cast<MemoryBoard*>(m.add("memory", "mem0", err));
+        Region ram;
+        ram.kind = RegionKind::Ram;
+        ram.at   = 0;
+        ram.size = 0xC000;  // 48K -- ALTMON puts its stack at C000 and pushes DOWN
+        mem->addRegion(ram, err);
+        setProperty(*mem, "fill", "zero", err);
+
+        Region rom;
+        rom.kind  = RegionKind::Rom;
+        rom.at    = 0xF800;
+        rom.mount = testRom("altmon/ALTMON.HEX");
+        CHECK(mem->addRegion(rom, err), "the ALTMON ROM (a test fixture) mounts");
+
+        auto* sio = dynamic_cast<Sio2Board*>(m.add("2sio", "sio0", err));
+        auto  s   = std::make_unique<ScriptedStream>();
+        auto* tty = s.get();
+        sio->channel("a")->connect(std::move(s));
+
+        m.add("z80", "cpu0", err);
+        m.power();
+        m.cpu()->setPc(0xF800);
+
+        // Its own command syntax, read out of its own listing: `ahex` reads exactly
+        // four hex digits and ABORTS on any byte below '0' -- so a space is not a
+        // separator, it is a cancel. The spaces in ALTMON's printed command summary
+        // are typography, not grammar.
+        tty->feed("DF800F80F");
+
+        for (int i = 0; i < 400000; ++i) {
+            StepResult r = m.master()->step(m.bus);
+            m.clock.advance(r.tStates);
+        }
+
+        const std::string& out = tty->out();
+        CHECK(out.find("ALTMON 1.3") != std::string::npos, "it printed its banner");
+        CHECK(out.find("DUMP") != std::string::npos, "it echoed the command name");
+
+        // The bytes it dumped are its OWN first sixteen -- which are the 2SIO
+        // initialization: MVI A,3 / OUT 10 / OUT 12 / MVI A,11 / OUT 10 / OUT 12.
+        // So this line is the ROM reading itself back to us THROUGH the card it is
+        // printing the description of.
+        CHECK(out.find("3E 03 D3 10 D3 12 3E 11") != std::string::npos,
+              "and dumped its own 2SIO init code back to us, correctly");
+    }
+}

@@ -1,0 +1,111 @@
+#include "host/terminal/renderer.h"
+
+#include "host/terminal/font.h"
+#include "host/terminal/screen.h"
+
+namespace altair {
+namespace {
+
+// THE CURSOR BLINK IS NOT ON THE CPU'S CRYSTAL -- it is the terminal's own oscillator,
+// asynchronous to the host and unreadable from the S-100 side, exactly like the VDM-1's.
+// So it is measured in SECONDS OF WALL TIME, taken from the Display, which is the one
+// duration on this card that may be (DESIGN.md 7.5).
+constexpr double kBlinkHalfPeriod = 0.5;  // seconds -- ~1 Hz blink
+
+} // namespace
+
+bool TerminalRenderer::blinkOn(Display* d) const {
+    if (!d) return true;
+    return ((uint64_t)(d->hostSeconds() / kBlinkHalfPeriod) & 1) == 0;
+}
+
+bool TerminalRenderer::frameChanged(const TerminalScreen& scr, Display* d) const {
+    if (scr.dirty()) return true;
+    // A blinking cursor (present unless off) or any blinking cell repaints on its own clock.
+    if (d && (cursorMode_ == 1 || hasBlinkCell_)) {
+        if (blinkOn(d) != lastBlinkOn_) return true;
+    }
+    return false;
+}
+
+void TerminalRenderer::render(Display::Owner owner, const std::string& label, Display& d,
+                              TerminalScreen& scr, int windowWidth, const std::string& banner) {
+    if (!font_) return;
+    const int cw = font_->cellCols(), ch = font_->cellRows();
+    const int rows = scr.rows(), cols = scr.cols();
+    const int top  = banner.empty() ? 0 : ch;  // the title bar row, above the screen
+
+    // owner keys this board's own window (issue #234); label titles it; windowWidth sizes it.
+    Surface* s =
+        d.acquire(owner, label, cols * cw, rows * ch + top, PixelFormat::Indexed8, windowWidth);
+    if (!s) return;
+
+    // Index 3 is the title bar's own color: a neutral grey, so the bar never reads as text on
+    // the screen, whichever phosphor the screen uses.
+    const Color pal[4] = {bg_, fg_, dim_, bar_};
+    d.setPalette(owner, pal);
+    s->clear(0);
+
+    // THE TITLE BAR: a full-width grey bar (index 3) with the title in the screen's background
+    // color, centered and cut to the width. Printable ASCII only; anything else shows as '?'.
+    if (top) {
+        for (int y = 0; y < ch; ++y)
+            for (int x = 0; x < cols * cw; ++x) s->put(x, y, 3);
+        std::string text = banner.size() > (size_t)cols ? banner.substr(0, (size_t)cols) : banner;
+        const int   left = (cols - (int)text.size()) / 2;
+        for (size_t i = 0; i < text.size(); ++i) {
+            uint8_t code = (uint8_t)text[i];
+            if (code < 0x20 || code > 0x7E) code = '?';
+            const int px = (left + (int)i) * cw;
+            for (int ry = 0; ry < ch; ++ry) {
+                uint16_t bits = font_->glyphRow(code, ry);
+                for (int rx = 0; rx < cw; ++rx)
+                    if (bits & (0x8000 >> rx)) s->put(px + rx, ry, 0);
+            }
+        }
+    }
+
+    const bool lit = blinkOn(&d);
+    const bool cursorShown = cursorMode_ == 2 || (cursorMode_ == 1 && lit);
+    const int curRow = scr.cursorRow(), curCol = scr.cursorCol();
+    bool sawBlink = false;
+
+    for (int dr = 0; dr < rows; ++dr) {
+        for (int c = 0; c < cols; ++c) {
+            uint8_t code = (uint8_t)(scr.cell(dr, c) & 0x7F);
+            uint8_t a    = scr.attr(dr, c);
+            bool blink   = (a & TerminalScreen::kAttrBlink) != 0;
+            if (blink) sawBlink = true;
+
+            // Whole-screen polarity (a switch) XORs the per-cell reverse; the cursor
+            // then inverts its own cell on top of that (a block cursor).
+            bool reverse = ((a & TerminalScreen::kAttrReverse) != 0) ^ reverse_;
+            bool isCursor = (dr == curRow && c == curCol && cursorShown);
+            if (isCursor) reverse = !reverse;
+            if (selected(dr, c)) reverse = !reverse;  // a mouse selection (TerminalStream)
+
+            bool hideGlyph = blink && !lit;                                 // dark half-cycle
+            uint8_t fgColor = (a & TerminalScreen::kAttrHalf) ? 2 : 1;      // dim vs full
+            uint8_t bgIdx = reverse ? fgColor : 0;
+            uint8_t fgIdx = reverse ? 0 : fgColor;
+
+            const int px = c * cw, py = dr * ch + top;
+            if (bgIdx != 0)
+                for (int y = 0; y < ch; ++y)
+                    for (int x = 0; x < cw; ++x) s->put(px + x, py + y, bgIdx);
+            if (!hideGlyph)
+                for (int ry = 0; ry < ch; ++ry) {
+                    uint16_t bits = font_->glyphRow(code, ry);  // bit 15 = leftmost
+                    for (int rx = 0; rx < cw; ++rx)
+                        if (bits & (0x8000 >> rx)) s->put(px + rx, py + ry, fgIdx);
+                }
+        }
+    }
+
+    scr.clearDirty();
+    lastBlinkOn_  = lit;
+    hasBlinkCell_ = sawBlink;
+    d.present(owner, s);
+}
+
+} // namespace altair

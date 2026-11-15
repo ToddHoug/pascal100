@@ -1,0 +1,282 @@
+#include "core/symbols.h"
+
+#include <cctype>
+
+namespace altair {
+
+namespace {
+
+std::string upcase(const std::string& s) {
+    std::string u;
+    u.reserve(s.size());
+    for (char c : s) u += (char)std::toupper((unsigned char)c);
+    return u;
+}
+
+int hexNib(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+}
+
+bool isHex4(const std::string& s, size_t at, uint32_t& out) {
+    // Exactly four hex digits at [at, at+4). The .PRN address field is four wide.
+    if (at + 4 > s.size()) return false;
+    uint32_t v = 0;
+    for (size_t i = at; i < at + 4; ++i) {
+        int d = hexNib(s[i]);
+        if (d < 0) return false;
+        v = v * 16 + (uint32_t)d;
+    }
+    out = v;
+    return true;
+}
+
+// A whole token as a hex number (1..8 digits). The value field of a .SYM record.
+bool hexToken(const std::string& s, uint32_t& out) {
+    if (s.empty() || s.size() > 8) return false;
+    uint32_t v = 0;
+    for (char c : s) {
+        int d = hexNib(c);
+        if (d < 0) return false;
+        v = v * 16 + (uint32_t)d;
+    }
+    out = v;
+    return true;
+}
+
+bool isBlank(char c) { return c == ' ' || c == '\t'; }
+
+// The payload of a text file, minus the CP/M ^Z padding that fills the last record.
+std::span<const uint8_t> untilEof(std::span<const uint8_t> d) {
+    for (size_t i = 0; i < d.size(); ++i)
+        if (d[i] == 0x1A) return d.subspan(0, i);
+    return d;
+}
+
+}  // namespace
+
+bool SymbolTable::lookup(const std::string& name, uint32_t& out) const {
+    auto it = byName.find(upcase(name));
+    if (it == byName.end()) return false;
+    out = it->second.value;
+    return true;
+}
+
+void SymbolTable::clear() {
+    byName.clear();
+    byAddr.clear();
+    loadOrder.clear();
+}
+
+std::vector<std::string> SymbolTable::labelsAt(uint32_t addr) const {
+    std::vector<std::string> out;
+    auto range = byAddr.equal_range(addr & 0xFFFF);
+    for (auto it = range.first; it != range.second; ++it) out.push_back(it->second);
+    return out;
+}
+
+std::string SymbolTable::operandName(uint32_t value) const {
+    value &= 0xFFFF;
+
+    // A real label wins -- byAddr is labels only, so a hit here is unambiguous.
+    auto range = byAddr.equal_range(value);
+    if (range.first != range.second) return range.first->second;
+
+    // No label at this address, but a symbol may still name the value -- an EQU that is
+    // really an address (BDOS EQU 5), or a linker global from a flat .SYM. byName is
+    // ordered by name, so the choice is deterministic when two symbols share a value.
+    for (const auto& [name, s] : byName)
+        if ((s.value & 0xFFFF) == value) return name;
+    return "";
+}
+
+void SymbolTable::put(const std::string& rawName, uint32_t value, bool isAddr,
+                      const std::string& source, LoadStats& st) {
+    std::string name = upcase(rawName);
+    if (name.empty()) return;
+
+    auto it = byName.find(name);
+    if (it != byName.end()) {
+        st.redefined++;
+        if (st.redefinedNames.size() < 8) st.redefinedNames.push_back(name);
+        // Drop the old reverse entry so a redefined label does not linger at its old
+        // address (equal_range because two names can share a value).
+        if (it->second.isAddr) {
+            auto range = byAddr.equal_range(it->second.value);
+            for (auto r = range.first; r != range.second; ++r)
+                if (r->second == name) { byAddr.erase(r); break; }
+        }
+    } else {
+        st.added++;
+    }
+
+    byName[name] = Sym{value, isAddr, source};
+    if (isAddr) byAddr.insert({value, name});
+}
+
+bool looksLikeSym(std::span<const uint8_t> data) {
+    // The first byte that carries content decides. A .SYM opens with its value --
+    // `0005 BDOS` -- so a hex digit in column 1. A .PRN opens with a space (column 1 is
+    // blank, the address is at column 2) or a form-feed page break.
+    for (uint8_t b : data) {
+        if (b == '\r' || b == '\n') continue;
+        return std::isxdigit(b) != 0;
+    }
+    return false;  // empty -- neither, and the caller reports zero symbols
+}
+
+// One physical line, form-feeds stripped from the front so a page break does not shift
+// the columns. Returns false at end of input.
+static bool nextLine(std::span<const uint8_t> d, size_t& i, std::string& line) {
+    if (i >= d.size()) return false;
+    while (i < d.size() && d[i] == 0x0C) ++i;   // ^L page break
+    line.clear();
+    while (i < d.size() && d[i] != '\n') {
+        if (d[i] != '\r') line += (char)d[i];
+        ++i;
+    }
+    if (i < d.size()) ++i;  // consume the '\n'
+    return true;
+}
+
+namespace {
+
+// True for a MACRO-80 page header: "[title]\tMACRO-80 3.44\tdate\tPAGE\tn". M80 starts every
+// listing with one. Only the first non-blank line is read, so a comment cannot look like it.
+bool isM80Header(const std::string& line) {
+    size_t mark = line.find("\tMACRO-80 ");
+    return mark != std::string::npos && line.find("\tPAGE\t", mark) != std::string::npos;
+}
+
+// The whitespace-delimited token that starts at or after `from`, minus any trailing ':'
+// (M80 writes a public label as `NAME::`).
+std::string sourceToken(const std::string& line, size_t& from, bool stripColons = true) {
+    while (from < line.size() && isBlank(line[from])) ++from;
+    size_t s = from;
+    while (from < line.size() && !isBlank(line[from])) ++from;
+    std::string tok = line.substr(s, from - s);
+    if (stripColons)
+        while (!tok.empty() && tok.back() == ':') tok.pop_back();
+    return tok;
+}
+
+// One M80 listing line. Machine field to index 31, address at index 2-5, its relocation mark
+// at index 6, source from index 32. Returns false only to refuse the file.
+bool m80Line(const std::string& line, int lineNo, const std::string& source, SymbolTable& t,
+             SymbolTable::LoadStats& st, std::string& err) {
+    uint32_t value;
+    if (line.size() <= 32 || isBlank(line[32]) || !isHex4(line, 2, value)) return true;
+
+    size_t pos = 32;
+    std::string first = sourceToken(line, pos, /*stripColons=*/false);
+    size_t second = pos;
+    std::string op = upcase(sourceToken(line, second));
+
+    // M80 requires the colon on a label, so a first token without one is a label only when an
+    // assignment follows it. `DS 4` in column 1 has an address and is no symbol.
+    bool isLabel = first.back() == ':';
+    bool isAssign = op == "EQU" || op == "SET" || op == "DEFL" || op == "ASET";
+    if (!isLabel && !isAssign) return true;
+
+    // Tested only on a line that defines a name: `ASEG` prints 0000' in an absolute listing.
+    char mark = line.size() > 6 ? line[6] : ' ';
+    if (mark == '\'' || mark == '"' || mark == '!') {
+        err = source + ": line " + std::to_string(lineNo) +
+              " has a relocatable address -- link it and load the .SYM, or "
+              "assemble to an absolute origin";
+        return false;
+    }
+
+    while (first.back() == ':') first.pop_back();
+    if (!first.empty()) t.put(first, value, /*isAddr=*/isLabel && !isAssign, source, st);
+    return true;
+}
+
+}  // namespace
+
+bool loadPrn(std::span<const uint8_t> raw, const std::string& source, SymbolTable& t,
+             bool replace, SymbolTable::LoadStats& st, std::string& err) {
+    if (replace) t.clear();
+
+    std::span<const uint8_t> d = untilEof(raw);
+    size_t i = 0;
+    std::string line;
+    int lineNo = 0;
+    bool sawText = false, m80 = false;
+
+    while (nextLine(d, i, line)) {
+        ++lineNo;
+
+        if (!sawText && line.find_first_not_of(" \t\f") != std::string::npos) {
+            sawText = true;
+            m80 = isM80Header(line);
+        }
+        if (m80) {
+            if (!m80Line(line, lineNo, source, t, st, err)) return false;
+            continue;
+        }
+
+        // ASM and MAC. The address lives in columns 2-5 (index 1-4). No address there -- a
+        // blank line, a bare comment, an ORG with no label -- means no symbol on this line.
+        uint32_t value;
+        if (!isHex4(line, 1, value)) continue;
+
+        // The source field is column 17 (index 16). A label is present only when that
+        // column is non-blank; a code/continuation line has whitespace there.
+        if (line.size() <= 16 || isBlank(line[16])) continue;
+
+        // The label is the first whitespace-delimited token of the source field, minus a
+        // trailing ':'. Handles `START:` (colon) and `monit` (tabs, no colon) alike.
+        size_t pos = 16;
+        std::string label = sourceToken(line, pos);
+        if (label.empty()) continue;
+
+        // Column 7 (index 6) marks a constant: '=' for an EQU, '#' for a MAC SET. Its value
+        // may be a BDOS function number as easily as an address, and nothing tells them
+        // apart, so it feeds name->value ONLY -- never the reverse map (else 0015 renders
+        // as some FWRITE).
+        bool isConst = line.size() > 6 && (line[6] == '=' || line[6] == '#');
+        t.put(label, value, /*isAddr=*/!isConst, source, st);
+    }
+
+    if (st.added > 0 || replace) t.loadOrder.push_back(source);
+    return true;
+}
+
+bool loadSym(std::span<const uint8_t> raw, const std::string& source, SymbolTable& t,
+             bool replace, SymbolTable::LoadStats& st, std::string& err) {
+    (void)err;  // a .SYM has no format error to report -- no relocation, no records to fail
+    if (replace) t.clear();
+
+    std::span<const uint8_t> d = untilEof(raw);
+
+    // Records are `HHHH NAME`, several per line, separated by one-or-more TABs and by the
+    // line breaks. Split on any whitespace run and read pairs: value, name, value, name...
+    // A .SYM has no EQU/label distinction, so every symbol is name->value only (isAddr=false).
+    std::vector<std::string> tok;
+    std::string cur;
+    for (uint8_t b : d) {
+        if (b == ' ' || b == '\t' || b == '\r' || b == '\n') {
+            if (!cur.empty()) { tok.push_back(cur); cur.clear(); }
+        } else {
+            cur += (char)b;
+        }
+    }
+    if (!cur.empty()) tok.push_back(cur);
+
+    for (size_t k = 0; k + 1 < tok.size(); ) {
+        uint32_t value;
+        // A value token is hex; if it is not, this is a header/garbage token -- skip one and
+        // resync rather than pairing a name with the wrong number.
+        if (!hexToken(tok[k], value)) { ++k; continue; }
+        t.put(tok[k + 1], value, /*isAddr=*/false, source, st);
+        k += 2;
+    }
+
+    if (st.added > 0 || replace) t.loadOrder.push_back(source);
+    return true;
+}
+
+}  // namespace altair

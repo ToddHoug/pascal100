@@ -1,0 +1,835 @@
+# Driving pascal100 with an AI
+
+How to let an **AI assistant** drive **pascal100**, the simulator of the Digicomp Pascal-100 and
+the CompuPro IEEE 696 boards around it, through its built-in MCP server — so you can say *"using
+pascal100, do …"* and it does it, instead of you
+cutting and pasting between a chat window and a terminal. It can boot a machine, type at its
+console, read what it prints, build a CP/M program, single-step and debug one, and talk to a
+program over a real serial port — all through typed tools.
+
+This works with **any MCP-capable assistant**. The examples below use **Claude** as the concrete
+client, but the server speaks the open Model Context Protocol and the same steps apply elsewhere.
+
+Every recipe below was **verified end to end** against the CP/M machine that ships in this
+package (`examples/cpm22/cpm22-buffered.toml`). Point at the `pascal100` you were given.
+
+**New to this?** The `examples/ai-mcp/` folder is a ready-made working directory: register the
+server there (below) and ask your assistant to build and fix the little program waiting in it —
+a complete, guided round trip through everything this document describes.
+
+## Contents
+
+- Starting the server
+- Register the server with your assistant
+- Several machines, and several projects
+- Your own project
+- Watching over its shoulder — and taking the keyboard
+- The tools
+- Knowing the commands
+- The pattern: an expect loop
+- Rules for a guest program
+- From a bare disk image to a booting machine
+- Amending a machine instead of rewriting it — the delta file
+- Debugging a behavior: make the machine show you, don't guess
+- Investigate a program you did not write
+- Attaching a serial port to a board
+- Toward a real machine
+- Gotchas
+- Without the MCP (CLI fallback)
+- Where to go next
+
+## Starting the server
+
+```
+pascal100 <machine> --mcp        # <machine>: a built-in name, or a path to a .toml
+```
+
+It speaks line-delimited **JSON-RPC 2.0 on stdio**. Send `initialize`, then `tools/call`.
+A machine named on the command line is loaded (disks mounted, boards fitted) but **its
+`startup` is NOT run** — under `--mcp` you boot it yourself with the `run` tool, so nothing
+blocks before you have control. Switching machines mid-session with `CONFIG LOAD` is safe the
+same way: its `startup` runs up to the boot `RUN`, which under `--mcp` **parks** the PC rather
+than entering the run loop — so `CONFIG LOAD anymachine.toml` never wedges the server. Advance
+it with `run {from: …}` afterward.
+
+**On macOS, start a downloaded copy from a terminal, not with a double-click.** Finder opens a
+plain executable as a document, and macOS refuses that even when the copy is notarized. The
+same copy started from a terminal is checked as a program. That check passes when the Mac is
+online. If macOS still blocks the start with a dialog (*"pascal100" Not Opened* on newer
+versions, seen on macOS 27; *cannot be opened because the developer cannot be verified* on older
+ones), tell the user to press **Done**. **Move to Trash** is the default button and deletes the
+program. If the Mac cannot reach Apple, remove the quarantine mark: run
+`xattr -dr com.apple.quarantine ./pascal100` in the package folder. Remove the mark once per
+download. Every new archive carries a new mark.
+
+Each machine in `examples/` is one complete TOML file. The CP/M example this guide is written
+against is the machine file `examples/cpm22/cpm22-buffered.toml`.
+
+Minimal driver:
+
+```python
+import subprocess, json
+p = subprocess.Popen(["pascal100", "examples/cpm22/cpm22-buffered.toml", "--mcp"],
+                     cwd=WORKDIR, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     text=True, bufsize=1)
+# write {"jsonrpc":"2.0","id":N,"method":"tools/call","params":{"name":..,"arguments":..}}\n
+# read one JSON line back per call.  results are in result.structuredContent
+```
+
+`cwd` matters: the host-bridge sandbox (`hb0`) defaults to the directory you launch from, so
+launch from the directory holding the files you want to move in and out — or aim it elsewhere
+with `monitor {command: "SET hb0 HOSTDIR=/path"}`.
+
+## Register the server with your assistant
+
+Starting the server by hand is only for a quick look. To have the **assistant** drive it, you
+register `pascal100 --mcp` as an MCP server with your client **once**, and from then on you just
+talk to the assistant. A client needs two things: the command to run, and to know it speaks over
+stdio — both of which `pascal100 --mcp` satisfies.
+
+**Register it from the directory you want as the sandbox** — the host bridge (`R`/`W`) and any
+relative paths resolve against wherever the server is launched, so launch it where your files
+are. If `pascal100` is not on your `PATH`, use its full path in place of `pascal100` below.
+
+**Claude Code (the CLI).** One command, with the machine you want it to drive after the `--`
+(everything after `--` is the command the client will run):
+
+```
+cd examples/ai-mcp
+claude mcp add pascal100 -- pascal100 cpm-ai.toml --mcp
+claude mcp list                       # confirm it is registered and reachable
+```
+
+Then start `claude` in that directory and give it the job in plain language:
+
+> *Using pascal100, boot CP/M and show me what is on the disk.*
+
+`claude mcp add` defaults to **local** scope (this project, just you). Add `--scope project` to
+write a shareable `.mcp.json` into the directory instead — commit that and anyone who opens the
+folder gets the same server. `claude mcp get pascal100` shows how a given one is configured.
+
+**The registered program can be a different one from `pascal100` on your `PATH`.** A server
+registered as `./pascal100` runs the copy in that folder. `pascal100` typed in a shell runs the
+copy on `PATH`, which can be a different release with different tools. To start the same
+program by hand, use the command that `claude mcp get pascal100` shows.
+
+**Claude Desktop, or any other MCP client.** These read a JSON config. Add an `mcpServers` entry
+naming the command and its arguments:
+
+```json
+{
+  "mcpServers": {
+    "pascal100": {
+      "command": "pascal100",
+      "args": ["/absolute/path/to/examples/ai-mcp/cpm-ai.toml", "--mcp"],
+      "cwd": "/absolute/path/to/examples/ai-mcp"
+    }
+  }
+}
+```
+
+**Use absolute paths here.** The Desktop app currently launches a server in your **home
+directory**, not the project (a known Claude Code bug), so a relative machine path won't be found
+and the host-bridge sandbox won't land where you expect. Give the machine an absolute path, set
+`cwd` to the folder you want as the sandbox, and — if files still don't resolve — pin it from
+inside with `monitor {command: "SET hb0 HOSTDIR=/abs/path"}`. On macOS, Claude Desktop's config is
+`~/Library/Application Support/Claude/claude_desktop_config.json`; **restart the app** after
+editing it. Other clients differ in *where* the config lives, but the `mcpServers` block is the
+same shape.
+
+## Several machines, and several projects
+
+Nothing above is one-machine or one-project — the same mechanism scales three ways.
+
+**The server name is a label, not the machine.** In `claude mcp add `**`pascal100`**` -- …`, the
+first word names the *server*; register as many as you like under different names and an assistant
+sees them all at once, each pointed at its own machine:
+
+```
+claude mcp add p100-cpm     -- pascal100 cpm-ai.toml --mcp
+claude mcp add p100-pascal  -- pascal100 pascal-console.toml --mcp
+```
+
+(Names are letters, digits, `-` and `_`.)
+
+**Scope keeps projects apart.** The default **local** scope files the server under the directory
+you ran `claude mcp add` in, so it shows up only when you start `claude` there — register pascal100
+once per project, in that project's folder, and they never collide. **`--scope project`** instead
+writes a `.mcp.json` into the folder, so the server travels with it (commit or copy the folder and
+it comes too) — the right choice for a self-contained machine directory like `examples/ai-mcp/`.
+**`--scope user`** makes one entry for every project, which suits a fixed machine that needs no
+project files (a built-in like `default`, for work on the bus with no disk).
+
+**The working directory is where your files are.** pascal100's host-bridge sandbox — and any
+relative `<machine>` path — resolve against the *server's* working directory. From the **`claude`
+CLI** that is the directory you started `claude` in, which is why registering and running from the
+machine's own folder just works, and why relative paths in a committed `.mcp.json` stay portable
+(use `${CLAUDE_PROJECT_DIR}` in the paths to be robust even when `claude` is started from a
+subfolder). The **Desktop app** is the exception noted above — it starts the server in your home
+directory — so there, use absolute paths.
+
+## Your own project
+
+When the user starts a project of their own, two habits keep it on track:
+
+- **Keep a spare copy of the machine and its disk image**, untouched, beside the working copy.
+  The guest writes to the disk as it runs, so "start again" means copying the spare back — a
+  known state — not rebooting whatever the guest last wrote.
+- **Keep a session note in the project folder.** At the end of a session, stop any processes
+  you started, then write down what you learned and where the work stands. At the start of the
+  next one, read that note first, boot the machine, and tell the user where you left off.
+  Without the note you rebuild the state from scratch each time, and get it wrong.
+
+## Watching over its shoulder — and taking the keyboard
+
+You do not have to read a transcript after the fact to see what the assistant is doing. Add
+`--mirror socket:PORT` next to `--mcp` and a person can `nc localhost PORT` (or `telnet localhost
+PORT` — a clean Mac has `nc` but no `telnet`) to watch the **very session the assistant is
+driving** — every character the guest prints as it prints it —
+and **type back onto the line to take over**, sharing the console with the assistant:
+
+```
+pascal100 examples/cpm22/cpm22-buffered.toml --mcp --mirror socket:2323
+```
+
+The assistant keeps driving through `run`/`send`/`recv` exactly as before — the mirror is
+invisible to it — while whatever it types and whatever the guest prints also crosses the socket to
+you. Type there and the guest reads it as if you had reached over and used the keyboard.
+Add `?ro` to watch without being able to type — quote it (`--mirror 'socket:2323?ro'`), since
+`?` is a shell wildcard and an unquoted `socket:2323?ro` makes the shell fail with `no matches
+found`. One watcher at a time.
+
+`nc` and `telnet` exit each time you restart the simulator, and Windows installs neither. For a
+person who wants one window that stays open, the package has `tools/mirror-watch.sh` (macOS,
+Linux; bash only) and `tools/mirror-watch.ps1` (Windows; PowerShell only). Each waits for the
+mirror, shows it, and reconnects after a restart. With no argument it watches `localhost:2323`;
+`PORT` or `HOST PORT` picks another. They are watch-only — to type, use `nc`. On Windows, tell
+the person to start it with `powershell -ExecutionPolicy Bypass -File tools\mirror-watch.ps1`.
+
+**On macOS and Linux the mirror can be a pseudo-terminal: `--mirror pty`.** The simulator prints
+`pascal100: --mirror: open /tmp/pascal1000 (/dev/ttys004)` on stderr, and the person opens that
+name with a terminal program — `screen /tmp/pascal1000`, `minicom -D /tmp/pascal1000` — which
+sends each key as it is typed and adds no echo of its own, where `nc` does both badly. There is no
+port to pick. The first mirror is `/tmp/pascal1000`, the next `/tmp/pascal1001`; `--mirror
+pty:PATH` puts the name where you say, and `?ro` makes it watch-only. The name is a link that the
+simulator removes when it stops. With nobody on it the output is dropped, so the person sees the
+session from the moment they open it. Windows has no pseudo-terminal: `--mirror pty` is refused
+there, so use `socket:PORT`.
+
+**For a person with a hardware terminal, the mirror can be a real serial port:
+`--mirror serial:DEVICE`** (every platform; `COM3` on Windows). The port is 8N1 at 9600 baud with
+no flow control; `?baud=N` selects another rate and `?ro` makes it watch-only. Quote the option.
+The simulator cannot tell when a terminal is on the port, so it sends at all times, at the speed
+of the port, and it does not make the guest wait.
+
+Between two `run`s the guest is stopped, so a character you type then waits on the line and is
+read on the next `run` — the same as staging input with `send`. To hand the console to a person,
+**`start`** the guest instead (see *Leaving the guest running* below): it then runs between calls,
+as after `RUN` at the monitor, and answers what the person types at once. (This is the same `|socket:PORT`
+mirror the monitor's `CONNECT` offers on any line; the *Serial lines* chapter of the User Manual
+covers it in full.)
+
+### A text log a person can follow: `--log`
+
+`--log FILE` next to `--mcp` writes what the guest prints to `FILE` as plain text, as it is
+printed. It is an ordinary text file: a person can `cat` it, open it in an editor, search it or
+copy from it at any time, and can follow it live with, for example, `tail -f FILE` (PowerShell:
+`Get-Content -Wait FILE`). It holds the whole session from the first character, where
+a mirror shows only what is printed while a watcher is connected.
+
+```
+pascal100 examples/cpm22/cpm22-buffered.toml --mcp --log session.log
+```
+
+The log is watch-only; use `--mirror` when the person must type. The two can be given together.
+The file is emptied at each start, a bare name lands in the folder `pascal100` was started in,
+and a file that cannot be opened is an error before the session starts. You can read the file
+too, when you want the full console history and not only what your last `run` returned.
+
+## The tools
+
+`tools/list` is authoritative — ask it rather than working from the tables below. Each tool's
+schema comes off the board itself, so ask `board_types` what a card can be told rather than
+guessing.
+
+**Building and inspecting a machine** — fitting boards and reading them back, mapping the bus,
+reading and writing memory, the ROMs, reset — is a `board_*`, `bus_*` or `mem_*` tool, and
+`tools/list` names them with their arguments.
+
+**Driving a running guest** is the handful below, and they are the ones worth knowing by heart:
+
+| Tool | Args | Does |
+|---|---|---|
+| `run` | `from?`, `input?`, `until?`, `unit?`, `timeout_ms?` (2000, max 600000), `max_steps?`, `stop_at?` | Type `input`, advance the guest, return what it printed. Stops on `until` match, `stop_at` reached (`stopped: "stop-at"`, a one-shot PC stop for this call only), a **prompt** (guest idle on console input), `timeout_ms`, `max_steps`, HLT, a breakpoint, a port no board decodes under `SET BUS UNCLAIMED=HALT` (`unclaimed`), or a cancel of the request (`notifications/cancelled`) or a ^C sent to the pascal100 process (both give `stopped: "interrupted"`) — see `stopped`. `timeout_ms` is a ceiling, not a wait: the call returns as soon as one of the others fires. `from` sets PC first (that is how you boot). Bus and board messages from the run, such as a `SET BUS UNCLAIMED=WARN` line, come back in `warnings`. **Never blocks.** |
+| `send` | `text`, `unit?` | Type at the console (or at `unit`) without running. |
+| `recv` | `unit?` | Drain output since last read, without running. |
+| `regs` | — | CPU registers now (`pc`, `halted`, `registers{}`). |
+| `start` | `from?`, `input?` | Start the guest and **leave it running** between calls; returns at once. See *Leaving the guest running*. |
+| `stop` | — | End a free run; report `stopped`, `pc`, `steps`, `t_states` for all of it. |
+
+**Any serial unit, not only the console: `unit`.** `send`, `recv` and `run` take
+`unit: "<board>:<unit>"`, the monitor's own spelling, for example `"if4:user3"`. This is how you
+drive each user of a multi-user system such as MP/M, one line at a time. It works on any line,
+also one that is shown in a terminal window: a person typing in the window and you share that
+line, as two keyboards on one terminal would. On `run`, `input` goes to the unit and `until` and
+`output` are that unit's text; the console's output waits for `recv`. Output that nobody read
+yet counts for `until`, so `recv {unit}` first to start clean. A unit keeps the newest 64 KiB
+from the time the machine loaded. A machine whose console is a terminal window has no console
+line under `--mcp`: name every line with `unit`, and `run` then ends on `until`, `timeout_ms`
+or a stop, never on idle.
+
+```
+run  {from: 0, unit: "ss1:serial", until: "0A>", timeout_ms: 60000}   # boot MP/M on its console
+recv {unit: "if4:user3"}                                              # tty1: what it printed so far
+run  {unit: "if4:user3", input: "DIR\r", until: "0A>"}                 # a command on tty1
+```
+
+**Control bytes: use `\uXXXX`.** `input` and `text` are raw bytes — whatever you pass reaches
+the guest untouched, control characters included, and every line in the machine is 8-bit
+clean. Write a control byte as the JSON escape it is: `\u0003` for ^C, `\u001a` for ^Z,
+`\u001b` for ESC.
+
+```
+send {text: "\u0003"}                        # ^C: stop a program that checks for it
+run  {input: "\u001a", until: "A>"}          # ^Z ends a PIP copy from the console
+```
+
+**If your client sends the argument text as written**, a `\r` or a `\u0003` in `input` reaches
+the guest as those characters, not as one byte. Use the `TYPE` command through `monitor`
+instead. `TYPE` decodes its own escapes: `\r`, `\"` for a quote, `\^C` for Ctrl-C (`\^Z`,
+`\^[` for ESC), and `\xHH` for any byte. Then a bare `run` lets the guest read the keys.
+
+```
+monitor {command: 'TYPE "DIR\r"'}             # a CP/M line, ended by a CR
+monitor {command: 'TYPE "\^C"'}               # Ctrl-C
+run     {until: "A>"}
+```
+
+`\x03` is **not** JSON — there is no `\x` escape in the format — and it is not rejected
+either: it reaches the guest as the three ordinary characters `x03`. If a control byte seems
+to vanish while printable text gets through, that is the reason.
+
+**`monitor`** `{command}` runs any one monitor command (`CONNECT`, `MOUNT`, `SET`, `IN`,
+`OUT`, `DISASM`, …) and returns its text — the escape hatch for anything without a dedicated
+tool.
+
+## Knowing the commands
+
+You do not have to memorize the monitor. Two ways to get the whole surface:
+
+- **`cheatsheet.md`, shipped beside this file** — the full `pascal100 [options]` block, every
+  monitor command with its abbreviation and usage, every board and machine, the `CONNECT`
+  endpoint table, and a machine-file skeleton. It is generated from the program, so it matches
+  the binary you were given. Read it once for the lay of the land.
+- **Ask the running machine.** `monitor {command: "HELP"}` lists every command;
+  `monitor {command: "HELP <cmd>"}` prints one command's abbreviation, usage and detail
+  (`?` is the same as `HELP`). For the MCP/board surface, `tools/list` and `board_types`
+  self-describe.
+
+## The pattern: an expect loop
+
+One `run` per guest command, matching the prompt each time. The machine's `startup` does not
+run under `--mcp`, so `PC` is 0 until the first `run {from: …}` boots the guest:
+
+```
+run {from: 0, until: "A>"}                       # boot CP/M: the Disk 1 boot EPROM is at 0000
+run {input: "DIR\r", until: "A>"}                # a command, read the reply
+run {input: "ASM FOO\r", until: "A>", timeout_ms: 20000}
+```
+
+**Match the prompt that the system prints.** CompuPro CP/M prints `A>`. Some CP/M systems
+print the user number too, as `A0>`, and `A0>` does not contain `A>`. On such a system, use
+`until: "A0>"`.
+
+`\r` submits a CP/M line. `run` also returns on its own when the guest reaches a prompt
+(`stopped: "idle"`), so you rarely need to guess a timeout for interactive commands.
+
+**`idle = false` on the CPU board turns off this stop.** A machine file that sets
+`idle = false` never gets `stopped: "idle"`: each `run` continues until `until` matches or
+`timeout_ms` ends. On such a machine, give every `run` an `until`.
+`board_set {id: "cpu0", key: "idle", value: "true"}` turns the stop on again.
+
+**A program that reads one key takes no `\r`.** A question such as `Replace? (Y/N)` reads one
+character with BDOS function 1. Send `input: "Y"`. If you send `"Y\r"`, the `\r` stays in the
+type-ahead buffer, and the next prompt reads it as its answer.
+
+**Send one line in each `run`, and wait for its output before the next.** The server gives
+`input` to the guest at the baud rate of the board, with no pause after a carriage return. A
+person cannot type that fast. A guest that has no type-ahead buffer loses the characters that
+arrive while it is busy with the last line: a line arrives with its first characters missing
+(`FILE` arrives as `LE`), and the guest gives no error. A monitor that reads the console with
+interrupts and keeps one character only does this: four lines in one call lose characters, and
+the same four lines in four calls arrive complete. A guest that polls the port, such as CP/M,
+takes each character when it is ready and loses none, but the rule is correct for it too. This
+is the guest and not the simulator: real hardware at the same baud rate loses the same
+characters.
+
+**Make `until` the full prompt, and text that the guest does not print again.** A `run` stops
+at the first place where `until` occurs in the output. If `until` is only the start of a longer
+prompt, the call returns before the guest prints the remaining characters. For example, `DDT`
+has the prompt `-`, and a line of its output can also hold a `-`. With `until: "-"`, the call can
+return in the middle of the output. Match `"\n-"` instead. A prompt that the guest prints more than one time gives the same
+problem. A disk that runs `PROFILE.SUB` prints `A>` more than one time, and the guest
+discards input that arrives while the file runs. Match text that only the state you want
+prints.
+
+**`timeout_ms` is a ceiling, not a wait.** The call ends the moment `until` matches or the
+guest reaches a prompt, so a budget larger than the job costs you nothing — a 50-second
+assembly under `timeout_ms: 120000` returns in 50 seconds, not 120. There is no reason to
+trim it to what you expect the work to take, and no need to re-issue `run` by hand to walk a
+long job forward. Set it to the worst case you are willing to sit through and let `until` end
+the call. The maximum is 600000 (ten minutes); anything larger is clamped to it.
+
+**`from` is a JSON number, and JSON has no hex.** Write the decimal value: `65280` for `FF00`,
+`64512` for `FC00`, `63488` for `F800`. A string such as `"0xFF00"` is not a number, so the server
+refuses the call and tells you the number to send: `` `from` must be a JSON number, not a string:
+"0xFF00" is 65280 ``. Every tool checks its arguments this way, so a wrong type or a missing
+required argument is an error, and never a silent 0.
+
+### Stopping a `run` early, and `status`
+
+A `run` ends by itself at `timeout_ms`. Two things stop it sooner, and both return
+`stopped: "interrupted"` with what the guest printed so far:
+
+- **Cancel the request.** Send the standard `notifications/cancelled` with the request id of the
+  `run`. The server reads its input while a `run` goes on, so it sees the cancel at once. A cancel
+  that names another request, or that arrives after the `run` returned, is ignored, and it never
+  applies to the next call. Other requests sent during a `run` wait, and are answered in order after
+  it returns.
+- **Send the process a `^C`** (`kill -INT`). The first `^C` is caught and only interrupts the `run`.
+  A second `^C` before the server has reported the first one ends the server. A server started in
+  the background, or with `nohup`, ignores `^C`.
+
+Either way the machine is left as it was, and the next `run` starts clean. A `^C` with no `run` in
+progress does nothing to the guest, unless the guest is free-running (`start`, below). A `^C` then
+ends the free run, with `stop_reason: "interrupted"`.
+
+**`status` never waits.** It is answered by the reader thread, not the worker, so it answers even
+while a `run` (or a long `monitor`, `mem_load` or `snapshot`) is in progress. It returns the board
+id, `in_flight` (whether the worker is busy on any request), and the `pc` and `steps` of the last
+`run` or free run. Those two go stale: a `step` or a `monitor` command moves the real PC without
+changing them, and `steps` restarts at zero on the next `run`. `generation` is the one field that
+always climbs, so use it to tell "still advancing" from "stuck on the same slice". Poll `status`
+before you cancel, to see whether the `run` is still alive. `running` and `stop_reason` report the
+free run (next section).
+
+### Leaving the guest running: `start` and `stop`
+
+A `run` is bounded: the guest stops when the call returns. Some jobs need the guest to keep going
+between calls — a server on the guest that must answer its clients in time, two machines that
+talk to each other and must run side by side, or a person who takes over the console through
+`--mirror`. For these, use `start`:
+
+```
+start  {from: 0}                   # boot, and keep running; returns at once
+send   {text: "TNFSD\r"}           # the guest reads it by itself -- no run needed
+recv   {}                          # what it has printed so far
+status {}                          # running: true
+stop   {}                          # stopped: "requested", steps, t_states
+```
+
+- **The guest runs until** `stop`, a `HLT`, a breakpoint, `SET BUS UNCLAIMED=HALT` or a `^C`
+  to the process. Never on a timeout, and never because it is idle.
+  `status` gives `running`, and once it has stopped, `stop_reason` says why.
+- **Every other tool works while it runs.** The server runs the guest in short slices, and
+  answers each request between two slices, with the guest paused. `send`, `recv`, `regs`,
+  `mem_dump`, `breakpoints`, `monitor` — all answer in well under a millisecond. Only `run` and
+  `step` are refused until you `stop`, because they move the guest themselves.
+- **Output collects until `recv`.** The server holds the newest 1 MiB. If a guest prints more
+  than that before you read it, `recv` reports how many older bytes it let go, in `dropped`.
+- **`SET cpu0 clock_hz=N` paces the guest to that crystal**, as at the monitor, so a real serial
+  device or a network peer gets wall-clock time to reply. Without it the guest runs flat out, and
+  at a prompt the server naps between slices, so an idle guest does not use a whole core.
+- **Only an interrupt or RESET ends a `HLT`.** On a halted processor, `run`, `start` and `step`
+  with `from` return an error: `processor halted at PC=0042 -- RESET ends the halt.` Without
+  `from`, they return the same error when nothing can end the halt. Send `reset` first.
+- **Two machines are two servers.** Start each with its own `pascal100 --mcp`, and `start` both.
+  They then run side by side, each on its own server.
+
+**The console under `--mcp`.** There is no host keyboard behind a pipe, so the server moves the
+console line onto an in-memory terminal that `send`, `run` and `recv` read and write. Every other
+line keeps running and is serviced on every `run` slice: a second serial board on a real port, a
+socket. A program that moves bytes between the console and a modem port works as it would at a real
+terminal.
+
+## Rules for a guest program
+
+This document is about the simulator. The rules of a program that runs in the guest are in
+separate skills. Each skill is one short Markdown file. In the package, each one is a folder
+in `skills/`. Read the file for the program that the task uses:
+
+| Skill | Read it when the task… |
+|---|---|
+| `skills/pascal100-cpm-build/SKILL.md` | builds a CP/M program: `ASM` and `LOAD`, or `MAC` with `Z80.LIB` |
+| `skills/pascal100-hostbridge/SKILL.md` | moves a file into or out of the guest: `R`, `W`, `HDIR` |
+| `skills/pascal100-cpm-text/SKILL.md` | makes or edits a text file for CP/M: CR/LF line ends, the 8.3 name |
+
+`ASM.COM` has **no `INCLUDE`** directive (that is M80's `MACLIB`) — each `.ASM` carries its
+own equates.
+
+**Work on a copy of the disk.** CP/M writes to the mounted image; the `.dsk` files are not
+redistributable and there is no undo — copy the machine directory first if you are about to
+write in anger.
+
+**One buffer can stand between a guest write and the bytes on your host disk, and it is the
+guest's.** The BIOS of this machine is **track-buffered**: it holds the current track in RAM,
+and writes it to the disk when CP/M asks for another track or drive, or waits for a key. Not
+every CP/M BIOS buffers, and you cannot tell from the prompt which kind you have. **Assume that
+the BIOS buffers.** A guest at the `A>` prompt is waiting for a key, so end at `A>` before you
+read the image on the host, unmount it or take a snapshot; a guest stopped in the middle of a
+program can still hold the last track. pascal100 adds no buffer of its own: each sector the
+guest writes goes into the host `.dsk` at once, so no `UNMOUNT` is needed first.
+
+**One pascal100 per image.** Each process reads the image into memory when it mounts it, so a
+second pascal100 on the same `.dsk` does not see what the first one wrote, and its own writes
+go on top of them.
+
+## From a bare disk image to a booting machine
+
+The build skill starts from a machine that already has its disk wired in. When all you have
+is a **bare image** — a `.dsk` or a `.imd` off a real machine — and no machine file, three
+things trip up a cold start:
+
+- **`.imd` converts to `.dsk` on MOUNT.** `monitor {command: "MOUNT fd0:drive0 mydisk.imd"}`
+  converts the ImageDisk to a raw `mydisk.dsk` beside it (asking the controller for geometry)
+  and mounts *that*; a raw `.dsk` mounts as-is. The convert happens **only in the `MOUNT`
+  command** — a TOML `mount = "mydisk.imd"` line does **not** convert. So the from-cold path
+  is: `MOUNT` the `.imd` once to produce the `.dsk`, then reference that `.dsk` in the machine
+  file.
+- **Drive units are `drive0..driveN`, not `0`.** `MOUNT fd0:0 …` is rejected — a disk
+  controller names its units `drive0`, `drive1`, … (unlike a serial card's `a`/`b`/`tty`).
+  When in doubt, `monitor {command: "SHOW MOUNTS"}` prints every mountable unit spelled out as
+  `id:driveN` with what it holds.
+- **Geometry is read from the image's size.** A disk controller sizes itself from the byte
+  count, not from a mode switch. The CompuPro Disk 1 reads the number of sides from the size of
+  the image. It has 8″ drives only, so it refuses an image the size of a 5¼″ disk.
+- **Build the machine file from the skeleton.** The guide always started from an existing
+  machine; to write one from scratch, copy the **"A machine file, in one look"** skeleton in
+  `cheatsheet.md` (beside this file) — it shows a `[[board.drive]]` with `unit`/`mount`. Pick a
+  disk controller with `board_types` (or `monitor {command: "SHOW BOARDS"}`), give it a
+  `[[board.drive]]` pointing at your `.dsk`, and add the boot PROM / `startup` line that
+  controller boots from. The User Manual's **Disks** chapter (`pascal100-manual.pdf`) walks
+  the same ground in depth.
+
+## Amending a machine instead of rewriting it — the delta file
+
+You rarely want to write a whole machine from scratch. A machine file that names `base =
+"<other.toml>"` is a **delta**: it starts from that machine and changes only what you name.
+Inside it, what a `[[board]]` block *does* is decided by its `type` and `id` together, and the
+four cases are easy to get backwards — the difference between "amend the console card to connect
+channel B" and "throw the console card away and fit a new one":
+
+- **`type` + a *new* `id`** → **add** a board.
+- **`type` + an `id` the base already has** → **replace** that whole card.
+- **no `type`, just the `id`** → **modify in place** — change a property, leave the rest.
+- **`remove = true`** → pull the board out.
+
+Redeclaring a `type` for an `id` *this same file* already declared is an error. So to nudge one
+property of an existing board, name it by `id` with **no** `type`; the moment you add a `type`
+you are replacing the card, not editing it. (`board_set` over MCP is the live equivalent of the
+no-`type` modify-in-place; `board_add` is the add.)
+
+## Debugging a behavior: make the machine show you, don't guess
+
+**Read this before you form a single theory.** When a guest misbehaves — a character dropped, a
+byte mistimed, a loop that runs when it shouldn't — **the simulator already knows exactly what
+happened. Get it to tell you before you decide what it is.** The debugger records every
+instruction with its registers and every bus cycle; a breakpoint plus a history dump *shows* you
+the cause. A hypothesis about what the guest "probably" does is almost always wrong, and each
+wrong guess costs a round trip to disprove. One trace replaces a dozen guesses.
+
+**What NOT to do** (each of these wastes hours):
+
+- **Do not speculate a mechanism and then build on it.** "It's probably pacing / a look-ahead /
+  an overrun" is a guess. Confirm it in a trace or throw it away. Do **not** propose a fix for a
+  cause you have not observed.
+- **Do not hand-decode bytes into instructions.** `DISASM` is the authoritative decoder — the
+  same decode the CPU uses. Eyeballing opcodes invents instructions that are not there (and
+  reading a PROM-shadowed region by hand yields garbage that looks like real code).
+- **Do not add `printf`/file logging in the hot path.** It perturbs timing and hides the very
+  timing bug you are chasing (a Heisenbug). The built-in recorder is passive — use it.
+- **Do not fight the console with `expect`/pty prompt-matching.** Drive the monitor over `--mcp`
+  (`monitor {command: …}`): one command in, clean text out, nothing to mis-sync.
+
+**The method that works:**
+
+1. **Reproduce deterministically** — the smallest input that shows the symptom, every time.
+2. **Break on the exact event, not a guessed address.** `BREAK IO R <port>` stops on a port
+   read, `BREAK IO W <port>` / `BREAK MEM R|W <addr>` on I/O or memory, `BREAK <addr>` (or
+   `BREAK <addr> IF <expr>`) on code. An `IO`/`MEM` break needs **no** reverse-engineering to
+   place — you break on the read/write itself. To stop on the *byte* an `IN` read rather than
+   the fact of the read, use `BREAK IO R <port> LOADS <expr>` — it is judged after the
+   instruction, so the register holds what just arrived (the status bit that finally came up,
+   the byte that was out of range).
+3. **Sweep, then read.** The `HISTORY` recorder is **always on**, so the moment a break fires the
+   run-up to it is already captured — `HISTORY CPU 500` dumps the last 500 instructions with their
+   registers, no arming needed. To go forward instead, `STEP 500` runs quietly and `HISTORY CPU
+   500` dumps what it just ran. Either way, read what actually executed — do not summarize it in
+   your head, read it.
+4. **Follow the one datum.** Track the specific byte in `A`, the register, or the memory write
+   through those instructions: where it is stored (`LD (HL),A`), where control branches, and who
+   called the code (stack pointer depth and the return address). Run a **working** case beside a
+   **failing** one and find the single instruction where they diverge.
+5. **Only then design the fix** — against the confirmed cause, never the theory.
+
+Example: a console that drops a character from a pasted command. `BREAK IO R 0` (the data port
+of Interfacer 1 channel A), type `DIR`, then `STEP`/`HISTORY` from each read and follow the byte
+in `A`. The trace shows, as fact, whether each typed byte is read from the UART, which byte
+reaches the command line and which is thrown away, and the branch where a kept byte and a
+dropped byte part company. Reach for the trace first.
+
+### The debugger commands — reach for the one that fits
+
+The whole debugger is reachable over MCP, nearly all of it through `monitor {command: …}`; only
+`regs` and `mem_dump` have dedicated tools. You do not memorize these — `monitor {command: "HELP
+<cmd>"}` prints any one's syntax — but you do need to know they *exist*, because the right command
+turns a guess into a fact. Grouped by what you are trying to see:
+
+**Where the processor is, and moving it forward**
+
+| To… | Command | Why it is the one |
+|---|---|---|
+| See the CPU now | `regs` (or `REGS`) | Free on every stop — you rarely type it. The last column is the next instruction, already disassembled. |
+| Run one instruction, or *n* | `STEP` / `STEP 20` | Real bus cycles through the real decode — it *is* the machine moved forward one instruction. Prints the registers after each. |
+| Step **over** a `CALL`/`RST` | `NEXT` (`N`) | Runs the callee as `RUN` does (paced by `clock_hz`, flat out by default) and stops the instant it returns — so you stay in the code you are reading instead of touring a print routine. On anything else it is a single step. |
+| Jam the PC and look | `EXAMINE <addr>` | Sets PC to `<addr>`, then shows the register line and the instruction `STEP` will run. |
+
+**Stopping on the exact event**
+
+| To… | Command | Why it is the one |
+|---|---|---|
+| Reach a code address | `BREAK <addr>` / `BREAK <lo>-<hi>` | PC lands **on** it, nothing there has run yet — `STEP` runs it fresh. |
+| Catch whatever writes/reads memory | `BREAK MEM W <addr>` / `BREAK MEM R <addr>` | Watches the **bus**, not an instruction — so it catches a DMA write no CPU instruction made, and works unchanged on any processor. This is how you find who clobbers a byte. |
+| Catch a port access | `BREAK IO R <port>` / `BREAK IO W <port>` | The same, on I/O — break on the read/write itself, no address to reverse-engineer. |
+| Stop only in the case you care about | `BREAK <addr> IF <expr>` | Condition on the registers. **A bare word is that register; a literal needs a leading zero** — `0A` is ten, `A` is the accumulator. `== != < > <= >= && \|\| & \|` and parens. Works on `MEM`/`IO` breaks too. |
+| Stop on the byte an `IN` **read** | `BREAK IO R <port> LOADS <expr>` | Judged *after* the instruction, so the register holds the byte that just arrived. `IF` sees the inputs, `LOADS` the result. |
+| List / clear | `BREAK` / `NOBREAK [id]` | Ids are plain decimals, not bus addresses. |
+
+**Reading and changing memory**
+
+| To… | Command | Why it is the one |
+|---|---|---|
+| Read a block | `mem_dump` / `DUMP <addr>` | Peeks — runs no bus cycle, consumes nothing. Hex plus ASCII; read a string straight out of the right column. |
+| Disassemble | `DISASM <addr> <count>` | Peeks, and decodes for the CPU actually in the machine. **Must start on an opcode** — one byte off and the listing is fiction (it re-syncs a line or two later, so it can look right while its first instruction is a phantom). Single-step to a known boundary if unsure. |
+| Patch one byte / a run | `DEPOSIT <addr> <bytes>` / `EDIT <addr>` | A **real** bus write — it says so if nothing decodes the address, rather than pretending. `EDIT` also assembles an instruction in place (`IN 10` → `DB 10`). |
+| Name things | `SYMBOLS LOAD prog.PRN` | Then `BREAK START`, and `DISASM` reads `CALL BDOS`, not a bare address. A `.PRN`/`.LST` listing is richer than a `.SYM` (it marks `EQU`s); an L80 `.SYM` holds globals only. |
+| Find / fill / move / compare | `SEARCH` `FILL` `MOVE` `COMPARE` | `COMPARE <range> <file>` checks what the machine loaded against what you meant to load. |
+
+**The bus and the boards**
+
+| To… | Command | Why it is the one |
+|---|---|---|
+| Poke a board like the guest would | `IN <port>` / `OUT <port> <val>` | **Real** bus cycles with every side effect — consumes a UART byte, advances a sector counter. Poke a board without writing guest software. |
+| Ask who answers | `WHO <addr>` / `WHO IO <port>` | No cycle run. When an `IN` gives you `FF`, `WHO` tells you whether a board answered with that byte or **the bus floated because nobody decodes it** — the single most useful disambiguation on this machine. Also flags contention and `PHANTOM*`. |
+| See the whole backplane | `SHOW BUS MAP\|IO\|IRQ\|CONTENTION` | `IRQ` is the *only* window on interrupt wiring — a board strapped to a line nobody listens to fails in total silence. `CONTENTION` finds two boards on one port in a machine you built yourself. |
+| Hear a board narrate itself | `SHOW DEBUG`, then `SET <ch> DEBUG=<flag>` | Instrumented parts (`6850` serial, `socket` connect) describe what they do in their own terms, each line prefixed with the PC that drove it. |
+
+**The machine over time**
+
+| To… | Command | Why it is the one |
+|---|---|---|
+| See what led to the stop | `HISTORY [n]` / `HISTORY BUS [n]` | A flight recorder that is **always on** — the run-up to any break is already recorded. Each `HISTORY` line reads like a `STEP`; `HISTORY BUS` is raw cycles naming *who drove* and *who answered* (DMA names the board; a floated read shows `--`). |
+| Trace a region as it runs | `TRACE ON [file] [MASK=IN,OUT,IRQ,DMA,CONTENTION]` | Logs every matching cycle. A **tracepoint** — `BREAK <addr> TRACE ON` and `BREAK <addr> TRACE OFF` — flips tracing on entering a subroutine and off leaving it, without ever stopping the machine. An assistant has no console to trace to, so through the `monitor` tool the file is necessary: `TRACE ON <file>`, and for a tracepoint `TRACE ON <file>` then `TRACE OFF` first. The `bus_trace` tool gives the same cycles with no file. |
+| Copy the whole session | `SET CONSOLE log=session.txt` | Guest output and your input to a host file as they happen. |
+| Save and return to a moment | `SNAPSHOT <file>` / `RESTORE <file>` | Saves *state*, not configuration — build the machine first with a machine file or `CONFIG LOAD`; `RESTORE` matches boards by id and type, and names (in `not_restored`) each board it could not restore. |
+
+The full reference, with a worked session for each, is the **Debugger** document
+(`pascal100-debugger.pdf`, shipped beside this file); every command's one-line syntax is in
+`cheatsheet.md`.
+
+### Drive it through a persistent `--mcp` session, not a pty
+
+The debugging loop above only works if controlling the machine is *effortless* — one command in,
+its answer out, decide the next. You get that by keeping **one `--mcp` process open** (the minimal
+driver near the top of this guide) and sending one `tools/call` per step: `monitor {command: …}`
+is literally "enter a monitor command, read its text, enter the next," with **no console echo and
+no prompt to match**. `run`, `regs`, `send`, `recv` fill in the rest. That is the loop for
+stepping and tracing.
+
+**Do not reach for `expect` or a raw pty to drive the interactive monitor for this.** A pty echoes
+your keystrokes back *interleaved* with the machine's output, and matching the `pascal100> ` prompt
+races the **stale** prompt already sitting in the buffer — so your captures come back empty or as
+fragments of the next command, and a `RUN` followed by typed input races the monitor against the
+guest over who reads the line. If you catch yourself logging a whole session to a file to grep
+afterward, you have already lost the loop: stop and drive it over `--mcp`.
+
+This is also the only way to reliably send a real **carriage return** — and that is the single
+biggest "the simulator is broken" false alarm, so it earns its own gotcha:
+
+- **A `\r` reaches the guest as 0x0D only if your client JSON-*escapes* it.** The server feeds
+  the bytes of the decoded `input` string verbatim, so `json.dumps({"input": "DIR\r"})` from a
+  persistent Python session puts a genuine 0x0D on the wire. But some tool wrappers pass the two
+  characters `\` and `r` literally, or send an Enter as LF (0x0A) — and **CCP, `DDT` and
+  `ASM.COM` all accept LF**, so nothing looks wrong until a program that does single-character
+  reads and *requires* a true CR. `SYSGEN`'s drive prompts are exactly that: fed anything but
+  0x0D they loop `Invalid drive name` forever. When Enter seems ignored, stop guessing at the
+  program — drive from the persistent Python `--mcp` session, where `\r` is a real 0x0D.
+
+Two more gotchas once you do:
+
+- **`notifications/initialized` gets no reply.** After `initialize`, send it as a JSON-RPC
+  *notification* (no `id`) and do **not** try to read a line back for it — waiting for a response
+  that never comes hangs the driver. Then begin your `tools/call`s.
+- **Confirm the guest is actually at its prompt before you type.** Under `--mcp` a machine's
+  `startup` parks, and some boots idle through a PROM countdown/banner that `run`'s idle heuristic
+  reads as "done." Loop `run` until the guest reaches its interactive prompt — press Enter with
+  `run {input: "\r"}` and watch the prompt echo back — *before* you feed a command, or a boot-time
+  reader swallows your first characters (an early `DIR` typed too soon showed up as the cold loader
+  eating `DIR` while only the tail reached the OS).
+
+## Investigate a program you did not write
+
+Building is half of it; the other half is taking a binary apart to see how it works — a monitor
+loader, a period utility, a game — which is what the machine is really for. The same command crib
+above is the whole toolkit; the moves that take a program apart are `SYMBOLS LOAD prog.PRN` (so
+`DISASM` reads `CALL BDOS`, not a bare address), `BREAK <addr>` at the load address (it trips the
+moment CP/M's loader jumps in, before the first instruction), then `DISASM` the region and `STEP`
+through it — `NEXT` over the calls you already trust.
+
+The pattern for "explain what this does": load or run the code far enough to have it in memory,
+`BREAK` where you want to start looking, `DISASM` the region, then `STEP` through the interesting
+part reading the registers — the same way you would with `DDT`, but with the assistant
+doing the bookkeeping. The `examples/ai-mcp/` walkthrough does exactly this to find a planted bug:
+it breaks at the load address, disassembles the loop, and single-steps until a register shows the
+wrong value — then fixes the source and reassembles. The full command set with a worked session for
+each is the **Debugger** document (`pascal100-debugger.pdf`), and every command's syntax is in
+`cheatsheet.md` beside this file.
+
+## Attaching a serial port to a board
+
+A serial channel `CONNECT`s to an endpoint: `console | null | loopback | serial:/dev/tty… |
+socket:PORT | socket:HOST:PORT`.
+
+The CP/M machine has a CompuPro Interfacer 1 with two channels. Channel `a` (ports `00`/`01`)
+holds the console. Channel `b` (ports `02`/`03`) is free:
+
+```
+monitor  {command: "SHOW if1"}                                    # the channels and their straps
+monitor  {command: "SET if1:b baud=19200"}                        # baud is a unit strap
+monitor  {command: "CONNECT if1:b serial:/dev/tty.usbserial-XXXX"} # a real host port
+monitor  {command: "CONNECT if1:b loopback"}                      # TX->RX plug, for self-test
+```
+
+Address a channel as `if1:a` or `if1:b`. Each channel has its own `port`, which is **hex**.
+
+Framing (8N1 …) comes from the straps (`data_bits`, `parity`, `stop_bits`) and the control latch
+that the guest writes. A real host port is reprogrammed to follow. During every `run`, each
+connected line is serviced, so a program shuttling bytes between the console and a modem port
+works live: bytes the far end sends arrive on the guest console, and bytes typed on the console
+arrive at the far end.
+
+### Interfacer 1 register crib
+
+Each channel, at its port `P`: `P` is the data (write to send, read to receive), `P+1` is the
+control latch (write) and the status byte (read).
+
+- **Status (read):** `0x01` TBMT (transmit buffer empty, 1 = ready), `0x02` DAV (a character
+  waits), `0x08` parity error, `0x10` overrun, `0x20` framing error, `0x40` DSR and `0x80` CTS
+  (both 0 = ON).
+- **Control latch (write):** each 1 bit *inverts* the line from its strap, and 0 returns it to
+  the strap. `OUT` of `00` puts the channel back to its jumpers. `SHOW BOARD interfacer1` lists
+  every strap.
+
+### Driving a real serial device — the clock is the trap
+
+The moment the far end is real hardware with real reply latency, the CPU clock stops being a
+performance knob and becomes a **timing** one. A period BIOS times a serial read with an
+instruction-count busy-loop calibrated for one clock — for example, a loop count that means
+"1 s at 2 MHz". `clock_hz` rescales that constant: `SET cpu0 clock_hz=4000000` halves the
+timeout, `clock_hz=0` (flat-out, the default) burns it in microseconds. Run the guest too fast
+and its timeout shrinks below the device's actual reply latency — the read times out, retries,
+and desyncs **before the answer arrives**. Pin `clock_hz` to the clock the guest's constants
+assume — the clock of the machine the code was written for — unless you have measured headroom.
+
+**`clock_hz` changes on a running machine.** Build flat out, then set the period clock before
+you test against the device:
+
+```
+board_set {id: "cpu0", key: "clock_hz", value: "0"}         # build flat out
+run {input: "ASM FOO\r", until: "\nA>", timeout_ms: 300000}
+board_set {id: "cpu0", key: "clock_hz", value: "2000000"}   # then the period clock
+monitor {command: "CONNECT if1:b serial:/dev/cu.usbserial-XXXX"}
+monitor {command: "SET if1:b baud=19200"}
+run {input: "FOO\r", until: "\nA>", timeout_ms: 180000}
+```
+
+How much margin you need is timeout-vs-latency, not the clock alone. A per-transaction protocol
+(the device pauses to seek or process between requests) needs a big margin; a back-to-back
+streaming transfer tolerates far less — the same guest code has desynced at 4 MHz on a per-sector
+protocol yet run clean well past 20 MHz on a whole-track one. And a serial poll loop is
+I/O-bound: past a modest clock, raising `clock_hz` buys **no** throughput, it only erodes the
+margin. Don't reach for a faster clock to "speed up" a wire-bound transfer.
+
+**Watch the wire.** Tee a line to a chronological hex dump — the single best view of exact TX/RX
+interleaving and timing:
+
+```
+monitor {command: "CONNECT if1:b serial:/dev/cu.usbserial-XXXX |cap.log?fmt=dump&ts=elapsed&gap=50"}
+```
+
+`gap` is a bare millisecond integer (`gap=50`, not `50ms`; `0` = never break a row on a pause).
+The tap lives **in the sim process**, so it stops on `QUIT` — a late reply a device streams after
+you have quit never reaches the log.
+
+**One owner per host port.** Exactly one process may hold `/dev/cu.…`; close any `pyserial` (or
+other pascal100) that has it, or the attach fails busy. pascal100 already flushes stale RX on open
+(`tcflush`), so an external flush is redundant — and worse, opening the port from pyserial toggles
+DTR/RTS, which can knock a device out of its current mode. Let the sim own the port.
+
+**`timeout_ms` bounds a live transfer too.** Traffic on a real device does not extend the budget. Give a streaming read a `timeout_ms` as long as its worst case (up to
+600000 ms) and let `until` end the call early, same as any other command; a call that hits
+`timeout_ms` mid-transfer returns `stopped: "timeout"` with what it read so far, which is a normal
+result to resume `run` (no new `from`) on, not a failure. Watch a destination pointer climb via
+`regs`/`mem_dump` if you want to confirm it is still making progress rather than stuck.
+
+## Toward a real machine
+
+The reason the serial attach matters: the endpoint a channel `CONNECT`s to is the only thing that
+changes between the simulator and the metal. Build and debug a program on the simulated machine —
+where you can single-step it and dump its memory — and when it works, `CONNECT` the same channel
+to `serial:/dev/cu.…` (a USB-to-serial cable to a real CompuPro system, a Pascal-100, or any period machine) and
+send the identical bytes at real hardware. The guest program does not know the difference; only
+the endpoint moved. That makes the simulator a bench for the real machine: prove it here, then run
+it there, and when they disagree you have a known-good side to compare against.
+
+(On macOS use the `/dev/cu.*` name, not `/dev/tty.*` — `cu` does not block waiting for carrier.)
+
+## Gotchas
+
+- **The CP/M BIOS trashes registers.** `CONST`/`CONIN`/`CONOUT` may clobber any register. Keep
+  loop state in **memory**, not a register.
+- **Hex ports, decimal prompts.** A board's `port` is **hex**, but a guest program may prompt
+  in **decimal** for a port. Interfacer 1 channel `b` has its data at `0x02` and its status at
+  `0x03` = **3**. A wrong port aims the program at undecoded I/O that floats to `0xFF`, so it
+  "receives" an endless stream of `0xFF`.
+- **Disk units are `driveN`, and `.imd` converts on MOUNT** — `MOUNT fd0:0 …` is rejected;
+  the unit is `drive0`. `SHOW MOUNTS` spells them out. A `.imd` becomes a raw `.dsk` on
+  interactive `MOUNT` only, not through a TOML `mount =` line (see the bare-image section).
+- **A disk image can live on a TNFS server.** `MOUNT fd0:drive1 tnfs://<host>[:<port>]/<path>`
+  (default port 16384) reads the whole image at mount; changes go back to the server when the
+  guest flushes and at `UNMOUNT`. A machine file takes the same URL in `mount =`.
+- **High bytes in output** — a serial terminal can print any byte; the server escapes
+  non-UTF-8 bytes as `\u00XX` so the JSON stays valid. Read `output` as text.
+- **Debug at runtime** — `mem_dump` the (possibly self-modified) code and `regs` mid-run.
+
+## Without the MCP (CLI fallback)
+
+If you cannot run the MCP server, the same machine answers the monitor:
+
+```
+pascal100 examples/cpm22/cpm22-buffered.toml -x 'BOARDS' -i          # run a command, then stay interactive
+pascal100 examples/cpm22/cpm22-buffered.toml -s script.cmd           # run a command script, exit with status
+```
+
+But note: a bare monitor **`RUN` blocks on stdin under a pipe** (stdin is the script/JSON-RPC
+channel), so anything that reads the guest console wants the MCP `run` tool or a real TTY /
+`expect`. `STOP` = **`^E`** returns from a running guest to the monitor; **`^C` belongs to
+CP/M** (warm boot), so the guest keeps it. There is no `BOOT` verb — the Disk 1 boot EPROM at
+`0000` is the boot command (`RUN 0`).
+
+## Where to go next
+
+The **User Manual** (`pascal100-manual.pdf`, shipped beside this file) is the full reference —
+the machines, the boards, the monitor, serial, disks, and the MCP server in depth. This guide
+is the operator's crib for driving it all through MCP, and **`cheatsheet.md`** (also beside this
+file) is the at-a-glance list of every option and command when you just need the syntax.

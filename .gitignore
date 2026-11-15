@@ -1,0 +1,177 @@
+# Build
+build/
+build-asan/
+out/
+cmake-build-*/
+_deps/
+CMakeUserPresets.json
+
+# The plain-Makefile convenience build (docs/building-*.md): objects, generated
+# sources and the binary all live here (kept out of build/, which is CMake's).
+build-make/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+.cache/
+compile_commands.json
+
+# macOS
+.DS_Store
+.AppleDouble
+Icon?
+._*
+
+# Windows
+Thumbs.db
+*.pdb
+*.ilk
+
+# Simulator artifacts
+*.snap
+*.replay
+pascal100.log
+altairsim.log           # altairsim's own files, when altairsim is run in this folder
+
+# The assembled distribution. tools/build-package.sh writes dist/pascal100-<ver>-<target>/
+# and the archive beside it -- an OUTPUT of the tree, never an input to it. The directory
+# itself is TRACKED (via dist/README.md) so it always exists after a checkout: dist/ is
+# also the release COLLECTION point (DISTRIBUTION.md 6), and a worker must be able to scp into
+# it before the coordinator has built anything. Contents stay ignored; the README does not.
+/dist/*
+!/dist/README.md
+
+# Binaries CI built, pulled down by tools/fetch-ci-binaries.sh. Scratch: overwritten on
+# every fetch, read by nothing in the build or the tests.
+/artifacts/
+
+# The built documents. THE MARKDOWN IS THE SOURCE; the PDF is an artifact of it, of the
+# binary (the reference chapters are printed from the program) and of a browser.
+#
+# The USER-FACING PDFs ARE TRACKED. tools/build-docs.sh makes docs/pascal100-manual.pdf and
+# docs/pascal100-devguide.pdf, and they are versioned deliverables: they ship in the
+# distribution zip beside the binary, and a fresh clone should carry the manual a reader can
+# open without a pandoc-and-a-browser toolchain to build it. So they are committed on purpose
+# (regenerate and re-commit them when the docs change), and NOT listed here.
+#
+# The line that is NOT ours to track is the SCANNED REFERENCE MANUALS in reference/ (below):
+# vendor datasheets, tens of MB each, and burned into this repo's history twice already. That
+# is the "no PDFs in the reference directory" rule -- our documentation is fine, their scans
+# are not. The intermediate HTML the browser prints from stays an artifact too.
+docs/*.html
+.pascal100_history
+.altairsim_history
+
+# Disk/tape images are large and usually not ours to redistribute.
+# Commit them deliberately with `git add -f` if a test genuinely needs one.
+*.dsk
+*.DSK
+*.cas
+*.img
+
+# disks/ IS AN ALLOWLIST, the other way round from everything above. NOTHING under disks/
+# is tracked unless it is named here, so a `git add -A` after a download cannot put
+# megabytes of somebody else's images into history. A line is earned by:
+#   - the machine files and one README per directory, which are ours;
+#   - a source file that a board document cites (the Tarbell BIOS listing);
+#   - a disk image named one at a time below, on purpose. pascal100 (2026-11-09): the
+#     CompuPro CP/M 2.2 disk that the Pascal-100 build guide starts from. It holds only
+#     Digital Research and CompuPro distribution files, plus our R.COM and W.COM.
+disks/**
+!disks/**/
+!disks/**/*.toml
+!disks/**/README.md
+!disks/compupro-disk1/cpm22/CPM.DSK
+!disks/tarbell-sd/cpm22/buffered/BIOS (1).ASM
+
+# tests/media/ is the simulator's own test media -- every image in it is there because a test
+# reads it, so it is committed on purpose. examples/ is never a simulator fixture -- an example
+# is tested only to prove the example works -- so a test that needs a disk takes its own copy here.
+!tests/media/**/*.dsk
+!tests/media/**/*.DSK
+!tests/media/**/*.img
+
+# examples/ IS THE SHIPPED SET, and it is an allowlist for the same reason disks/ is.
+#
+# These are the examples that ship -- cpm22, cpm86, cpm8-16, mpm8-16, pascal, debugger and ai-mcp --
+# and they are what goes in
+# the package. They are tested only as examples (acceptance-examples); the simulator's own
+# tests take their media from tests/media/ (above). The rules above would hide most of it:
+# `*.dsk` swallows the CP/M images.
+#
+# So each shipped file is named. If you add one and git does not see it, that is this
+# block doing its job -- add the line.
+examples/**
+!examples/**/
+!examples/**/*.toml
+!examples/**/README.md
+# Every example's README is rendered to a sibling README.pdf (tools/build-docs.sh, committed
+# by CI) so a file manager with no Markdown viewer can read it, and so it travels in the
+# package. One glob covers all of them, at any depth.
+!examples/**/README.pdf
+!examples/cpm22/cpm22k-64k.dsk
+# UCSD Pascal III.0 for the Pascal-100, ready to boot (the master Pascal-DD-OneBIOS). Not MIT:
+# examples/pascal/README.md says so.
+!examples/pascal/pascal-dd.dsk
+!examples/debugger/HELLO.ASM
+!examples/debugger/HELLO.PRN
+!examples/debugger/HELLO.HEX
+# examples/ai-mcp ships the CP/M disk (with HELLO.ASM baked on for an assistant to build over
+# MCP); HELLO.ASM is here too as the pristine planted bug -- kept to rebuild the disk, stripped
+# from the package like every other .ASM beside an image (tools/build-package.sh).
+!examples/ai-mcp/cpm22k-64k.dsk
+!examples/ai-mcp/HELLO.ASM
+# CompuPro 8-16 systems on the CPU 8085/88. DRI and CompuPro files only, not MIT: each
+# example's README says so, and says what was removed from the original master.
+!examples/cpm86/cpm86-11.dsk
+!examples/cpm8-16/cpm816-11r.dsk
+!examples/mpm8-16/mpm816-boot.dsk
+!examples/mpm8-16/m20.dsk
+
+# Scanned manuals and datasheets. Same reasoning as the disk images, and then
+# some: they are enormous (the 88-DCDD manual alone is 52 MB) and they are not
+# ours. They are the SOURCE the boards were built from, not part of the build --
+# keep them here on disk, cite them by filename in the code, and let
+# docs/sources.md say where each one came from. See [altair-hardware-sources].
+#
+# This was decided once, and then a `git add -A` put 83 MB of them in history
+# anyway; that history has been rewritten out. If you find yourself typing
+# `git add -f reference/...`, you are about to do it a third time.
+#
+# The ONE exception, allowlist-style like disks/ above: the *.md files here are
+# OURS -- distilled, text-only emulation references written FROM the scans, each
+# citing its source PDF by filename. "Our documentation is fine, their scans are
+# not." Those are tracked; the scans themselves stay ignored.
+reference/*
+!reference/*.md
+
+# CTest scratch output
+Testing/Temporary/
+
+# Capture files. The manual's examples connect a line to `out:printout.txt`, and altairsim's
+# lineprinter and parallel machines wrote these two names, so a run from the repo root can
+# drop one here -- and an empty one got committed once by a `git add -A` (37afae6).
+printout.txt
+parallel-out.txt
+
+# .claude/ IS MOSTLY LOCAL, AND ONE DIRECTORY IN IT IS NOT.
+#
+# settings.local.json is this machine's permission grants, scheduled_tasks.lock is a runtime
+# file, and worktrees/ is agent scratch -- none of it is repository content, and a `git add -A`
+# would sweep every one of them into a commit (the same mistake printout.txt records above).
+# So the default is EXCLUDE, and the exception is named.
+#
+# .claude/skills/ IS TRACKED ON PURPOSE. It holds the pascal100 skill -- the briefing an
+# assistant reads to drive a guest over MCP -- and Claude Code discovers a project skill at
+# exactly that path, so committing it is what makes a fresh clone work with no setup. It is
+# also the packaged skill's source (docs/package.map ships it as `skills/`).
+#
+# The pattern must exclude the CONTENTS (`.claude/*`), not the directory (`.claude/`): git
+# does not descend into an excluded directory, so a `!` re-include underneath one never fires.
+.claude/*
+!.claude/skills/
+
+# This site's release machines: addresses, ssh users, serial port names. The tracked
+# distribution.conf.example is the template; each site keeps its own copy under this name.
+distribution.conf

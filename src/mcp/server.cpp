@@ -1,0 +1,2783 @@
+#include "mcp/server.h"
+
+#include "boards/s100-memory.h"
+#include "boards/registry.h"
+#include "cli/monitor.h"
+#include "core/crc32.h"
+#include "core/debug.h"
+#include "core/hex.h"
+#include "core/roms.h"
+#include "core/version.h"
+#include "cpu/cpu.h"
+#include "host/agent_tap.h"
+#include "host/console.h"
+#include "host/endpoint.h"
+#include "host/filter.h"
+#include "host/mirror_stream.h"
+#include "host/tee_stream.h"
+#include "host/stream.h"
+#include "isa/isa.h"
+#include "util/json.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <fstream>
+#include <iostream>
+#include <istream>
+#include <mutex>
+#include <ostream>
+#include <sstream>
+#include <thread>
+
+namespace altair {
+
+namespace {
+
+Json strSchema(const char* desc) {
+    Json p = Json::obj();
+    p["type"] = Json("string");
+    p["description"] = Json(desc);
+    return p;
+}
+Json intSchema(const char* desc) {
+    Json p = Json::obj();
+    p["type"] = Json("integer");
+    p["description"] = Json(desc);
+    return p;
+}
+Json boolSchema(const char* desc) {
+    Json p = Json::obj();
+    p["type"] = Json("boolean");
+    p["description"] = Json(desc);
+    return p;
+}
+
+Json tool(const char* name, const char* desc, Json props, std::vector<std::string> required) {
+    Json t = Json::obj();
+    t["name"] = Json(name);
+    t["description"] = Json(desc);
+    Json schema = Json::obj();
+    schema["type"] = Json("object");
+    schema["properties"] = props;
+    Json req = Json::arr();
+    for (auto& r : required) req.push(Json(r));
+    schema["required"] = req;
+    t["inputSchema"] = schema;
+    return t;
+}
+
+// ---- The tool list. The interactive four -- run/send/recv/regs -- drive a RUNNING
+// ---- guest: they type at its console, read what it prints, and advance it a bounded
+// ---- slice at a time so a `tools/call` never blocks (unlike a bare RUN, which under a
+// ---- pipe would wait for a stdin that is the JSON-RPC channel -- monitor.cpp:818).
+Json toolList() {
+    Json list = Json::arr();
+
+    list.push(tool("board_types", "Every board type compiled in, with its properties.",
+                   Json::obj(), {}));
+    list.push(tool("board_list", "The boards in the machine: id, type, memory and I/O decode.",
+                   Json::obj(), {}));
+
+    {
+        Json p = Json::obj();
+        p["id"] = strSchema("Board id, e.g. mem0");
+        list.push(tool("board_get",
+                       "Every property of one board: value, legal range, and whether it is "
+                       "settable at runtime. Schema comes from the board itself.",
+                       p, {"id"}));
+    }
+    {
+        Json p = Json::obj();
+        p["type"] = strSchema("Board type, e.g. memory");
+        p["id"] = strSchema("The id to give it");
+        list.push(tool("board_add", "Add a board to the backplane.", p, {"type", "id"}));
+    }
+    {
+        Json p = Json::obj();
+        p["id"] = strSchema("Board id");
+        p["key"] = strSchema("Property name (board_get lists them, with legal values)");
+        p["value"] = strSchema("New value");
+        list.push(tool("board_set",
+                       "Set one property. Validated against the board's own metadata: illegal "
+                       "enums, out-of-range ints, and config-time properties on a running "
+                       "machine are REJECTED, never half-applied.",
+                       p, {"id", "key", "value"}));
+    }
+    {
+        Json p = Json::obj();
+        p["addr"] = intSchema("Address 0-0xFFFFFF");
+        list.push(tool("who",
+                       "Who drives this address, for a read and for a write -- and whether "
+                       "PHANTOM* is asserted. The reverse lookup for a decode you don't believe.",
+                       p, {"addr"}));
+    }
+    list.push(tool("bus_map", "The memory decode map, plus the holes that float to 0xFF.",
+                   Json::obj(), {}));
+    list.push(tool("bus_io", "The I/O decode map.", Json::obj(), {}));
+    list.push(tool("bus_contention",
+                   "Every address two boards BOTH actually drive. A PHANTOM* overlay is not "
+                   "contention and does not appear here -- the shadowed board switches itself "
+                   "off, so only one board answers.",
+                   Json::obj(), {}));
+    {
+        Json p = Json::obj();
+        p["lo"] = intSchema("First address");
+        p["hi"] = intSchema("Last address (inclusive)");
+        list.push(tool("mem_dump",
+                       "Read memory through the bus -- exactly what a CPU would see: live bank, "
+                       "PHANTOM* overlays applied, unmapped addresses reading 0xFF. A ROM reads "
+                       "back like anything else. To see a bank that is not selected, or a board "
+                       "that is phantomed out, SELECT it (board_set bank=/phantom=) and read "
+                       "ordinary addresses -- the same thing the guest would have to do.",
+                       p, {"lo", "hi"}));
+    }
+    {
+        Json p = Json::obj();
+        p["addr"] = intSchema("Address");
+        p["bytes"] = strSchema("Hex bytes, e.g. \"C3 00 2C\"");
+        p["rom"] = boolSchema("Program a ROM: write behind the bus, into whichever chip answers "
+                              "reads at this address");
+        list.push(tool("mem_deposit",
+                       "Write memory. Through the bus by default, which means a write to ROM "
+                       "goes NOWHERE (the board never answers the cycle) and the result says so. "
+                       "Pass `rom` to program it anyway -- that is the operator pulling the chip "
+                       "and putting it in a programmer, which is why the operator can and the "
+                       "guest cannot. Addresses are always bus addresses, 0000-FFFF.",
+                       p, {"addr", "bytes"}));
+    }
+    {
+        Json p = Json::obj();
+        p["path"] = strSchema("Path to an Intel HEX or flat binary file");
+        p["at"] = intSchema("Load address. Required for a flat binary; a HEX file places itself, "
+                            "and giving `at` anyway relocates it so its FIRST data record lands "
+                            "here (wrapping modulo 64K)");
+        p["format"] = strSchema("BIN or HEX. Overrides the sniffed content, which is otherwise "
+                                "what decides");
+        p["rom"] = boolSchema("Program a ROM: write behind the bus rather than through it");
+        list.push(tool("mem_load", "Load a HEX or binary file. Every HEX checksum is verified.",
+                       p, {"path"}));
+    }
+    list.push(tool("roms", "The ROMs compiled into the simulator: name, size, CRC32.",
+                   Json::obj(), {}));
+    {
+        Json p = Json::obj();
+        p["kind"] = strSchema("bus | power");
+        list.push(tool("reset",
+                       "bus = the RESET button (RESET*). power = a power cycle. NEITHER "
+                       "RESET CLEARS RAM -- only power does. A RAM chip has no reset pin.",
+                       p, {"kind"}));
+    }
+    {
+        Json p = Json::obj();
+        p["from"]       = intSchema("Optional start address: set PC here first (like RUN <addr>). "
+                                    "Omit to resume from the current PC.");
+        p["input"]      = strSchema("Optional keystrokes to type at the console before running "
+                                    "(raw bytes; add a trailing \\r to submit a CP/M line). "
+                                    "Control bytes go through untouched -- write one as the JSON "
+                                    "escape it is: \\u0003 is ^C, \\u001a is ^Z, \\u001b is ESC. "
+                                    "\\x03 is NOT JSON and arrives as the characters x03.");
+        p["until"]      = strSchema("Optional: stop as soon as this substring appears in the "
+                                    "output (e.g. a prompt like \"A0>\").");
+        p["unit"]       = strSchema("Optional serial unit as <board>:<unit> (e.g. \"if4:user3\"): "
+                                    "`input` goes to it, `until` and `output` are its text, and "
+                                    "the console's output stays queued for `recv`. With no "
+                                    "console line, the call ends on `until`, `timeout_ms` or a "
+                                    "stop, never on idle.");
+        p["timeout_ms"] = intSchema("Wall-clock ceiling for this call in ms (default 2000, max "
+                                    "600000). A CEILING, NOT A WAIT: the call returns the moment "
+                                    "`until` matches or the guest reaches a prompt, so a budget "
+                                    "bigger than the job costs nothing -- set it to the longest "
+                                    "you will sit through rather than re-issuing `run` to walk a "
+                                    "long job forward. By default the guest runs flat out and "
+                                    "this only bounds how long we wait; with `SET cpu0 clock_hz=N` "
+                                    "set, the guest is paced to that crystal so a real serial/"
+                                    "socket device has wall-clock time to reply within this "
+                                    "budget.");
+        p["max_steps"]  = intSchema("Optional instruction-count cap for this call.");
+        p["stop_at"]    = intSchema("Optional address (a decimal number, as `from`): stop when "
+                                    "the PC reaches it, before the instruction there runs -- "
+                                    "reported as `stopped: \"stop-at\"`. At least one instruction "
+                                    "runs first, so a PC already there stops on its next arrival. "
+                                    "One-shot: it is gone when the call returns, however it "
+                                    "ended, and it is not a breakpoint (no id, not listed).");
+        list.push(tool("run",
+                       "Advance the running guest a bounded slice and return what it printed to "
+                       "the console. STOPS on: `until` matched, `stop_at` reached, a prompt "
+                       "reached (the guest is spinning on console input with nothing to say), "
+                       "timeout_ms, max_steps, a HLT, a breakpoint, an I/O port no board decodes under SET BUS "
+                       "UNCLAIMED=HALT (`unclaimed`), a "
+                       "`notifications/cancelled` naming this call's "
+                       "request id, or a SIGINT to the pascal100 process itself (an "
+                       "out-of-band ^C) -- reported in `stopped`, the last two as "
+                       "`interrupted`. Bus and board messages from the run (a SET BUS "
+                       "UNCLAIMED=WARN line, say) come back in `warnings`. This is the expect "
+                       "loop: type a command with `input`, read the reply, call again. Never "
+                       "blocks. Refused while the guest is free-running (`start`) -- `stop` it "
+                       "first.",
+                       p, {}));
+    }
+    {
+        Json p = Json::obj();
+        p["from"]  = intSchema("Optional start address: set PC here first (like RUN <addr>). "
+                               "Omit to resume from the current PC.");
+        p["input"] = strSchema("Optional keystrokes to type at the console first, as for `run`.");
+        list.push(tool("start",
+                       "Start the guest and LEAVE IT RUNNING; returns at once. The guest keeps "
+                       "running between tool calls, as it does after RUN at the pascal100> "
+                       "prompt -- so a server on the guest answers its clients, two machines run "
+                       "side by side, and a person typing at the --mirror is answered. Every "
+                       "other tool still works: each is served between two slices of the guest, "
+                       "with the guest paused while it runs. Console output collects until "
+                       "`recv` takes it. `SET cpu0 clock_hz=N` paces the guest to that crystal; "
+                       "at a prompt the server naps, as RUN does. Ends on `stop`, a HLT, a "
+                       "breakpoint, SET BUS UNCLAIMED=HALT or a SIGINT -- "
+                       "never on a timeout and never because the guest is idle. `status` says "
+                       "whether it is still running and, if not, why it stopped. `run` and "
+                       "`step` are refused while it runs.",
+                       p, {}));
+    }
+    list.push(tool("stop",
+                   "Stop a guest that `start` left running, and report the whole free run: "
+                   "`stopped` (why it ended), `pc`, `steps`, `t_states`. Console output is NOT "
+                   "taken -- it stays for `recv`. If the guest already stopped by itself (a HLT, "
+                   "a breakpoint), this reports that stop and `was_running` is false.",
+                   Json::obj(), {}));
+    {
+        Json p = Json::obj();
+        p["text"] = strSchema("Keystrokes to type at the console (raw bytes). Does NOT run the "
+                              "guest -- follow with `run` (or use run's own `input`), unless "
+                              "`start` left it running, when it reads them itself. Control "
+                              "bytes go through untouched -- write one as the JSON escape it is: "
+                              "\\u0003 is ^C, \\u001a is ^Z, \\u001b is ESC. \\x03 is NOT JSON "
+                              "and arrives as the characters x03.");
+        p["unit"] = strSchema("Optional serial unit as <board>:<unit> (for example \"if4:user3\", one "
+                              "MP/M user's line). Omit for the console. Any serial unit works, also "
+                              "one shown in a terminal window: a person typing there and the "
+                              "assistant share the line.");
+        list.push(tool("send", "Type at the guest console, or at another serial unit, without "
+                               "running the guest.", p, {"text"}));
+    }
+    {
+        Json p = Json::obj();
+        p["unit"] = strSchema("Optional serial unit as <board>:<unit> (for example \"if4:user3\", one "
+                              "MP/M user's line). Omit for the console. Any serial unit works, also "
+                              "one shown in a terminal window: a person typing there and the "
+                              "assistant share the line.");
+        list.push(tool("recv",
+                       "Drain and return everything the guest has printed to the console (or to "
+                       "`unit`) since the last read, without running it. While the guest "
+                       "free-runs (`start`) the server holds at most the newest 1 MiB of the "
+                       "console; a unit keeps the newest 64 KiB from the time the machine "
+                       "loaded. `dropped` counts any older bytes that were let go because "
+                       "nobody read them.",
+                       p, {}));
+    }
+    list.push(tool("regs",
+                   "The CPU registers right now: every register the active core declares, plus "
+                   "pc, halted and interrupts. Does not run the guest.",
+                   Json::obj(), {}));
+    {
+        Json p = Json::obj();
+        p["command"] = strSchema("A monitor command line");
+        list.push(tool("monitor",
+                       "Run one monitor command and return its text. The escape hatch: anything "
+                       "the CLI can do, in one call. RUN does NOT block here -- it sets PC and "
+                       "returns, so `CONFIG LOAD <bootable.toml>` is safe (its startup runs up "
+                       "to the boot RUN, which parks); advance the guest with the `run` tool. "
+                       "The machine named on the command line runs no startup at all: boot it "
+                       "with `run {from: ...}`.",
+                       p, {"command"}));
+    }
+    {
+        Json p = Json::obj();
+        p["count"] = intSchema("How many instructions to execute (default 1).");
+        list.push(tool("step",
+                       "Execute N instructions through the real decode and real bus cycles, then "
+                       "report where the CPU came to rest. Unlike `run` this types nothing and "
+                       "reads no console output -- it is the debugger's single-step, not the "
+                       "expect loop. Stops early on a HLT or a breakpoint (see `stopped`).",
+                       p, {"count"}));
+    }
+    {
+        Json p = Json::obj();
+        p["addr"]  = intSchema("First address to decode.");
+        p["count"] = intSchema("How many instructions to decode (default 16). Ignored if `hi` "
+                               "is given.");
+        p["hi"]    = intSchema("Optional: decode from `addr` through this address inclusive, "
+                               "instead of a fixed count.");
+        p["cpu"]   = strSchema("Instruction set, e.g. 8080 or z80. Defaults to the machine's "
+                               "active CPU; required if the backplane has no processor.");
+        list.push(tool("disasm",
+                       "Disassemble memory. Reads non-invasively through a peek (no UART byte is "
+                       "consumed, no snoop latch tripped) and decodes with the stateless "
+                       "disassembler -- so it works with no CPU running, and on a ROM.",
+                       p, {"addr"}));
+    }
+    {
+        Json p = Json::obj();
+        p["lo"]   = intSchema("First address.");
+        p["hi"]   = intSchema("Last address (inclusive).");
+        p["byte"] = intSchema("The byte value to write into every cell of the range.");
+        p["rom"]  = boolSchema("Program a ROM: write behind the bus, into whichever chip answers "
+                               "reads there (the PROM burner). Otherwise a write to ROM or an "
+                               "unmapped hole lands nowhere and is counted in `discarded`.");
+        list.push(tool("mem_fill",
+                       "Fill an address range with one byte, written through the bus like a "
+                       "guest would -- so ROM and unmapped holes are reported, not silently "
+                       "dropped. Same rules as mem_deposit.",
+                       p, {"lo", "hi", "byte"}));
+    }
+    {
+        Json p = Json::obj();
+        p["lo"]    = intSchema("First address to search.");
+        p["hi"]    = intSchema("Last address (inclusive).");
+        p["bytes"] = strSchema("The pattern as hex bytes, e.g. \"C3 00 F8\".");
+        p["text"]  = strSchema("The pattern as an ASCII string (an alternative to `bytes`).");
+        list.push(tool("mem_search",
+                       "Find every occurrence of a byte pattern in a memory range, read through "
+                       "the bus. Give the pattern as `bytes` (hex) or `text` (ASCII). Returns "
+                       "the start address of each match.",
+                       p, {"lo", "hi"}));
+    }
+    {
+        Json p = Json::obj();
+        p["path"]   = strSchema("Where to write the file.");
+        p["lo"]     = intSchema("First address to save.");
+        p["hi"]     = intSchema("Last address (inclusive).");
+        p["format"] = strSchema("BIN or HEX. Defaults to the filename (.hex -> HEX, else BIN). "
+                                "HEX is Intel HEX and round-trips through mem_load.");
+        list.push(tool("mem_save",
+                       "Write a memory range to a host file, read through the bus. The mirror of "
+                       "mem_load: a BIN is raw bytes, a HEX is Intel HEX with checksums.",
+                       p, {"path", "lo", "hi"}));
+    }
+    {
+        Json p = Json::obj();
+        p["action"] = strSchema("list (default) | add | remove | clear.");
+        p["kind"]   = strSchema("For add: pc | memread | memwrite | ioread | iowrite.");
+        p["lo"]     = intSchema("For add: the address (a port, for io kinds), or the low end of "
+                                "a range.");
+        p["hi"]     = intSchema("For add: the high end of an address range (defaults to `lo`).");
+        p["id"]     = intSchema("For remove: which breakpoint (from the list).");
+        p["unit"]   = strSchema("For add, kind pc only: the core it watches, as <board>:<unit> "
+                                "(e.g. cpu0:z80), for a board with more than one processor. "
+                                "Omitted = whichever core is active.");
+        list.push(tool("breakpoints",
+                       "List, add, remove or clear breakpoints -- the same CPU-agnostic "
+                       "breakpoints the monitor sets, so a Z80 or a DMA transfer trips them too. "
+                       "A run/step stops when one fires. Conditional breakpoints (BREAK ... IF) "
+                       "are not exposed here; reach them through the `monitor` tool.",
+                       p, {}));
+    }
+    {
+        Json p = Json::obj();
+        p["path"] = strSchema("Where to write the snapshot.");
+        list.push(tool("snapshot",
+                       "Write the whole machine's STATE to a file: CPU registers and hidden "
+                       "micro-state, the clock's time, and every board's serialized state. It is "
+                       "state, not topology -- restore it into a machine built from the same "
+                       "config (DESIGN 13.1).",
+                       p, {"path"}));
+    }
+    {
+        Json p = Json::obj();
+        p["path"] = strSchema("The snapshot file to read back.");
+        list.push(tool("restore",
+                       "Restore machine state from a snapshot. Refuses a snapshot whose topology "
+                       "does not match this machine, with the reason.",
+                       p, {"path"}));
+    }
+    list.push(tool("bus_irq",
+                   "The interrupt bus, structured: pin 73 (pINT) and who pulls it, the eight "
+                   "VI wires and which are asserted, CPU INTE, and which level the interrupt controller would "
+                   "acknowledge right now and what it executes (an 88-VI's RST, an SS-1 "
+                   "8259A's CALL and its address, or in 8086 mode its interrupt type). The read-only companion "
+                   "to bus_map/bus_io for the interrupt lines.",
+                   Json::obj(), {}));
+    {
+        Json p = Json::obj();
+        p["count"] = intSchema("How many of the most recent cycles to return (default 64).");
+        list.push(tool("bus_trace",
+                       "The bus flight recorder: the last N cycles every board saw -- address, "
+                       "data, who drove and who answered, DMA and contention flags, and the "
+                       "T-state. Always recording WHILE the guest runs, so it holds the run-up to "
+                       "wherever the last run/step stopped; empty before anything has run.",
+                       p, {}));
+    }
+    {
+        Json p = Json::obj();
+        p["id"]             = strSchema("Board id, e.g. dsk.");
+        p["unit"]           = strSchema("Which unit on the board (its drive/socket name).");
+        p["path"]           = strSchema("Host path to the image or file to mount.");
+        p["write_protect"]  = boolSchema("Mount read-only (a write-protect tab / a ROM socket).");
+        p["create"]         = boolSchema("Create an empty file first if it does not exist -- for "
+                                         "a blank disk you are about to FORMAT.");
+        p["media"]          = strSchema("The diskette, on a floppy controller that takes it "
+                                        "(SHOW <id> lists the values): its size and sides, or a "
+                                        "format. A blank disk on some controllers needs it.");
+        list.push(tool("mount",
+                       "Mount a host file into a board's unit (a disk into a drive, an image into "
+                       "a ROM socket). The board decides what it can take.",
+                       p, {"id", "unit", "path"}));
+    }
+    {
+        Json p = Json::obj();
+        p["id"]       = strSchema("Board id.");
+        p["unit"]     = strSchema("Which serial unit on the board.");
+        // The grammar comes from endpointHelp(), the list HELP CONNECT prints: a hand-typed
+        // example here named tcp: and file:, which this program does not take (#784).
+        p["endpoint"] = strSchema(("The endpoint to wire it to, one of:\n" + endpointHelp() +
+                                   "\n(Under --mcp, the unit connected to console holds the "
+                                   "scripted stream; connecting another takes it.)")
+                                      .c_str());
+        list.push(tool("connect",
+                       "Wire a board's serial unit to a host endpoint -- the same schemes CONNECT "
+                       "accepts at the prompt.",
+                       p, {"id", "unit", "endpoint"}));
+    }
+    list.push(tool("status",
+                   "A guaranteed-non-blocking check (#490): board id, whether the worker is "
+                   "currently dispatched on ANY request -- not just `run`; a long `monitor`/"
+                   "`mem_load`/`snapshot` counts too -- plus the step count and PC as of the "
+                   "last `run`, or of the free run `start` began. `running` is true while "
+                   "that free run goes on; once it ends, `stop_reason` says why (`requested`, "
+                   "`halt`, `breakpoint`, `interrupted`, `unclaimed`, `no-cpu`). "
+                   "Unlike every other tool, this one is answered directly by the reader thread "
+                   "rather than the worker, so it still answers while the server is wedged or "
+                   "mid-flight on anything -- the exact case where `recv`, `regs`, even a fresh "
+                   "`who` would sit queued behind it. `pc`/`steps` come from `run` specifically "
+                   "and go stale the moment something else moves the machine: a `step` or a "
+                   "`monitor` command advances the real PC without updating them, and `steps` "
+                   "restarts at zero on the next `run`, so it can go backwards between runs. "
+                   "`generation` is the only field guaranteed to keep climbing, so use it (not "
+                   "`steps`) to tell 'still advancing' from 'stuck on the same slice.' "
+                   "`in_flight: false` means nothing is dispatched at this instant, NOT that the "
+                   "queue is drained -- the worker clears one request before picking up the next, "
+                   "and a poll can land in that gap. Because it "
+                   "can land ahead of requests queued before it, don't sequence it with the "
+                   "rest of a script; poll it, standalone, whenever you need to know if the "
+                   "server is still alive.",
+                   Json::obj(), {}));
+    return list;
+}
+
+Json boardJson(Board* b) {
+    Json j = Json::obj();
+    j["id"] = Json(b->id);
+    j["type"] = Json(b->type());
+    j["enabled"] = Json(b->enabled());
+    Json mem = Json::arr();
+    for (const auto& e : b->memMap()) {
+        Json r = Json::obj();
+        r["lo"] = Json((long long)e.lo);
+        r["hi"] = Json((long long)e.hi);
+        r["kind"] = Json(e.what);
+        r["note"] = Json(e.note);
+        mem.push(r);
+    }
+    j["memory"] = mem;
+    Json io = Json::arr();
+    for (const auto& e : b->ioMap()) {
+        Json r = Json::obj();
+        r["port"] = Json((long long)e.lo);
+        r["dir"] = Json(e.what);
+        r["note"] = Json(e.note);
+        io.push(r);
+    }
+    j["io"] = io;
+    return j;
+}
+
+// The whole argument for MCP-as-first-class, in one function: an agent asks a
+// board what it can be told, and gets an answer generated from the board's own
+// declaration -- enums, ranges, runtime-settability and all.
+Json propsJson(Board* b) {
+    Json arr = Json::arr();
+    for (const auto& p : b->properties()) {
+        Json j = Json::obj();
+        j["name"] = Json(p.name);
+        j["help"] = Json(p.help);
+        j["value"] = Json(p.get().text(p.radix));
+                switch (p.kind) {
+        case Kind::Bool: j["kind"] = Json("bool"); break;
+        case Kind::Int:
+            j["kind"] = Json("int");
+            if (!(p.min == 0 && p.max == 0)) {
+                j["min"] = Json((long long)p.min);
+                j["max"] = Json((long long)p.max);
+            }
+            if (p.radix == 16) j["radix"] = Json(16);
+            break;
+        case Kind::Str: j["kind"] = Json("string"); break;
+        case Kind::Enum: {
+            j["kind"] = Json("enum");
+            Json c = Json::arr();
+            for (const auto& x : p.choices) c.push(Json(x));
+            j["choices"] = c;
+            break;
+        }
+        }
+        arr.push(j);
+    }
+    return arr;
+}
+
+// ...and the same argument, one level down: an agent asks a board what may be written in
+// its [[board.drive]] / [[board.region]] tables, and gets an answer generated from the
+// board's own declaration. Until subUnitProperties() existed there was nothing to answer
+// from, so an agent writing a machine file could not discover `readonly`, `media` or `at`
+// -- the keys that carry the disk and the ROM -- from the schema at all.
+//
+// NO "value" HERE, and that is the difference: these describe a drive that does not exist
+// yet, so there is nothing to read. (Board::subUnitProperties.)
+Json subUnitsJson(Board* b) {
+    Json arr = Json::arr();
+    for (const auto& table : b->subUnitTables()) {
+        Json t = Json::obj();
+        t["table"] = Json("[[board." + table + "]]");
+        Json keys = Json::arr();
+        for (const auto& p : b->subUnitProperties(table)) {
+            Json j = Json::obj();
+            j["name"] = Json(p.name);
+            j["help"] = Json(p.help);
+            // A key with more than one spelling says so, and says which one is real:
+            // `name` is what an agent should WRITE (it is what CONFIG SAVE writes back),
+            // `aliases` is what it must be able to READ in somebody's existing file.
+            if (!p.aliases.empty()) {
+                Json a = Json::arr();
+                for (const auto& x : p.aliases) a.push(Json(x));
+                j["aliases"] = a;
+            }
+            switch (p.kind) {
+            case Kind::Bool: j["kind"] = Json("bool"); break;
+            case Kind::Str:  j["kind"] = Json("string"); break;
+            case Kind::Int:
+                j["kind"] = Json("int");
+                if (!(p.min == 0 && p.max == 0)) {
+                    j["min"] = Json((long long)p.min);
+                    j["max"] = Json((long long)p.max);
+                }
+                if (p.radix == 16) j["radix"] = Json(16);
+                break;
+            case Kind::Enum: {
+                j["kind"] = Json("enum");
+                Json c = Json::arr();
+                for (const auto& x : p.choices) c.push(Json(x));
+                j["choices"] = c;
+                break;
+            }
+            }
+            keys.push(j);
+        }
+        t["keys"] = keys;
+        arr.push(t);
+    }
+    return arr;
+}
+
+Json textResult(const std::string& s, bool isError = false) {
+    Json r = Json::obj();
+    Json content = Json::arr();
+    Json c = Json::obj();
+    c["type"] = Json("text");
+    c["text"] = Json(s);
+    content.push(c);
+    r["content"] = content;
+    if (isError) r["isError"] = Json(true);
+    return r;
+}
+
+// Structured results still carry a text rendering, because an agent reads the
+// text and a program reads the JSON, and neither should have to parse the other.
+Json dataResult(const Json& data, const std::string& text) {
+    Json r = textResult(text);
+    r["structuredContent"] = data;
+    return r;
+}
+
+// A string sent where the schema says integer is almost always an address someone wrote
+// in hex, because JSON has none. Say what number to send instead: "0xFF00" is 65280.
+std::string integerHint(const std::string& s) {
+    if (s.empty()) return "";
+    if (s.find_first_not_of("0123456789") == std::string::npos)
+        return ": write " + s + ", not \"" + s + "\"";
+    std::string h = s;
+    if (h.size() > 2 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h = h.substr(2);
+    else if (h.size() > 1 && (h.back() == 'h' || h.back() == 'H')) h.pop_back();
+    if (h.empty() || h.size() > 8 || h.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+        return "";
+    return ": \"" + s + "\" is " + std::to_string(std::stoull(h, nullptr, 16));
+}
+
+// CHECK THE ARGUMENTS AGAINST THE TOOL'S OWN inputSchema before any tool code reads them
+// (#579). Json's accessors return a default for the wrong type -- integer() of a string is
+// 0 -- so without this "from":"0xFF00" ran from PC 0 and "lo":"0x100" dumped address 0,
+// with no error. One check here covers every tool: a required argument that is missing, and
+// an integer, string or boolean of the wrong JSON type. Empty = fine.
+std::string checkArgs(const std::string& name, const Json& args) {
+    static const Json tools = toolList();
+    const Json* schema = nullptr;
+    for (const auto& t : tools.items())
+        if (t.at("name").str() == name) schema = &t.at("inputSchema");
+    if (!schema) return "";  // an unknown tool is callTool's to report
+    for (const auto& r : schema->at("required").items())
+        if (!args.has(r.str())) return "`" + r.str() + "` is required";
+    for (const auto& [key, v] : args.fields()) {
+        const std::string want = schema->at("properties").at(key).at("type").str();
+        if (want == "integer") {
+            if (v.type() == Json::T::Num && v.num() == std::floor(v.num())) continue;
+            std::string msg = "`" + key + "` must be a JSON number";
+            if (v.type() == Json::T::Str) msg += ", not a string" + integerHint(v.str());
+            return msg;
+        }
+        if (want == "string" && v.type() != Json::T::Str)
+            return "`" + key + "` must be a JSON string";
+        if (want == "boolean" && v.type() != Json::T::Bool)
+            return "`" + key + "` must be true or false";
+    }
+    return "";
+}
+
+// What the bus and the boards said while the guest ran -- a SET BUS UNCLAIMED=WARN line,
+// a contention report, a disk that would not sync. Monitor::flush() prints the same two
+// logs after a RUN; under MCP they come back as `warnings` (#580).
+Json drainWarnings(Machine& m, std::string& text) {
+    Json w = Json::arr();
+    for (const auto& s : m.bus.drain()) w.push(Json(s));
+    m.bus.clearLog();
+    for (const auto& s : m.drainBoardLog()) w.push(Json(s));
+    for (const auto& s : w.items()) {
+        if (!text.empty() && text.back() != '\n') text += '\n';
+        text += s.str();
+    }
+    return w;
+}
+
+bool parseBytes(const std::string& s, std::vector<uint8_t>& out) {
+    std::istringstream in(s);
+    std::string t;
+    while (in >> t) {
+        char* end = nullptr;
+        long v = std::strtol(t.c_str(), &end, 16);
+        if (end == t.c_str() || *end) return false;
+        out.push_back((uint8_t)v);
+    }
+    return !out.empty();
+}
+
+// WHY a step/run came back, as one lowercase word -- the structured twin of the
+// monitor's reportStop() prose (debug.h StopReason). Kept here rather than shared with
+// the run tool's inline strings because those name things the STEP loop cannot see (a
+// prompt is a console fact, not a StopReason) -- this covers exactly what m.debug.run
+// reports.
+const char* stopReasonName(StopReason w) {
+    switch (w) {
+    case StopReason::Steps:        return "steps";
+    case StopReason::Breakpoint:   return "breakpoint";
+    case StopReason::Halted:       return "halt";
+    case StopReason::Attn:         return "attn";
+    case StopReason::InputEnded:   return "input-ended";
+    case StopReason::StopRequested:  return "interrupted";
+    case StopReason::WindowClosed: return "window-closed";
+    case StopReason::NoCpu:        return "no-cpu";
+    case StopReason::StepTarget:   return "step-target";
+    case StopReason::Unclaimed:    return "unclaimed";
+    case StopReason::TmaConflict:  return "tma-conflict";
+    }
+    return "?";
+}
+
+// The words for a "tma-conflict" stop: the run never started, and this says which two
+// bus masters cannot be arbitrated (Machine::tmaConflict, kept by the debugger).
+std::string tmaConflictLine(Machine& m) {
+    return "the machine did not run: " + m.debug.tmaConflictWhy();
+}
+
+// A bus cycle's type as a lowercase word, for bus_trace's structured rows. The
+// monitor's cycleName is file-static in bus.cpp and human-spelled ("MEM R"); this is
+// the machine-readable spelling, kept beside its consumer.
+const char* cycleTypeName(Cycle t) {
+    switch (t) {
+    case Cycle::MemRead:  return "memread";
+    case Cycle::MemWrite: return "memwrite";
+    case Cycle::IoRead:   return "ioread";
+    case Cycle::IoWrite:  return "iowrite";
+    case Cycle::IntAck:   return "inta";
+    }
+    return "?";
+}
+
+// The BREAK kinds this tool can arm -- the address/port family only. A device-event
+// kind (TAPE STOP) is not an address and is reached through the monitor tool. Null if
+// `s` is not one we accept.
+bool breakKindFromName(const std::string& s, BreakKind& out) {
+    if (s == "pc")       { out = BreakKind::Pc;       return true; }
+    if (s == "memread")  { out = BreakKind::MemRead;  return true; }
+    if (s == "memwrite") { out = BreakKind::MemWrite; return true; }
+    if (s == "ioread")   { out = BreakKind::IoRead;   return true; }
+    if (s == "iowrite")  { out = BreakKind::IoWrite;  return true; }
+    return false;
+}
+
+// The register file as {name: value}, plus a "H=xxxx " text rendering appended to
+// `text`. Shared by the regs and step tools so the two cannot disagree about the shape.
+Json regsObject(CpuCore* c, std::string& text) {
+    Json regs = Json::obj();
+    char buf[64];
+    for (const RegDef& r : c->registers()) {
+        uint32_t v = r.get();
+        regs[r.name] = Json((long long)v);
+        std::snprintf(buf, sizeof buf, "%s=%X ", r.shown().c_str(), v);
+        text += buf;
+    }
+    return regs;
+}
+
+// One breakpoint as JSON, the shape breakpoints(list) and breakpoints(add) both return.
+Json breakpointJson(Machine& m, const Breakpoint& b) {
+    Json j = Json::obj();
+    j["id"]      = Json((long long)b.id);
+    j["kind"]    = Json(breakKindName(b.kind));
+    j["lo"]      = Json((long long)b.lo);
+    j["hi"]      = Json((long long)b.hi);
+    j["enabled"] = Json(b.enabled);
+    j["action"]  = Json(breakActionName(b.action));
+    j["hits"]    = Json((long long)b.hits);
+    if (!b.core.empty()) {
+        j["unit"] = Json(b.core);
+        // Its core went away (the board removed, another machine loaded): it never stops.
+        if (!m.coreByRef(b.core)) j["unit_missing"] = Json(true);
+    }
+    j["describe"] = Json(b.describe());
+    return j;
+}
+
+// The interactive console the four live tools share. Non-owning: the chip owns the
+// ScriptedStream; we remember only WHICH channel it is, and re-fetch the live pointer
+// every call so a reconnect can never leave us holding a dangling one.
+// #490: what `status` reports, published by the `run` tool's WORKER-thread loop at each
+// slice boundary and read by the READER thread to answer `status` out of band -- see
+// runMcp's reader/worker split for why a second thread exists at all. This is a snapshot,
+// not a live view: the whole point of `status` is that it must still answer while `run` is
+// wedged or mid-flight, which rules out synchronizing with the worker for an
+// up-to-the-instruction value (and reading cpu->pc() off the reader thread while the worker
+// is running it would be a genuine data race, not just a stale read). Copied as a whole
+// struct under McpSession::statusMu, never touched field-by-field without that lock.
+// No `inFlight` field here on purpose: it used to mean "a `run` is executing," which made
+// `status` blind to a long `monitor`/`mem_load`/`snapshot` call -- the exact case it exists
+// to catch. `in_flight` in the reply is now read from `haveCurrentId` instead (the reader
+// thread's own "is the worker mid-request" flag, already there for cancellation), which is
+// true for whichever tool the worker is running, not just `run`. See statusResult().
+struct RunSnapshot {
+    uint64_t    seq      = 0;    // bumped on every publish -- lets a poller tell "still
+                                  // advancing" from "the same slice as last time"
+    uint64_t    steps    = 0;
+    uint32_t    pc       = 0;
+    std::string boardId;
+    bool        running  = false;  // #602: a free run (`start`) is going on
+    std::string stopReason;        // why the last free run ended; empty before the first
+};
+
+// #602: THE GUEST RUNNING ON ITS OWN, between requests -- `start` to `stop`. It runs on the
+// WORKER thread, the same one that serves every request: runMcp's loop runs a slice of the
+// guest whenever no request is waiting, and serves a request between two slices, with the
+// guest paused. So no second thread ever steps the Machine (the line #489 was declined on),
+// and no tool needs a lock it did not already have. Worker-thread only -- the reader never
+// reads this; `status` reads the RunSnapshot each slice publishes.
+struct FreeRun {
+    using clk = std::chrono::steady_clock;
+    bool        running = false;
+    std::string stopped;             // why the last free run ended; empty before the first
+    uint64_t    steps   = 0;         // this free run's totals, for `stop` and `status`
+    uint64_t    tStates = 0;
+    RunResult   last;                // the slice that ended it -- unclaimed's port
+    uint64_t    dropped = 0;         // console bytes let go since the last `recv`
+
+    // Pacing: the wall time the crystal is counted from, the T-states this free run has
+    // spent since then, and the crystal it was counted at. Counted from the free run's OWN
+    // T-states, not the machine clock, so a `restore` or CONFIG LOAD between two slices,
+    // which moves that clock, cannot throw the pacing off. `nextSlice` is the earliest wall
+    // time the next slice may start -- how long the worker WAITS for a request before it
+    // runs the guest again. A wait, not a sleep, so a request that arrives during a pacing
+    // gap or an idle nap is served at once.
+    clk::time_point baseW{};
+    uint64_t        sinceBase = 0;
+    long long       baseHz    = 0;
+    clk::time_point nextSlice{};
+    clk::time_point idleSince{};     // when this unbroken quiet began; unset = busy
+    bool            servedSinceSlice = false;  // fairness: see runMcp
+    // `achieved_hz` (#903), counted from `tStates` for the same reason pacing is.
+    AchievedHzMeter meter;
+
+    void rebase(clk::time_point wallNow, long long hz) {
+        baseW     = wallNow;
+        sinceBase = 0;
+        baseHz    = hz;
+    }
+};
+
+struct McpSession {
+    // The console line: the resolved `scripted[|mirror][|log]` stack. The session owns it,
+    // and the one unit that holds the console has a SharedStream to it, so the line survives
+    // a move of the console to another unit (console(), issue #759). Null when no unit holds
+    // it, or when a board that cannot take a pre-built stream owns a bare line.
+    std::shared_ptr<ByteStream> line;
+    std::string conBoard;  // the unit that holds the console
+    std::string conUnit;
+    // "console taken from <id>:<unit>" lines from console(), for the tool that caused the move
+    // to report, as the CLI's CONNECT does.
+    std::vector<std::string> taken;
+    // Set when takeConsole() took the session's line from the unit that held it: the line lost
+    // its holder to a move, not to a CONFIG LOAD, so console() keeps it -- with any --mirror
+    // watcher and the output nobody has read yet -- for the unit that takes the console.
+    // Cleared by console().
+    bool handover = false;
+    // `--mirror socket:PORT[?ro]`: when set, the console is `scripted` WRAPPED in a
+    // MirrorStream so a human can telnet in and share the session (issue #381). Empty =
+    // the bare scripted line. Set once at startup (runMcp), read by console().
+    std::string mirror;
+    // `--log FILE`: when set, the console is also tapped to a text file (issue #666). The
+    // tap is outside the mirror and inside the console filter, so the file holds what a
+    // terminal would show. Set once at startup, read by console().
+    std::string log;
+
+    // #490: guards `status` below. Every read/write is a whole-struct copy under this
+    // lock -- see RunSnapshot's own comment for why individual atomics are not enough
+    // (board id is a std::string, not atomic-sized, and the fields must not tear against
+    // each other: a poller must never see this slice's steps against last slice's pc).
+    std::mutex  statusMu;
+    RunSnapshot status;
+
+    FreeRun free;  // #602 -- worker thread only
+};
+
+// The board id for whichever board carries a CpuCard, or empty if there is none. Same walk
+// as Machine::cpuCard() (core/machine.cpp), but Board-typed: CpuCard is a bare interface
+// (activeCore() and friends) and carries no id of its own -- only Board does, on whatever
+// concrete class multiply-inherits both. Used to seed and refresh the #490 status snapshot.
+std::string cpuBoardId(Machine& m) {
+    for (const auto& b : m.boards())
+        if (dynamic_cast<CpuCard*>(b.get())) return b->id;
+    return std::string();
+}
+
+// #490's out-of-band reply. `in_flight` and the RunSnapshot fields come from two different
+// locks, taken one at a time and never nested -- see queueMu/haveCurrentId's own comment
+// (by runMcp's reader/worker split) for why `in_flight` has to be sourced there rather than
+// from the snapshot, and RunSnapshot's own comment for why the rest is a snapshot at all.
+// Callable from either thread.
+Json statusResult(McpSession& sess, std::mutex& queueMu, const bool& haveCurrentId) {
+    bool inFlight;
+    {
+        std::lock_guard<std::mutex> lk(queueMu);
+        inFlight = haveCurrentId;
+    }
+    RunSnapshot snap;
+    {
+        std::lock_guard<std::mutex> lk(sess.statusMu);
+        snap = sess.status;
+    }
+    Json d = Json::obj();
+    d["board"]      = Json(snap.boardId);
+    d["in_flight"]  = Json(inFlight);
+    d["steps"]      = Json((long long)snap.steps);
+    d["pc"]         = Json((long long)snap.pc);
+    d["generation"] = Json((long long)snap.seq);
+    d["running"]    = Json(snap.running);
+    d["stop_reason"] = Json(snap.stopReason);
+
+    char pcHex[16];  // RunSnapshot::pc is uint32_t; "%04X" of a full 32-bit value needs 9
+                     // bytes, not the 8-bit CPU's usual 4 -- oversized on purpose.
+    std::snprintf(pcHex, sizeof pcHex, "%04X", (unsigned)snap.pc);
+    std::string text = snap.boardId.empty() ? "(no board)" : snap.boardId;
+    text += inFlight ? " busy" : " idle";
+    text += snap.running ? ", guest running" : "";
+    text += ", steps=" + std::to_string(snap.steps) + " pc=" + pcHex;
+    if (!snap.running && !snap.stopReason.empty())
+        text += " (free run stopped: " + snap.stopReason + ")";
+    if (inFlight || snap.running)
+        text += " (pc/steps are the last published slice boundary, not a live read)";
+    return dataResult(d, text);
+}
+
+// The scripted line the interactive tools drive -- reached THROUGH whatever wraps it.
+// Bare, the unit's stream IS the ScriptedStream; the console binding wraps it in the
+// console's transform FilterStream (always), under --log a TeeStream and under --mirror a
+// MirrorStream, so the stack is Filter -> [Tee ->] [Mirror ->] Scripted. Peel any of those decorators to reach the
+// ScriptedStream the guest ultimately talks to, which is the one we feed()/out().
+ScriptedStream* asScripted(ByteStream* s) {
+    while (s) {
+        if (auto* ss = dynamic_cast<ScriptedStream*>(s)) return ss;
+        if (auto* f = dynamic_cast<FilterStream*>(s)) { s = f->inner(); continue; }
+        if (auto* mir = dynamic_cast<MirrorStream*>(s)) { s = mir->inner(); continue; }
+        if (auto* sh = dynamic_cast<SharedStream*>(s)) { s = sh->inner(); continue; }
+        if (auto* tee = dynamic_cast<TeeStream*>(s)) { s = tee->inner(); continue; }
+        if (auto* tap = dynamic_cast<AgentTap*>(s)) { s = tap->inner(); continue; }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+// Does any serial unit's line still reach `ss`? False once CONFIG LOAD has replaced the
+// boards, or once every unit that held the console line has been re-wired.
+bool anyUnitReaches(Machine& m, ScriptedStream* ss) {
+    for (const auto& b : m.boards())
+        for (const auto& u : b->units())
+            if (u.kind == UnitKind::Serial && asScripted(b->unitStream(u.name)) == ss) return true;
+    return false;
+}
+
+// The console line, as the session sees it: its own line, or the bare one a board owns when
+// it could not take a pre-built stream. Null when no unit holds the console.
+ScriptedStream* sessionLine(Machine& m, const McpSession& s) {
+    if (s.line) return asScripted(s.line.get());
+    if (s.conBoard.empty()) return nullptr;
+    Board* b = m.find(s.conBoard);
+    return b ? asScripted(b->unitStream(s.conUnit)) : nullptr;
+}
+
+// Does this unit hold the console under --mcp? It is wired to it (the CLI's answer), or its
+// line is the session's console line -- which shows `scripted`, so the CLI cannot see it.
+bool holdsLine(Machine& m, const McpSession& s, Board& b, const std::string& unit) {
+    if (wiredToConsole(b, unit)) return true;
+    ScriptedStream* ss = sessionLine(m, s);
+    return ss && asScripted(b.unitStream(unit)) == ss;
+}
+
+// Take the console for b:unit with the --mcp answer to who holds it -- for CONNECT (the
+// monitor tool sets it as the taker) and for console(), which the connect tool calls.
+std::vector<std::string> takeLine(Machine& m, McpSession& s, Board* b, const std::string& unit) {
+    ScriptedStream* own = s.line ? asScripted(s.line.get()) : nullptr;
+    const bool      held = own && anyUnitReaches(m, own);
+    auto taken = takeConsole(m, b, unit, [&](Board& ob, const std::string& ou) {
+        return holdsLine(m, s, ob, ou);
+    });
+    if (held && !anyUnitReaches(m, own)) s.handover = true;
+    return taken;
+}
+
+// Adopt the serial unit wired to the host console onto an in-memory ScriptedStream. Under
+// --mcp there is no terminal, so "console" would aim the guest's keyboard at the JSON-RPC pipe
+// and hang the first run forever (monitor.cpp:818), and aim its output at the JSON-RPC stdout;
+// a scripted line is one we can feed() and read out() instead. Under --mirror the scripted
+// line is wrapped in a socket mirror (scripted|socket:PORT), transparently -- we still return
+// the inner scripted, so the run loop is unchanged.
+//
+// EXACTLY ONE UNIT HOLDS THE CONSOLE (DESIGN.md 7.2, 9), here as in the CLI. The unit holding
+// it shows `scripted`, not `console`, so the monitor's CONNECT cannot see it to take the
+// console from it (issue #759). This does that instead: a unit that arrives on `console`
+// takes the line, and the unit that held it goes to `null`, with the CLI's "console taken
+// from" line in `s.taken` for the caller to report. The SESSION owns the line, and the holder
+// has only a SharedStream to it, so a move keeps a --mirror watcher connected and keeps the
+// output nobody has read yet. Called again after every monitor command and `connect`, so a
+// move happens at once (issue #756). Null + err if the machine has no such line.
+ScriptedStream* console(Machine& m, McpSession& s, std::string& err) {
+    const bool handover = s.handover;
+    s.handover = false;
+
+    // The units newly wired to `console`, gathered first: taking the console re-wires units,
+    // and no unit list is walked while it changes. More than one only at startup; the last
+    // one then holds the console, as a run of CONNECTs would leave it.
+    std::vector<std::pair<Board*, std::string>> arrivals;
+    for (const auto& b : m.boards())
+        for (const auto& u : b->units())
+            if (u.kind == UnitKind::Serial && u.state == "console")
+                arrivals.emplace_back(b.get(), u.name);
+
+    // The line that is the console now, if any unit still reaches it: the session's line, or
+    // (see the fallback below) a bare line one board owns.
+    ScriptedStream* ss = nullptr;
+    if (s.line) {
+        ss = asScripted(s.line.get());
+        // Kept when a take moved it and its new holder is arriving (handover, above).
+        if (!anyUnitReaches(m, ss) && !(handover && !arrivals.empty())) {
+            ss = nullptr;
+            s.line.reset();  // closes a --mirror port now, so a rebuilt line can reopen it
+        }
+    }
+    // E.g. the console unit re-wired to its own `scripted`. Only while s.conBoard still names
+    // it: a unit that went to another endpoint first lost the console, and a bare `scripted`
+    // does not give it back -- `console` does (issue #783).
+    if (!ss && !s.conBoard.empty()) {
+        if (Board* b = m.find(s.conBoard)) ss = asScripted(b->unitStream(s.conUnit));
+    }
+    if (!ss) {
+        s.conBoard.clear();
+        s.conUnit.clear();
+    }
+
+    // Bare `scripted`, or `scripted|socket:PORT` when a mirror was asked for. The mirror
+    // rides the same tap grammar the resolver already knows (host/endpoint.cpp).
+    // A `--log` file is one more tap on the end. APPEND, not truncate: this runs again
+    // after a CONFIG LOAD, and the transcript so far must survive that.
+    std::string baseSpec = s.mirror.empty() ? std::string("scripted") : "scripted|" + s.mirror;
+    if (!s.log.empty()) baseSpec += "|" + s.log + "?fmt=text&append";
+
+    if (!arrivals.empty()) {
+        auto [b, unit] = arrivals.back();
+        // Take the console from the unit that holds it, and from every other arrival.
+        for (auto& t : takeLine(m, s, b, unit)) s.taken.push_back(std::move(t));
+        s.handover = false;  // the line is kept below, as the handover asks
+        if (!s.line) ss = nullptr;  // a board's own bare line went with its unit
+        s.conBoard.clear();
+        s.conUnit.clear();
+
+        if (!s.line) {
+            auto base = resolveEndpoint(baseSpec, err);
+            if (!base) return nullptr;
+
+            // A pseudo-terminal mirror gets its name at run time, so say where it is --
+            // to STDERR, never the JSON-RPC channel. Said again after a CONFIG LOAD,
+            // because a rebuilt mirror is a new device.
+            ByteStream* p = base.get();
+            if (auto* a = dynamic_cast<AgentTap*>(p)) p = a->inner();
+            if (auto* t = dynamic_cast<TeeStream*>(p)) p = t->inner();
+            if (auto* ms = dynamic_cast<MirrorStream*>(p))
+                if (std::string note = ms->sinkNote(); !note.empty())
+                    std::cerr << "pascal100: --mirror: open " << note << "\n";
+            s.line = std::move(base);
+        }
+
+        // Wrap the line in the CONSOLE's transform chain, so the AI -- and any mirror
+        // watcher -- see what a terminal would, not the raw 8-bit wire. Without it, a machine
+        // like `ps2` (strip7out=on, upper=on) reads back as bit-7 parity junk (0x4F 'O' ->
+        // 0xCF). The transforms are the console's, applied to the console's stand-in; the
+        // endpoint grammar deliberately cannot express a filter (host/filter.h), so it is
+        // installed as a pre-built stream. It FOLLOWS the console's settings rather than
+        // copying them, so a SET CONSOLE made mid-session reaches the guest (issue #529).
+        auto filt = std::make_unique<FilterStream>(std::make_unique<SharedStream>(s.line));
+        filt->follow(Console::instance().filter());
+        if (b->connectStream(unit, std::move(filt), err)) {
+            ss = asScripted(s.line.get());
+        } else {
+            // A board not taught the seam refuses. Fall back to a bare line of its own --
+            // no transforms, but no regression.
+            s.line.reset();
+            if (!b->connect(unit, baseSpec, err)) return nullptr;
+            ss = asScripted(b->unitStream(unit));
+        }
+        s.conBoard = b->id;
+        s.conUnit  = unit;
+    }
+    if (ss) return ss;
+    err = "no console line: CONNECT a serial unit to 'console' to give it the console line.";
+    return nullptr;
+}
+
+// THE LINE A TOOL TALKS TO: the console, or -- with `unit` -- any serial unit, through the
+// AgentTap that every line has under --mcp (host/agent_tap.h). The unit that holds the
+// console is the console, whichever way it is named. A unit is `<board>:<unit>`, the
+// monitor's own spelling (CONNECT if4:user3 ...).
+struct LineRef {
+    ScriptedStream* con = nullptr;
+    AgentTap*       tap = nullptr;
+    std::string     name;  // "console", or the unit as given
+    explicit operator bool() const { return con || tap; }
+    void feed(const std::string& s) { con ? con->feed(s) : tap->feed(s); }
+    const std::string& out() const { return con ? con->out() : tap->out(); }
+    void clearOut() { con ? con->clearOut() : tap->clearOut(); }
+};
+
+LineRef lineFor(Machine& m, McpSession& s, const Json& args, std::string& err) {
+    LineRef r;
+    if (!args.has("unit") || args.at("unit").str().empty()) {
+        r.con  = console(m, s, err);
+        r.name = "console";
+        return r;
+    }
+    const std::string spec  = args.at("unit").str();
+    const size_t      colon = spec.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 == spec.size()) {
+        err = "`unit` is <board>:<unit>, for example if4:user3 (SHOW BOARDS lists them)";
+        return r;
+    }
+    const std::string id = spec.substr(0, colon), unit = spec.substr(colon + 1);
+    Board* b = m.find(id);
+    if (!b) {
+        err = "no board '" + id + "' (SHOW BOARDS lists them)";
+        return r;
+    }
+    std::string serial;
+    bool        found = false;
+    for (const auto& u : b->units()) {
+        if (u.kind != UnitKind::Serial) continue;
+        serial += (serial.empty() ? "" : ", ") + b->id + ":" + u.name;
+        if (u.name == unit) found = true;
+    }
+    if (!found) {
+        err = serial.empty() ? b->id + " has no serial unit"
+                             : "no serial unit '" + unit + "' on " + b->id + ". It has: " + serial;
+        return r;
+    }
+    // Keep the console adopted, as every other tool does (a CONNECT may have moved it). A
+    // machine with no console line is fine here: the unit is all this call needs.
+    std::string ignored;
+    console(m, s, ignored);
+    r.name = b->id + ":" + unit;
+    if (holdsLine(m, s, *b, unit)) {
+        r.con = sessionLine(m, s);
+        if (r.con) return r;
+    }
+    r.tap = findAgentTap(b->unitStream(unit));
+    if (!r.tap) err = r.name + " cannot be reached: its line has no tap (CONNECT it again)";
+    return r;
+}
+
+
+// One slice of the guest, in instructions -- for `run` and for the free run alike.
+constexpr uint64_t kSliceSteps = 2000;
+
+// THE StopReasons THAT END A RUN, for `run` and the free run both. One list, so a new
+// StopReason cannot be honoured by one loop and run straight past by the other -- the way
+// SET BUS UNCLAIMED=HALT was once run past under MCP (#580). The name
+// is stopReasonName()'s.
+bool sliceStops(StopReason w) {
+    switch (w) {
+    case StopReason::Halted:
+    case StopReason::Breakpoint:
+    case StopReason::NoCpu:
+    case StopReason::TmaConflict:
+    case StopReason::StopRequested:
+    case StopReason::Unclaimed:
+    case StopReason::StepTarget:  // the run tool's `stop_at`; a free run never sets one
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A HALTED PROCESSOR (#770), as the monitor's RUN and STEP treat it: `from` would move a
+// PC that the front panel cannot move, and a run of a halt that nothing can end would only
+// count idle T-states. Returns the refusal, or empty when the call may go on.
+std::string haltRefusal(Machine& m, CpuCore* cpu, bool movesPc) {
+    if (!cpu->halted()) return {};
+    if (!movesPc && !m.debug.haltIsFinal()) return {};
+    return Debugger::haltedRefusal(pcText(*cpu));   // `1234:0010 (12350)` on the 8088
+}
+
+// `from` must fit the core's PC: 16 bits, or 20 on the 8088 (CpuCore::pcMask). Before
+// the PC was widened a cast cut it silently; now a PC past the range is refused.
+std::string fromRefusal(CpuCore* cpu, const Json& args) {
+    if (!args.has("from")) return {};
+    const long long f = args.at("from").integer();
+    if (f >= 0 && f <= (long long)cpu->pcMask()) return {};
+    return cpu->pcMask() > 0xFFFF ? "`from` must be an address from 0 to 1048575 (FFFFF)"
+                                  : "`from` must be an address from 0 to 65535";
+}
+
+// The monitor's stop line for SET BUS UNCLAIMED=HALT, so the text says WHICH port.
+std::string unclaimedLine(const RunResult& r) {
+    char b[96];
+    std::snprintf(b, sizeof b, "stopped: %s port 0x%02X, which no board decodes",
+                  r.write ? "OUT to" : "IN from", r.port);
+    return b;
+}
+
+// #602: the free run's state, for `status` -- the same whole-struct publish `run` makes.
+void publishFree(Machine& m, McpSession& sess) {
+    CpuCore*    cpu = m.cpu();
+    std::string id  = cpuBoardId(m);
+    std::lock_guard<std::mutex> lk(sess.statusMu);
+    sess.status.boardId    = id;
+    sess.status.steps      = sess.free.steps;
+    sess.status.pc         = cpu ? cpu->pc() : 0;
+    sess.status.running    = sess.free.running;
+    sess.status.stopReason = sess.free.stopped;
+    ++sess.status.seq;
+}
+
+void endFreeRun(Machine& m, McpSession& sess, const std::string& why) {
+    sess.free.meter.finish(m.cpuCard(), sess.free.tStates, FreeRun::clk::now());
+    sess.free.running = false;
+    sess.free.stopped = why;
+    publishFree(m, sess);
+}
+
+// Console output the free run holds for `recv`. A guest nobody reads -- a server logging
+// every request for hours -- would otherwise grow it without end.
+constexpr size_t kMaxHeldOutput = 1 << 20;
+
+// #602: ONE SLICE OF THE FREE RUN, run by runMcp's worker when no request is waiting. The
+// stop rules are `run`'s (sliceStops); the pacing and the idle nap are the monitor RUN's
+// (runMachine), because a free run IS a RUN -- it has no `until` and no timeout, and it does
+// not stop at a prompt, it naps there. Everything is looked up again each slice: a request
+// served between two slices may have replaced the machine (CONFIG LOAD) or its console.
+//
+// Ends by setting `nextSlice`: the wall time the worker waits for before the next slice.
+void freeRunSlice(Machine& m, McpSession& sess) {
+    using clk = std::chrono::steady_clock;
+    FreeRun& f = sess.free;
+    f.servedSinceSlice = false;
+
+    if (!m.cpu()) {
+        endFreeRun(m, sess, stopReasonName(StopReason::NoCpu));
+        return;
+    }
+    // A ^C that landed since the last slice -- consumed, because answering it is what
+    // "handled" means (see the same check in `run`).
+    if (Debugger::stopRequested()) {
+        Debugger::clearStopRequest();
+        endFreeRun(m, sess, stopReasonName(StopReason::StopRequested));
+        return;
+    }
+
+    std::string     err;
+    ScriptedStream* con          = console(m, sess, err);  // null on a machine with none
+    const uint64_t  rxBefore     = m.rxBytes();
+    const size_t    outBefore    = con ? con->out().size() : 0;
+    const uint64_t  hungryBefore = con ? con->hungry() : 0;
+
+    RunResult r = m.debug.run(kSliceSteps, false);  // keep a pending stop -- see `run`
+    m.pump();
+    f.steps += r.steps;
+    f.tStates += r.tStates;
+    f.sinceBase += r.tStates;
+    // Looked up each slice: a request served between two slices may have replaced the machine.
+    f.meter.sample(m.cpuCard(), f.tStates, clk::now());
+
+    // What this slice did, taken BEFORE the held output is trimmed below.
+    const SliceWork work{r.steps, con ? con->out().size() - outBefore : 0,
+                         m.rxBytes() - rxBefore, con ? con->hungry() - hungryBefore : 0};
+    if (con) f.dropped += con->trimOut(kMaxHeldOutput);
+
+    if (sliceStops(r.why)) {
+        if (r.why == StopReason::StopRequested) Debugger::clearStopRequest();
+        f.last = r;
+        endFreeRun(m, sess, stopReasonName(r.why));
+        return;
+    }
+    publishFree(m, sess);
+
+    const auto now = clk::now();
+
+    // THE IDLE NAP -- runMachine's rule (monitor.cpp): a guest that said nothing, received
+    // nothing and kept finding the console empty is at a prompt. Once that has lasted
+    // kIdleWarmup, wait kIdleNap before the next slice, so a free-running guest at A> does
+    // not hold a whole core. The wait ends early for a request, and a typed key is read
+    // within one nap.
+    //
+    // FLAT OUT ONLY, as in runMachine (mayNap, monitor.h). With a crystal set, the pacing
+    // wait below already leaves the host idle. A nap in place of it leaves the slice before
+    // it unpaced: measured at clock_hz=2000000, the guest at a prompt ran 1.5x its crystal,
+    // and a guest timing a reply while it polls the console would time it short (#606 was
+    // the same fault in the monitor's RUN).
+    static constexpr uint64_t kIdleRatio  = 32;
+    static constexpr auto     kIdleWarmup = std::chrono::milliseconds(20);
+    static constexpr auto     kIdleNap    = std::chrono::milliseconds(4);
+    const bool idling = m.clock.free() && m.clock.idle() && con && con->drained() &&
+                        guestIsWaiting(work, kIdleRatio);
+    if (!idling) {
+        f.idleSince = clk::time_point{};
+    } else if (f.idleSince == clk::time_point{}) {
+        f.idleSince = now;
+    } else if (now - f.idleSince >= kIdleWarmup) {
+        f.nextSlice = now + kIdleNap;
+        return;
+    }
+
+    // PACE TO THE CRYSTAL when one is asked for, as `run` and RUN do: the next slice waits
+    // until wall time has caught up with the emulated time this free run has spent.
+    f.nextSlice = now;
+    const long long hz = m.clock.free() ? 0 : m.clock.hz();
+    // A NEW CRYSTAL (or none) starts a new count: the T-states spent at the old one say
+    // nothing about the new one, and counting them at a lowered clock_hz would freeze the
+    // guest for as long as it takes the new crystal to "earn" them.
+    if (hz != f.baseHz) {
+        f.rebase(now, hz);
+        return;
+    }
+    if (hz <= 0) {
+        f.rebase(now, hz);  // flat out: nothing to pace
+        return;
+    }
+    const double want = (double)f.sinceBase / (double)hz;
+    const double got  = std::chrono::duration<double>(now - f.baseW).count();
+    // BEHIND -- wall time passed that the guest did not run: a long request served between
+    // two slices, the thread descheduled. It is not owed, so re-base rather than sprint to
+    // catch up.
+    if (want < got) {
+        f.rebase(now, hz);
+        return;
+    }
+    f.nextSlice = f.baseW + std::chrono::duration_cast<clk::duration>(
+                                std::chrono::duration<double>(want));
+}
+
+Json callTool(Machine& m, McpSession& sess, const std::string& name, const Json& args) {
+    char buf[256];
+    // The mem_* tools, who, bus_map and bus_contention take and return PHYSICAL addresses,
+    // A0-A23, and their text shows 6 hex digits. (disasm and the run tools stay on the
+    // CPU's 16-bit addresses.)
+    const uint32_t amax = m.bus.addrMask();
+    // ONE CALL SPANS AT MOST 64K. `hi = 0xFFFFFFFF` ("all of memory") would be 16M bus
+    // cycles and a 16M-element reply, so a wider span is refused, not cut short.
+    auto spanErr = [&](uint32_t lo, uint32_t hi) -> std::string {
+        if (hi < lo) return "";
+        if ((uint64_t)std::min(hi, amax) - lo + 1 <= 0x10000) return "";
+        return "lo-hi spans more than 64K; one call takes at most "
+               "64K (10000H bytes). Split the range.";
+    };
+    auto hx = [](uint32_t A) {
+        char b[16];
+        std::snprintf(b, sizeof b, "%06X", (unsigned)A);
+        return std::string(b);
+    };
+
+    if (std::string bad = checkArgs(name, args); !bad.empty()) return textResult(bad, true);
+
+    if (name == "board_types") {
+        Json a = Json::arr();
+        for (const auto& t : boardTypes()) {
+            Json j = Json::obj();
+            j["name"] = Json(t.name);
+            j["summary"] = Json(t.summary);
+            j["description"] = Json(t.description);
+            auto b = makeBoard(t.name);
+            j["properties"] = propsJson(b.get());
+            j["sub_units"]  = subUnitsJson(b.get());   // what its [[board.x]] tables take
+            a.push(j);
+        }
+        Json d = Json::obj();
+        d["types"] = a;
+        return dataResult(d, a.dump());
+    }
+
+    if (name == "board_list") {
+        Json a = Json::arr();
+        for (const auto& b : m.boards()) a.push(boardJson(b.get()));
+        Json d = Json::obj();
+        d["boards"] = a;
+        return dataResult(d, a.items().empty() ? "(empty backplane)" : a.dump());
+    }
+
+    if (name == "board_get") {
+        Board* b = m.find(args.at("id").str());
+        if (!b) return textResult("no board '" + args.at("id").str() + "'", true);
+        Json d = boardJson(b);
+        d["properties"] = propsJson(b);
+        d["sub_units"]  = subUnitsJson(b);
+        if (auto* mem = dynamic_cast<MemoryBoard*>(b)) {
+            Json rs = Json::arr();
+            int i = 0;
+            for (const auto& r : mem->regions()) {
+                Json j = Json::obj();
+                j["unit"] = Json(i++);
+                j["type"] = Json(r.kind == RegionKind::Rom ? "rom" : "ram");
+                j["at"] = Json((long long)r.at);
+                j["size"] = Json((long long)r.size);
+                if (!r.mount.empty()) j["mount"] = Json(r.mount);
+                rs.push(j);
+            }
+            d["regions"] = rs;
+        }
+        return dataResult(d, d.dump());
+    }
+
+    if (name == "board_add") {
+        std::string err;
+        Board* b = m.add(args.at("type").str(), args.at("id").str(), err);
+        if (!b) return textResult(err, true);
+        return dataResult(boardJson(b), b->id + ": " + b->type() + " added");
+    }
+
+    if (name == "board_set") {
+        Board* b = m.find(args.at("id").str());
+        if (!b) return textResult("no board '" + args.at("id").str() + "'", true);
+        std::string err;
+        if (!setProperty(*b, args.at("key").str(), args.at("value").str(), err))
+            return textResult(err, true);
+        return dataResult(propsJson(b), b->id + ": " + args.at("key").str() + "=" +
+                                            storedText(b->properties(), args.at("key").str(),
+                                                       args.at("value").str()));
+    }
+
+    if (name == "who") {
+        const uint32_t A = (uint32_t)args.at("addr").integer() & amax;
+        Json d = Json::obj();
+        d["addr"] = Json((long long)A);
+        std::string text;
+        for (Cycle t : {Cycle::MemRead, Cycle::MemWrite}) {
+            BusCycle c;
+            c.type = t;
+            c.addr = (uint16_t)A;
+            c.ext  = (uint8_t)(A >> 16);
+            bool ph = false;
+            for (const auto& b : m.boards())
+                if (b->enabled() && b->assertsPhantom(c)) ph = true;
+            auto who = m.bus.respondersTo(c);
+            Json j = Json::obj();
+            Json ids = Json::arr();
+            for (auto* b : who) ids.push(Json(b->id));
+            j["boards"] = ids;
+            j["phantom"] = Json(ph);
+            j["floats"] = Json(who.empty());
+            j["contention"] = Json(who.size() > 1);
+            const char* k = (t == Cycle::MemRead) ? "read" : "write";
+            d[k] = j;
+            std::snprintf(buf, sizeof buf, "%s %s: ", hx(A).c_str(), k);
+            text += buf;
+            if (who.empty()) text += "nobody -- floats to FF";
+            for (auto* b : who) text += b->id + " ";
+            if (who.size() > 1) text += "*** CONTENTION ***";
+            if (ph) text += " [PHANTOM*]";
+            text += "\n";
+        }
+        return dataResult(d, text);
+    }
+
+    if (name == "bus_map" || name == "bus_io") {
+        Json a = Json::arr();
+        for (const auto& b : m.boards())
+            for (const auto& e : (name == "bus_map" ? b->memMap() : b->ioMap())) {
+                Json j = Json::obj();
+                j["board"] = Json(b->id);
+                j["lo"] = Json((long long)e.lo);
+                j["hi"] = Json((long long)e.hi);
+                j["kind"] = Json(e.what);
+                j["note"] = Json(e.note);
+                // IEEE 696: lo/hi are A0-A15; `segments` says where (A16-A23): "all" for a
+                // board that does not decode A16-A23, else the segment numbers.
+                if (name == "bus_map") {
+                    if (!b->decodesExtended()) {
+                        j["segments"] = Json("all");
+                    } else {
+                        Json sg = Json::arr();
+                        for (uint32_t x : m.segmentsOf(*b)) sg.push(Json((long long)x));
+                        j["segments"] = sg;
+                    }
+                }
+                a.push(j);
+            }
+        Json d = Json::obj();
+        d["entries"] = a;
+        return dataResult(d, a.dump());
+    }
+
+    if (name == "bus_contention") {
+        // Segment 0, and on the IEEE 696 bus every segment a board decodes
+        // (Machine::contentionSegments, the same set SHOW BUS CONTENTION walks).
+        const std::vector<uint32_t> segs = m.contentionSegments();
+        Json a = Json::arr();
+        for (uint32_t sg : segs)
+        for (uint32_t A = sg << 16; A <= ((sg << 16) | 0xFFFF); ++A) {
+            for (Cycle t : {Cycle::MemRead, Cycle::MemWrite}) {
+                BusCycle c;
+                c.type = t;
+                c.addr = (uint16_t)A;
+                c.ext  = (uint8_t)(A >> 16);
+                auto who = m.bus.respondersTo(c);
+                if (who.size() < 2) continue;
+                Json j = Json::obj();
+                j["addr"] = Json((long long)A);
+                j["cycle"] = Json(t == Cycle::MemRead ? "read" : "write");
+                Json ids = Json::arr();
+                for (auto* b : who) ids.push(Json(b->id));
+                j["boards"] = ids;
+                a.push(j);
+            }
+        }
+        Json d = Json::obj();
+        d["contention"] = a;
+        return dataResult(d, a.items().empty() ? "none" : a.dump());
+    }
+
+    if (name == "mem_dump") {
+        uint32_t lo = (uint32_t)args.at("lo").integer();
+        uint32_t hi = (uint32_t)args.at("hi").integer();
+        if (std::string e = spanErr(lo, hi); !e.empty()) return textResult(e, true);
+
+        Json bytes = Json::arr();
+        std::string text;
+        for (uint32_t A = lo; A <= hi && A <= amax; ++A) {
+            uint8_t v = m.bus.memReadX(A);
+            bytes.push(Json((long long)v));
+            std::snprintf(buf, sizeof buf, "%02X ", v);
+            text += buf;
+        }
+        Json d = Json::obj();
+        d["lo"] = Json((long long)lo);
+        d["hi"] = Json((long long)hi);
+        d["bytes"] = bytes;
+        return dataResult(d, text);
+    }
+
+    if (name == "mem_deposit") {
+        uint32_t A = (uint32_t)args.at("addr").integer();
+        std::vector<uint8_t> bytes;
+        if (!parseBytes(args.at("bytes").str(), bytes))
+            return textResult("bytes must be hex, e.g. \"C3 00 2C\"", true);
+        bool rom = args.has("rom") && args.at("rom").boolean();
+
+        int discarded = 0;
+        for (size_t k = 0; k < bytes.size(); ++k) {
+            if (rom) {
+                std::string why;
+                if (!m.burn(A + (uint32_t)k, bytes[k], why)) return textResult(why, true);
+            } else {
+                m.bus.memWriteX(A + (uint32_t)k, bytes[k]);
+                if (m.bus.lastUnclaimed()) ++discarded;
+            }
+        }
+        Json d = Json::obj();
+        d["addr"] = Json((long long)A);
+        d["written"] = Json((long long)bytes.size());
+        d["discarded"] = Json((long long)discarded);
+        d["rom"] = Json(rom);
+
+        std::string text = std::to_string(bytes.size()) + " byte(s) written";
+        if (discarded) {
+            // The single most important thing this tool can tell an agent, and
+            // it must never be silent about it.
+            text += "; " + std::to_string(discarded) +
+                    " landed NOWHERE -- no board decodes a write there. That address is ROM "
+                    "or unmapped. A ROM does not reject the write; it never answers the cycle. "
+                    "To program it anyway, pass rom=true (the PROM burner).";
+        }
+        return dataResult(d, text);
+    }
+
+    if (name == "mem_load") {
+        std::string path = args.at("path").str();
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return textResult("cannot open '" + path + "'", true);
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
+                                  std::istreambuf_iterator<char>());
+        // Same rule as the prompt's LOAD, because it is the same operation: the file's
+        // contents decide, and `format` overrides them.
+        int forced = -1;  // -1 autodetect, 0 BIN, 1 HEX
+        if (args.has("format")) {
+            std::string want = args.at("format").str();
+            for (char& c : want) c = (char)std::toupper((unsigned char)c);
+            if (want == "HEX") forced = 1;
+            else if (want == "BIN") forced = 0;
+            else return textResult("format must be BIN or HEX", true);
+        }
+
+        Image img;
+        std::string err;
+        if (forced == 1 || (forced < 0 && looksLikeHex(data))) {
+            if (!loadHex(data, img, err, amax)) return textResult(path + ": " + err, true);
+            // `at` was accepted and then IGNORED here for a HEX file, silently. It
+            // relocates, exactly as it does at the prompt (hex.h).
+            if (args.has("at")) relocateTo(img, (uint32_t)args.at("at").integer(), amax);
+        } else if (forced < 0 && looksLikeSrec(data)) {
+            // An S-record carries its own addresses like Intel HEX, so `at` relocates.
+            if (!loadSrec(data, img, err)) return textResult(path + ": " + err, true);
+            if (args.has("at")) relocateTo(img, (uint32_t)args.at("at").integer(), amax);
+        } else {
+            if (!args.has("at"))
+                return textResult(path + " is a flat binary and carries no addresses -- pass `at`",
+                                  true);
+            loadBin(data, (uint32_t)args.at("at").integer(), img);
+        }
+
+        bool rom = args.has("rom") && args.at("rom").boolean();
+
+        int discarded = 0;
+        for (const auto& [A, v] : img.bytes) {
+            if (rom) {
+                std::string why;
+                if (!m.burn(A, v, why)) return textResult(hx(A) + ": " + why, true);
+            } else {
+                m.bus.memWriteX(A, v);
+                if (m.bus.lastUnclaimed()) ++discarded;
+            }
+        }
+        Json d = Json::obj();
+        d["bytes"] = Json((long long)img.size());
+        d["lo"] = Json((long long)img.lo());
+        d["hi"] = Json((long long)img.hi());
+        d["discarded"] = Json((long long)discarded);
+        d["rom"] = Json(rom);
+        std::snprintf(buf, sizeof buf, "loaded %zu bytes (%s-%s)", img.size(), hx(img.lo()).c_str(),
+                      hx(img.hi()).c_str());
+        std::string text = buf;
+        if (discarded)
+            text += "; WARNING: " + std::to_string(discarded) +
+                    " byte(s) landed nowhere (ROM or unmapped). Use raw=<id> to burn a ROM.";
+        return dataResult(d, text);
+    }
+
+    if (name == "roms") {
+        Json a = Json::arr();
+        std::string text;
+        for (const auto& r : builtinRoms()) {
+            Image img;
+            std::string err;
+            Json j = Json::obj();
+            j["name"] = Json(r.name);
+            j["file"] = Json(r.file);
+            if (decodeRom(r, 0, img, err) && !img.empty()) {
+                auto flat = img.flat();
+                j["size"] = Json((long long)img.size());
+                j["lo"] = Json((long long)img.lo());
+                j["hi"] = Json((long long)img.hi());
+                std::snprintf(buf, sizeof buf, "%08X", crc32(flat));
+                j["crc32"] = Json(std::string(buf));
+                text += std::string(r.name) + " (" + buf + ")\n";
+            }
+            j["mount"] = Json(std::string("builtin:") + r.name);
+            a.push(j);
+        }
+        Json d = Json::obj();
+        d["roms"] = a;
+        return dataResult(d, text.empty() ? "(none compiled in)" : text);
+    }
+
+    if (name == "reset") {
+        std::string k = args.at("kind").str("bus");
+        if (k == "power") {
+            m.power();
+            return textResult("power cycled: RAM re-filled, ROM images re-read, POC* pulsed.");
+        }
+        m.reset(Reset::Bus);
+        return textResult("RESET* pulsed. Memory is UNTOUCHED -- only power loses RAM.");
+    }
+
+    if (name == "send") {
+        std::string err;
+        LineRef     line = lineFor(m, sess, args, err);
+        if (!line) return textResult(err, true);
+        line.feed(args.at("text").str());
+        return textResult(line.con ? "(typed)" : "(typed at " + line.name + ")");
+    }
+
+    if (name == "recv") {
+        std::string err;
+        LineRef     line = lineFor(m, sess, args, err);
+        if (!line) return textResult(err, true);
+        std::string out = line.out();
+        line.clearOut();
+        Json d = Json::obj();
+        d["output"] = Json(out);
+        std::string text = out.empty() ? "(nothing)" : out;
+        // The console's drops are the free run's; a unit's are its tap's.
+        const uint64_t dropped = line.con ? sess.free.dropped : line.tap->takeDropped();
+        if (line.con) sess.free.dropped = 0;
+        if (dropped) {
+            d["dropped"] = Json((long long)dropped);
+            text = "[" + std::to_string(dropped) + " older bytes dropped: nobody read them]\n" + text;
+        }
+        return dataResult(d, text);
+    }
+
+    // #602: the two tools that move the guest themselves. The free run owns it until `stop`.
+    if ((name == "run" || name == "step") && sess.free.running)
+        return textResult("the guest is running (`start`) -- `stop` it first", true);
+
+    if (name == "start") {
+        if (sess.free.running) return textResult("the guest is already running", true);
+        CpuCore* cpu = m.cpu();
+        if (!cpu) return textResult("no CPU in this machine", true);
+        // Adopt the console now, as `run` does, so the guest never reads the JSON-RPC
+        // stdin. A machine with no console line can still free-run -- a server on a socket
+        // needs none -- but then it cannot be typed at.
+        std::string     err;
+        ScriptedStream* con = console(m, sess, err);
+        if (args.has("input") && !con) return textResult(err, true);
+        if (std::string h = haltRefusal(m, cpu, args.has("from")); !h.empty())
+            return textResult(h, true);
+        if (std::string e = fromRefusal(cpu, args); !e.empty()) return textResult(e, true);
+
+        if (args.has("from")) cpu->setPc((uint32_t)args.at("from").integer());
+        if (args.has("input")) con->feed(args.at("input").str());
+        m.bus.resetUnclaimedWarnings();  // as `run` and RUN do (#580)
+
+        FreeRun& f = sess.free;
+        const auto now = FreeRun::clk::now();
+        f.running   = true;
+        f.stopped.clear();
+        f.steps     = 0;
+        f.tStates   = 0;
+        f.last      = RunResult{};
+        f.idleSince = FreeRun::clk::time_point{};
+        f.nextSlice = now;
+        f.rebase(now, m.clock.free() ? 0 : m.clock.hz());
+        f.meter.start(0, now);
+        publishFree(m, sess);
+
+        Json d = Json::obj();
+        d["running"] = Json(true);
+        d["pc"]      = Json((long long)cpu->pc());
+        std::snprintf(buf, sizeof buf,
+                      "running from %s -- the guest keeps running until `stop`; `recv` "
+                      "reads what it prints, `status` says whether it still runs.",
+                      pcText(*cpu).c_str());
+        return dataResult(d, buf);
+    }
+
+    if (name == "stop") {
+        FreeRun&   f   = sess.free;
+        const bool was = f.running;
+        if (was) endFreeRun(m, sess, "requested");
+
+        Json d = Json::obj();
+        d["was_running"] = Json(was);
+        d["stopped"]     = Json(f.stopped);
+        d["pc"]          = Json(m.cpu() ? (long long)m.cpu()->pc() : 0LL);
+        d["steps"]       = Json((long long)f.steps);
+        d["t_states"]    = Json((long long)f.tStates);
+        std::string text;
+        if (f.stopped.empty()) {
+            text = "not running -- nothing was started";
+        } else {
+            if (f.stopped == "unclaimed") text = unclaimedLine(f.last) + "\n";
+            if (f.stopped == "tma-conflict") text = tmaConflictLine(m) + "\n";
+            text += (was ? "stopped" : "not running; the free run had already stopped") +
+                    std::string(": ") + f.stopped + ", " + std::to_string(f.steps) + " insn, " +
+                    std::to_string(f.tStates) + " T";
+        }
+        d["warnings"] = drainWarnings(m, text);
+        return dataResult(d, text);
+    }
+
+    if (name == "regs") {
+        CpuCore* c = m.cpu();
+        if (!c) return textResult("no CPU in this machine", true);
+        Json d = Json::obj();
+        std::string text;
+        d["registers"] = regsObject(c, text);
+        d["pc"] = Json((long long)c->pc());
+        d["halted"] = Json(c->halted());
+        d["interrupts"] = Json(c->interruptsEnabled());
+        // Which core, on a board with two processors (absent on a one-core machine).
+        if (std::string unit = m.coreUnit(c); !unit.empty()) d["core"] = Json(unit);
+        text = m.coreTag(c) + text;
+        return dataResult(d, text);
+    }
+
+    if (name == "run") {
+        using clk = std::chrono::steady_clock;
+        std::string err;
+        // `unit` (or none: the console) is the line `input`, `until` and `output` use. `con` is
+        // the console, kept for the idle test below -- null on a machine with no console line,
+        // and then this call never stops on idle.
+        LineRef line = lineFor(m, sess, args, err);
+        if (!line) return textResult(err, true);
+        ScriptedStream* con = line.con ? line.con : sessionLine(m, sess);
+        CpuCore* cpu = m.cpu();
+        if (!cpu) return textResult("no CPU in this machine", true);
+        if (std::string h = haltRefusal(m, cpu, args.has("from")); !h.empty())
+            return textResult(h, true);
+        // #822: refused before anything moves -- a bad stop_at must not leave PC or input changed.
+        const long long stopAt = args.has("stop_at") ? args.at("stop_at").integer() : -1;
+        if (args.has("stop_at") && (stopAt < 0 || stopAt > (long long)cpu->pcMask()))
+            return textResult(cpu->pcMask() > 0xFFFF
+                                  ? "`stop_at` must be an address from 0 to 1048575 (FFFFF)"
+                                  : "`stop_at` must be an address from 0 to 65535",
+                              true);
+        if (std::string e = fromRefusal(cpu, args); !e.empty()) return textResult(e, true);
+
+        if (args.has("from")) cpu->setPc((uint32_t)args.at("from").integer());
+        if (args.has("input")) line.feed(args.at("input").str());
+
+        // Re-arm the unclaimed-port de-dup for this run, as runMachine does for a RUN, so
+        // an absent port reported by the last run is reported again by this one (#580).
+        m.bus.resetUnclaimedWarnings();
+
+        // #490: publish a slice-boundary snapshot so `status`, answered out of band by the
+        // reader thread, can report on THIS run without ever touching the Machine/CpuCore
+        // itself -- see RunSnapshot's own comment for why that split has to exist, and
+        // statusResult()'s own comment for why `in_flight` itself is NOT one of these fields.
+        // One publish now (before the first slice runs), one after each slice below, and one
+        // right after the loop alongside the `d` this call is about to return -- so a
+        // poller's last look always matches what the caller of `run` itself was told.
+        const std::string boardId = cpuBoardId(m);
+        auto publishStatus = [&](uint64_t stepsSoFar) {
+            std::lock_guard<std::mutex> lk(sess.statusMu);
+            sess.status.boardId  = boardId;
+            sess.status.steps    = stepsSoFar;
+            sess.status.pc       = m.cpu()->pc();   // the ACTIVE core: a run may switch them
+            ++sess.status.seq;
+        };
+        publishStatus(0);
+
+        const std::string until   = args.has("until") ? args.at("until").str() : std::string();
+        long long         timeout = args.has("timeout_ms") ? args.at("timeout_ms").integer() : 2000;
+        if (timeout < 0) timeout = 0;
+        if (timeout > 600000) timeout = 600000;  // ten minutes is already a runaway
+        const uint64_t maxSteps = args.has("max_steps") ? (uint64_t)args.at("max_steps").integer() : 0;
+
+        // A prompt is a guest that ran, said nothing, received nothing, and came to the
+        // console and found it empty at least once every 32 instructions -- the same
+        // discrimination runMachine draws (guestIsWaiting, monitor.cpp), so a loader that
+        // is merely quiet while it works is NOT mistaken for one. It must persist across a
+        // couple of slices to be believed.
+        static constexpr uint64_t kIdleRatio = 32;
+
+        // THROTTLE TO THE CRYSTAL, exactly as runMachine does (monitor.cpp). By default
+        // clock_hz is 0 -- the clock is free() -- and this loop runs the guest FLAT OUT, which
+        // is what a fast CP/M boot and interactive prompt-driving want. But `SET cpu0
+        // clock_hz=N` under --mcp is a request to make the machine real-time, and the reason it
+        // is asked for is a real serial device: a bench peer answers a read hundreds of ms
+        // later, in WALL time, and a guest polling for that reply with a software timeout burns
+        // that timeout in microseconds if we sprint. Paced, its emulated timeout spends real
+        // wall-clock, m.pump() reads the port meanwhile, and the reply lands while it is still
+        // waiting -- the same bargain the standalone monitor RUN already makes (#424). The
+        // deadline below still bounds the call; pacing only declines to do all the emulated work
+        // at once. Baseline is per-call: each run() re-bases, and there is no idle nap to rebase
+        // against (this loop STOPS on idle rather than napping).
+        const long long hz     = m.clock.hz();
+        const uint64_t  startT = m.clock.now();
+        const auto      start  = clk::now();
+
+        // IS A REAL DEVICE ON A LINE? -- a serial cable, a socket, anything but the MCP console
+        // and an empty jack. This governs ONLY the idle-stop grace below (`idleDwell`): on such a
+        // wire, a quiet slice does not mean the guest reached a prompt -- it may be waiting on a
+        // reply that lands hundreds of ms later, or sitting in the gap between two blocks of a
+        // disk read (#424). It does NOT extend timeout_ms. An earlier version of this loop also
+        // let live-wire traffic renew the deadline itself, so a peer that said anything at all,
+        // however slowly, kept the call going indefinitely (#487) -- timeout_ms is now a hard
+        // wall-clock ceiling no matter what is arriving on any line. A transfer that needs longer
+        // gets a bigger timeout_ms and a caller that loops on stopped:"timeout", not an unbounded
+        // wait built into the tool.
+        bool hasLiveWire = false;
+        for (const auto& b : m.boards())
+            for (const auto& u : b->units()) {
+                if (u.kind != UnitKind::Serial) continue;
+                if (b->id == sess.conBoard && u.name == sess.conUnit) continue;  // the MCP console
+                if (u.state == "null") continue;                                 // nothing plugged in
+                hasLiveWire = true;
+            }
+
+        // The wall-clock grace the idle-stop (below) waits out before it will call a live wire's
+        // silence "idle". Zero with no device -- there the instruction-count rule alone decides,
+        // exactly as before, so a plain interactive prompt still "idles on instruction count".
+        const auto idleDwell = hasLiveWire ? std::chrono::milliseconds(5000)
+                                           : std::chrono::milliseconds(0);
+
+        const auto deadline = start + std::chrono::milliseconds(timeout);
+        std::string     out;
+        uint64_t        steps = 0;
+        uint64_t        tStates = 0;       // emulated time this call spent -- see below
+        int             quietSlices = 0;         // consecutive quiet slices -- the instruction-count rule
+        clk::time_point idleSince{};             // when this unbroken run of quiet began; unset = busy
+        std::string     stopped;
+        RunResult       last;                    // the slice that stopped on unclaimed/tape-stop
+
+        auto drain = [&] {
+            const std::string& o = line.out();
+            if (!o.empty()) { out += o; line.clearOut(); }
+        };
+
+        // `achieved_hz` (#903), as the monitor's RUN measures it, from this call's own T-states.
+        CpuCard* const  card = m.cpuCard();
+        AchievedHzMeter meter;
+        meter.start(0, start);
+
+        // `stop_at` is NEXT's one-shot PC target (Debugger::setStepTarget): no breakpoint id,
+        // nothing for BREAK to list. Set for this call only -- every exit from the loop below is
+        // a `break`, so the clear after it always runs.
+        m.debug.setStepTarget((int)stopAt, /*anyCore=*/true);   // whichever core gets there
+        for (;;) {
+            drain();
+            if (!until.empty() && out.find(until) != std::string::npos) { stopped = "match"; break; }
+            // ASK BEFORE THE SLICE, not just after it. A stop request that arrived since the last
+            // slice returned -- and with a clock_hz set, most of this loop's wall time is the
+            // pacing sleep below -- is caught here. Measured before this check existed, when
+            // every slice still cleared the flag on entry: five of eight ^Cs swallowed at
+            // clock_hz=2000000. The slice below no longer clears it either (see there).
+            if (Debugger::stopRequested()) {
+                // CONSUME it: reporting it to the client is what "handled" means. Leave it
+                // standing and the next ^C -- the one that means "I said stop" -- would find
+                // an unconsumed flag and kill the process (SigintGuard, core/debug.h) even
+                // though this one was heard and answered.
+                Debugger::clearStopRequest();
+                stopped = "interrupted";
+                break;
+            }
+            if (clk::now() >= deadline) { stopped = "timeout"; break; }
+            if (maxSteps && steps >= maxSteps) { stopped = "steps"; break; }
+
+            const uint64_t rxBefore     = m.rxBytes();
+            const uint64_t hungryBefore = con ? con->hungry() : 0;
+            // KEEP A PENDING STOP REQUEST (the `false`). The check at the top of this loop and the
+            // slice are two steps, and a cancel or ^C can land between them. If the slice cleared
+            // the flag on entry, as a whole RUN does, that one would be erased unseen and the run
+            // would go on to its full budget: on Windows, 9 cancels in 5000 were lost that way.
+            // This request's stale flag was already cleared once, at dispatch (runMcp), so
+            // keeping it here cannot resurrect an old one.
+            RunResult r = m.debug.run(kSliceSteps, false);
+            m.pump();
+            steps += r.steps;
+            tStates += r.tStates;
+            publishStatus(steps);  // #490: this slice's boundary, for `status` to read
+
+            // Keep wall-clock in step with the crystal (see the baseline above). Only when a
+            // clock_hz was asked for; free() is the flat-out default and never sleeps here.
+            if (!m.clock.free()) {
+                double want = (double)(m.clock.now() - startT) / (double)hz;
+                double got  = std::chrono::duration<double>(clk::now() - start).count();
+                if (want > got)
+                    std::this_thread::sleep_for(std::chrono::duration<double>(want - got));
+            }
+            meter.sample(card, tStates, clk::now());
+
+            const size_t wroteBefore = out.size();
+            drain();
+            const bool produced = out.size() != wroteBefore;
+            const bool received = m.rxBytes() != rxBefore;
+            const uint64_t hungry = con ? con->hungry() - hungryBefore : 0;
+
+            // A HLT, a breakpoint, a stop request -- and SET BUS UNCLAIMED=HALT and BREAK TAPE
+            // STOP, which stop the monitor's RUN and so stop this one too (#580). One list,
+            // shared with the free run. `last` keeps the port for the stop line below.
+            if (sliceStops(r.why)) {
+                if (r.why == StopReason::StopRequested) Debugger::clearStopRequest();
+                last    = r;
+                stopped = r.why == StopReason::StepTarget ? "stop-at" : stopReasonName(r.why);
+                break;
+            }
+
+            // IDLE-STOP -- hand control back when the guest has nothing to do, so the AI is not
+            // made to wait out timeout_ms for its next command. Gated on clock.idle() like
+            // runMachine's nap (monitor.cpp): `SET cpu0 idle=off` turns it off entirely. A slice
+            // counts as quiet when the guest said nothing, received nothing on ANY line (rxBytes,
+            // the whole backplane), and kept coming to the console and finding it empty. It takes
+            // BOTH signals to stop: the instruction-count spin (two quiet slices -- fast, and all
+            // a plain interactive prompt needs) AND, when a device is on the wire, that the wire
+            // has stayed silent for idleDwell of WALL time -- so a gap between a request and its
+            // reply, or between two blocks of a disk read, is not mistaken for a prompt (#424).
+            // idleDwell is 0 with no device, so there the two-slice rule alone decides, unchanged.
+            const bool quiet = con && m.clock.idle() && con->drained() && !produced && !received &&
+                               r.steps != 0 && hungry * kIdleRatio >= r.steps;
+            if (!quiet) {
+                quietSlices = 0;
+                idleSince   = clk::time_point{};                   // it did something -- start over
+            } else {
+                ++quietSlices;
+                if (idleSince == clk::time_point{}) idleSince = clk::now();  // first quiet slice
+                if (quietSlices >= 2 && clk::now() - idleSince >= idleDwell) {
+                    stopped = "idle";
+                    break;
+                }
+            }
+        }
+
+        m.debug.setStepTarget(-1);
+        meter.finish(card, tStates, clk::now());
+
+        publishStatus(steps);  // #490: this call is done -- the next status poll's `steps`/`pc`
+                                // are this call's own final values (its `in_flight` comes from
+                                // `haveCurrentId`, which the caller below is about to clear)
+
+        Json d = Json::obj();
+        d["output"]  = Json(out);
+        d["stopped"] = Json(stopped);
+        d["pc"]      = Json((long long)m.cpu()->pc());   // the active core (it may have switched)
+        if (std::string unit = m.coreUnit(m.cpu()); !unit.empty()) d["core"] = Json(unit);
+        d["steps"]   = Json((long long)steps);
+        // EMULATED TIME THIS CALL SPENT, which `steps` cannot give you: instructions are
+        // 4-17 T-states apiece, so a count of them is not a duration (issue #492). `step`
+        // has always reported t_states for its own call; run not doing so was an oversight.
+        // Seconds are t_states divided by the crystal -- `monitor {command: "SHOW CLOCK"}`
+        // prints that, plus the total since power-on.
+        d["t_states"] = Json((long long)tStates);
+        std::string text = out;
+        if (stopped == "unclaimed") {
+            // The monitor's stop line, so the text says WHICH port; the warning with the PC
+            // follows it, from the bus log.
+            if (!text.empty() && text.back() != '\n') text += '\n';
+            text += unclaimedLine(last);
+        }
+        if (stopped == "tma-conflict") {
+            if (!text.empty() && text.back() != '\n') text += '\n';
+            text += tmaConflictLine(m);
+        }
+        d["warnings"] = drainWarnings(m, text);
+        if (!text.empty() && text.back() != '\n') text += '\n';
+        text += "[stopped: " + stopped + "]";
+        return dataResult(d, text);
+    }
+
+    if (name == "monitor") {
+        std::ostringstream os;
+        Monitor mon(m);
+        mon.setMcpMode(true);  // RUN parks instead of blocking -- a bare RUN (or the RUN a
+                               // CONFIG LOAD startup ends in) would otherwise wedge the server.
+                               // It also stops TRACE from borrowing `os`, which dies with
+                               // this call while the debugger would go on writing to it (#613).
+        // The unit on the session's scripted line holds the console, though it shows
+        // `scripted`: SHOW CONSOLE names it, and CONNECT ... console takes the console from it
+        // during the command (issue #779).
+        mon.setConsoleHolds(
+            [&](Board& b, const std::string& unit) { return holdsLine(m, sess, b, unit); });
+        mon.setConsoleTaker(
+            [&](Board* b, const std::string& unit) { return takeLine(m, sess, b, unit); });
+        mon.exec(args.at("command").str(), os);
+
+        // A monitor command can swap the console out from under us: CONFIG LOAD replaces
+        // every board (and with them the scripted line and any --mirror listener), CONNECT
+        // can re-wire the console unit. Re-adopt it NOW rather than on the next send/recv/
+        // run -- otherwise the mirror port is closed meanwhile, and a `step` would run the
+        // guest with its console aimed at our JSON-RPC stdin (issue #481). Idempotent when
+        // nothing changed. Losing a console we held (the mirror port taken, a machine with
+        // no console line) is said once on stderr, as at startup -- never on `out`.
+        std::string conErr;
+        const bool  hadConsole = !sess.conBoard.empty();
+        if (!console(m, sess, conErr)) {
+            if (hadConsole && !conErr.empty())
+                std::cerr << "pascal100: --mcp console lost: " << conErr << "\n";
+            sess.conBoard.clear();
+            sess.conUnit.clear();
+        }
+        // A CONNECT that moved the console says who it took it from, first, as the CLI does.
+        std::string text;
+        for (const auto& t : sess.taken) text += t + "\n";
+        sess.taken.clear();
+        text += os.str();
+        return textResult(text.empty() ? "(ok)" : text, mon.failed());
+    }
+
+    if (name == "step") {
+        CpuCore* c = m.cpu();
+        if (!c) return textResult("no CPU in this machine", true);
+        if (std::string h = haltRefusal(m, c, false); !h.empty()) return textResult(h, true);
+        uint64_t n = args.has("count") ? (uint64_t)args.at("count").integer() : 1;
+        if (n == 0) n = 1;
+
+        RunResult r;
+        uint64_t steps = 0, tStates = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            r = m.debug.run(1);
+            steps += r.steps;
+            tStates += r.tStates;
+            if (r.why != StopReason::Steps) break;  // HLT, breakpoint -- stop early
+        }
+        m.pump();  // reflect the resting bus cycle on the panel, as monitor STEP does
+
+        // ASKED AGAIN: on a board with two processors the step may have switched cores, and
+        // the answer is the core that runs NEXT, not the one this call started on.
+        c = m.cpu();
+        Json d = Json::obj();
+        std::string text;
+        d["registers"] = regsObject(c, text);
+        if (std::string unit = m.coreUnit(c); !unit.empty()) d["core"] = Json(unit);
+        text = m.coreTag(c) + text;
+        d["warnings"]  = drainWarnings(m, text);  // an UNCLAIMED=WARN line, say (#580)
+        if (!text.empty() && text.back() != '\n') text += '\n';
+        d["steps"]    = Json((long long)steps);
+        d["t_states"] = Json((long long)tStates);
+        d["pc"]       = Json((long long)c->pc());
+        d["halted"]   = Json(c->halted());
+        d["stopped"]  = Json(stopReasonName(r.why));
+        if (r.why == StopReason::TmaConflict) text += tmaConflictLine(m) + "\n";
+        text += "[" + std::to_string(steps) + " insn, " + std::to_string(tStates) +
+                " T; stopped: " + stopReasonName(r.why) + "]";
+        return dataResult(d, text);
+    }
+
+    if (name == "disasm") {
+        std::string isa = args.has("cpu") ? args.at("cpu").str() : m.isa();
+        if (isa.empty())
+            return textResult("no CPU in this machine -- pass cpu (e.g. 8080) to say how to "
+                              "decode these bytes.", true);
+        const Disassembler* dis = disassemblerFor(isa);
+        if (!dis) {
+            std::string known;
+            for (const auto& s : instructionSets()) known += " " + s;
+            return textResult("no instruction set '" + isa + "'. Known:" + known, true);
+        }
+        auto peek = [&](uint16_t a) { return m.bus.peek(a); };
+
+        uint32_t at   = (uint32_t)args.at("addr").integer();
+        bool     rng  = args.has("hi");
+        uint32_t hi   = rng ? (uint32_t)args.at("hi").integer() : 0;
+        uint32_t cnt  = args.has("count") ? (uint32_t)args.at("count").integer() : 16;
+
+        Json lines = Json::arr();
+        std::string text;
+        for (uint32_t i = 0; (rng ? at <= hi : i < cnt) && at <= 0xFFFF; ++i) {
+            Insn in = dis->at((uint16_t)at, peek, 16);
+            Json line = Json::obj();
+            line["addr"] = Json((long long)at);
+            Json b = Json::arr();
+            std::string hexbytes;
+            for (int k = 0; k < in.len; ++k) {
+                uint8_t v = peek((uint16_t)(at + (uint32_t)k));
+                b.push(Json((long long)v));
+                std::snprintf(buf, sizeof buf, "%02X ", v);
+                hexbytes += buf;
+            }
+            line["bytes"] = b;
+            line["text"]  = Json(in.text);
+            line["len"]   = Json((long long)in.len);
+            line["undocumented"] = Json(in.undocumented);
+            lines.push(line);
+            std::snprintf(buf, sizeof buf, "%04X  %-9s %s%s\n", at, hexbytes.c_str(),
+                          in.text.c_str(), in.undocumented ? "   ; undocumented" : "");
+            text += buf;
+            at += in.len;
+        }
+        Json d = Json::obj();
+        d["lines"] = lines;
+        return dataResult(d, text);
+    }
+
+    if (name == "mem_fill") {
+        uint32_t lo = (uint32_t)args.at("lo").integer();
+        uint32_t hi = (uint32_t)args.at("hi").integer();
+        if (std::string e = spanErr(lo, hi); !e.empty()) return textResult(e, true);
+        uint8_t  v  = (uint8_t)args.at("byte").integer();
+        bool     rom = args.has("rom") && args.at("rom").boolean();
+
+        uint32_t written = 0, discarded = 0;
+        for (uint32_t A = lo; A <= hi && A <= amax; ++A) {
+            if (rom) {
+                std::string why;
+                if (!m.burn(A, v, why)) return textResult(hx(A) + ": " + why, true);
+            } else {
+                m.bus.memWriteX(A, v);
+                if (m.bus.lastUnclaimed()) ++discarded;
+            }
+            ++written;
+        }
+        Json d = Json::obj();
+        d["lo"] = Json((long long)lo);
+        d["hi"] = Json((long long)hi);
+        d["byte"] = Json((long long)v);
+        d["written"] = Json((long long)written);
+        d["discarded"] = Json((long long)discarded);
+        d["rom"] = Json(rom);
+        std::snprintf(buf, sizeof buf, "filled %s-%s with %02X", hx(lo).c_str(), hx(hi).c_str(), v);
+        std::string text = buf;
+        if (discarded)
+            text += "; " + std::to_string(discarded) +
+                    " cell(s) landed NOWHERE (ROM or unmapped). Pass rom=true to burn a ROM.";
+        return dataResult(d, text);
+    }
+
+    if (name == "mem_search") {
+        uint32_t lo = (uint32_t)args.at("lo").integer();
+        uint32_t hi = (uint32_t)args.at("hi").integer();
+        if (std::string e = spanErr(lo, hi); !e.empty()) return textResult(e, true);
+        std::vector<uint8_t> pat;
+        if (args.has("bytes")) {
+            if (!parseBytes(args.at("bytes").str(), pat))
+                return textResult("bytes must be hex, e.g. \"C3 00 F8\"", true);
+        } else if (args.has("text")) {
+            for (char ch : args.at("text").str()) pat.push_back((uint8_t)ch);
+            if (pat.empty()) return textResult("text is empty", true);
+        } else {
+            return textResult("give a pattern: bytes (hex) or text (ASCII)", true);
+        }
+        if (hi > amax) hi = amax;
+
+        Json matches = Json::arr();
+        std::string text;
+        if (lo + pat.size() - 1 <= hi) {
+            for (uint32_t A = lo; A + (uint32_t)pat.size() - 1 <= hi; ++A) {
+                bool hit = true;
+                for (size_t k = 0; k < pat.size(); ++k)
+                    if (m.bus.peekX(A + (uint32_t)k) != pat[k]) { hit = false; break; }
+                if (hit) {
+                    matches.push(Json((long long)A));
+                    std::snprintf(buf, sizeof buf, "%s ", hx(A).c_str());
+                    text += buf;
+                }
+            }
+        }
+        Json d = Json::obj();
+        d["matches"] = matches;
+        d["count"] = Json((long long)matches.items().size());
+        return dataResult(d, matches.items().empty() ? "no match" : text);
+    }
+
+    if (name == "mem_save") {
+        std::string path = args.at("path").str();
+        uint32_t lo = (uint32_t)args.at("lo").integer();
+        uint32_t hi = (uint32_t)args.at("hi").integer();
+        if (std::string e = spanErr(lo, hi); !e.empty()) return textResult(e, true);
+        if (hi > amax) hi = amax;
+
+        // The name decides, FORMAT overrides -- the same rule the monitor's SAVE uses,
+        // and deliberately not mem_load's (a file that does not exist yet cannot be
+        // sniffed, so a name is all there is to go on).
+        bool asHex = false;
+        std::string uname = path;
+        for (char& ch : uname) ch = (char)std::toupper((unsigned char)ch);
+        if (uname.size() > 4 && uname.rfind(".HEX") == uname.size() - 4) asHex = true;
+        if (args.has("format")) {
+            std::string want = args.at("format").str();
+            for (char& ch : want) ch = (char)std::toupper((unsigned char)ch);
+            if (want == "HEX") asHex = true;
+            else if (want == "BIN") asHex = false;
+            else return textResult("format must be BIN or HEX", true);
+        }
+
+        Image img;
+        for (uint32_t A = lo; A <= hi; ++A) img.bytes[A] = m.bus.peekX(A);
+
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return textResult("cannot write '" + path + "'", true);
+        if (asHex) {
+            f << saveHex(img);
+        } else {
+            for (uint32_t A = lo; A <= hi; ++A) f.put((char)m.bus.peekX(A));
+        }
+        if (!f) return textResult("write failed on '" + path + "'", true);
+
+        Json d = Json::obj();
+        d["path"] = Json(path);
+        d["lo"] = Json((long long)lo);
+        d["hi"] = Json((long long)hi);
+        d["bytes"] = Json((long long)(hi - lo + 1));
+        d["format"] = Json(asHex ? "HEX" : "BIN");
+        std::snprintf(buf, sizeof buf, "saved %s-%s (%u bytes) as %s to %s", hx(lo).c_str(),
+                      hx(hi).c_str(), hi - lo + 1, asHex ? "HEX" : "BIN", path.c_str());
+        return dataResult(d, buf);
+    }
+
+    if (name == "breakpoints") {
+        std::string action = args.has("action") ? args.at("action").str() : "list";
+
+        if (action == "list") {
+            Json a = Json::arr();
+            std::string text;
+            for (const Breakpoint& b : m.debug.breakpoints()) {
+                a.push(breakpointJson(m, b));
+                text += b.describe();
+                if (!b.core.empty() && !m.coreByRef(b.core)) text += "  (no such core: never stops)";
+                text += "\n";
+            }
+            Json d = Json::obj();
+            d["breakpoints"] = a;
+            return dataResult(d, a.items().empty() ? "(no breakpoints)" : text);
+        }
+        if (action == "add") {
+            BreakKind kind{};  // set by breakKindFromName below; init keeps MSVC /W4 (C4701) quiet
+            if (!args.has("kind") || !breakKindFromName(args.at("kind").str(), kind))
+                return textResult("add needs kind: pc | memread | memwrite | ioread | iowrite",
+                                  true);
+            if (!args.has("lo")) return textResult("add needs lo (the address or port)", true);
+            uint32_t lo = (uint32_t)args.at("lo").integer();
+            uint32_t hi = args.has("hi") ? (uint32_t)args.at("hi").integer() : lo;
+            std::string coreRef;
+            if (args.has("unit")) {
+                if (kind != BreakKind::Pc)
+                    return textResult("unit applies to kind pc; memory and I/O breakpoints "
+                                      "watch the bus, whoever drives it",
+                                      true);
+                if (!m.coreByRef(args.at("unit").str(), &coreRef))
+                    return textResult("no core '" + args.at("unit").str() +
+                                          "' -- name one as <board>:<unit>",
+                                      true);
+            }
+            int id = m.debug.add(kind, lo, hi);
+            if (!coreRef.empty()) m.debug.setCore(id, coreRef);
+            for (const Breakpoint& b : m.debug.breakpoints())
+                if (b.id == id) return dataResult(breakpointJson(m, b), b.describe());
+            return textResult("added", false);
+        }
+        if (action == "remove") {
+            if (!args.has("id")) return textResult("remove needs id (see the list)", true);
+            std::string err;
+            if (!m.debug.remove((int)args.at("id").integer(), err))
+                return textResult(err, true);
+            Json d = Json::obj();
+            d["removed"] = args.at("id");
+            return dataResult(d, "breakpoint " + std::to_string(args.at("id").integer()) +
+                                     " removed");
+        }
+        if (action == "clear") {
+            m.debug.clear();
+            return textResult("all breakpoints cleared");
+        }
+        return textResult("action is list, add, remove or clear", true);
+    }
+
+    if (name == "snapshot") {
+        std::string path = args.at("path").str();
+        std::string err;
+        bool ok = m.snapshot(path, err);
+        if (!ok) return textResult(err, true);
+        Json d = Json::obj();
+        d["path"] = Json(path);
+        d["ok"] = Json(true);
+        return dataResult(d, "snapshot written to " + path);
+    }
+
+    if (name == "restore") {
+        std::string path = args.at("path").str();
+        std::string err;
+        std::vector<std::string> notes;
+        bool ok = m.restore(path, err, notes);
+        if (!ok) return textResult(err, true);
+        Json d = Json::obj();
+        d["path"] = Json(path);
+        d["ok"] = Json(true);
+        Json nr = Json::arr();
+        std::string text;
+        for (const auto& n : notes) {
+            nr.push(Json(n));
+            text += n + "\n";
+        }
+        d["not_restored"] = nr;
+        text += "machine state restored from " + path;
+        if (!notes.empty())
+            text += " (" + std::to_string(notes.size()) + " not restored; each starts as at power-on)";
+        return dataResult(d, text);
+    }
+
+    if (name == "bus_irq") {
+        Json d = Json::obj();
+        std::string text;
+
+        if (CpuCore* c = m.cpu()) {
+            d["inte"] = Json(c->interruptsEnabled());
+            text += std::string("INTE ") + (c->interruptsEnabled() ? "on" : "off") + "\n";
+        }
+        d["int_pending"] = Json(m.bus.intPending());
+
+        // pin 73: who is pulling it right now.
+        Json pin73boards = Json::arr();
+        for (const auto& b : m.boards())
+            if (b->enabled() && b->assertsInt()) pin73boards.push(Json(b->id));
+        Json pin73 = Json::obj();
+        pin73["asserted"] = Json(m.bus.intPending());
+        pin73["boards"] = pin73boards;
+        d["pin73"] = pin73;
+        text += m.bus.intPending() ? "pINT ASSERTED" : "pINT idle";
+        for (const auto& id : pin73boards.items()) text += " " + id.str();
+        text += "\n";
+
+        // The eight VI wires.
+        uint8_t lines = m.bus.viLines();
+        Json vi = Json::arr();
+        for (int i = 0; i < 8; ++i) {
+            Json j = Json::obj();
+            j["line"] = Json((long long)i);
+            j["pulling"] = Json((bool)((lines >> i) & 1));
+            vi.push(j);
+        }
+        d["vi_lines"] = vi;
+        d["vi_mask"] = Json((long long)lines);
+
+        // Which level the interrupt controller would acknowledge, and what it executes:
+        // the ENCODER's vector (Board::viVector) -- an 88-VI jams RST n, an SS-1's 8259A
+        // drives a CALL. `vector` is the first byte on the bus (the RST opcode, or CD);
+        // `kind` says which, and `call` is the CALL target.
+        for (const auto& b : m.boards()) {
+            int win = b->enabled() ? b->intWinner() : -1;
+            if (win >= 0) {
+                Json w = Json::obj();
+                w["level"] = Json((long long)win);
+                w["encoder"] = Json(b->id);
+                const Board::ViVector v = b->viVector(win);
+                if (v.kind == Board::ViVector::Call) {
+                    w["kind"]   = Json("call");
+                    w["vector"] = Json((long long)0xCD);
+                    w["call"]   = Json((long long)v.addr);
+                    std::snprintf(buf, sizeof buf, "winner: level %d via %s -> CALL %04X\n",
+                                  win, b->id.c_str(), v.addr);
+                } else if (v.kind == Board::ViVector::Type8086) {
+                    w["kind"]   = Json("type");
+                    w["vector"] = Json((long long)v.addr);
+                    std::snprintf(buf, sizeof buf,
+                                  "winner: level %d via %s -> 8086 type %02X (vector at %04X)\n",
+                                  win, b->id.c_str(), (unsigned)v.addr, (unsigned)(v.addr * 4));
+                } else if (v.kind == Board::ViVector::Unset) {
+                    w["kind"] = Json("unset");
+                    std::snprintf(buf, sizeof buf, "winner: level %d via %s -> no vector (not set up)\n",
+                                  win, b->id.c_str());
+                } else {
+                    uint8_t rst = (uint8_t)(0xC7 | ((win & 7) << 3));  // RST n
+                    w["kind"]   = Json("rst");
+                    w["vector"] = Json((long long)rst);
+                    std::snprintf(buf, sizeof buf, "winner: level %d via %s -> RST %d (%02X)\n",
+                                  win, b->id.c_str(), win, rst);
+                }
+                d["winner"] = w;
+                text += buf;
+                break;
+            }
+        }
+        return dataResult(d, text);
+    }
+
+    if (name == "bus_trace") {
+        size_t n = args.has("count") ? (size_t)args.at("count").integer() : 64;
+        auto recs = m.debug.history(n);
+        const auto& handles = m.debug.boardHandles();
+
+        Json a = Json::arr();
+        std::string text;
+        for (const auto& r : recs) {
+            Json j = Json::obj();
+            j["t"] = Json((long long)r.t);
+            j["type"] = Json(cycleTypeName(r.type));
+            // addr is the physical address (A0-A23), and a 16-bit transfer adds xtrq and
+            // data_hi (the odd byte).
+            j["addr"] = Json((long long)r.phys());
+            j["data"] = Json((long long)r.data);
+            j["xtrq"] = Json(r.xtrq);
+            if (r.xtrq) j["data_hi"] = Json((long long)r.dataHi);
+            j["dma"] = Json(r.dma);
+            j["contended"] = Json(r.contended);
+            j["master"] = Json(r.master < 0 ? std::string("cpu")
+                                            : handles[(size_t)r.master]);
+            if (r.responder < 0) j["responder"] = Json();  // floating bus -- nobody drove
+            else j["responder"] = Json(handles[(size_t)r.responder]);
+            a.push(j);
+            text += Debugger::formatCycle(r, handles) + "\n";
+        }
+        Json d = Json::obj();
+        d["cycles"] = a;
+        d["count"] = Json((long long)a.items().size());
+        return dataResult(d, a.items().empty()
+                                 ? "(no cycles recorded -- run or step the guest first)"
+                                 : text);
+    }
+
+    if (name == "mount") {
+        Board* b = m.find(args.at("id").str());
+        if (!b) return textResult("no board '" + args.at("id").str() + "'", true);
+        std::string unit = args.at("unit").str();
+        std::string path = args.at("path").str();
+        bool wp = args.has("write_protect") && args.at("write_protect").boolean();
+
+        // `media` goes in WITH the disk, checked before a file is made (issue #777), as at
+        // MOUNT. splitMountOptions refuses it on a unit that does not take it.
+        KeyValues pre, post;
+        if (UnitDef ud; b->findUnit(unit, ud)) unit = ud.name;  // the board's spelling
+        if (args.has("media")) {
+            std::string serr;
+            if (!splitMountOptions(*b, unit, {{"media", args.at("media").str()}}, pre, post, serr))
+                return textResult(serr, true);
+        }
+
+        // Root the mount at the machine's own directory, the one base a typed MOUNT uses
+        // too (Monitor::inputBase). MCP does not run a startup list, so the board is left
+        // at whatever the loader stamped; set it here so `mount` and the `monitor` tool's
+        // `MOUNT` resolve a bare name to the same file -- beside the machine.
+        b->setConfigDir(m.dir);
+
+        if (args.has("create") && args.at("create").boolean()) {
+            std::string rp = b->resolvePath(path);  // create beside where mount() will open
+            std::ifstream exists(rp, std::ios::binary);
+            if (!exists) {
+                std::ofstream mk(rp, std::ios::binary);  // touch it empty
+                if (!mk) return textResult("cannot create '" + path + "'", true);
+            }
+        }
+        std::string err;
+        if (!b->mountWith(unit, path, wp, pre, err)) return textResult(err, true);
+        Json d = Json::obj();
+        d["id"] = Json(b->id);
+        d["unit"] = Json(unit);
+        d["path"] = Json(path);
+        d["write_protect"] = Json(wp);
+        return dataResult(d, b->id + ":" + unit + " <- " + path + (wp ? " (WP)" : ""));
+    }
+
+    if (name == "connect") {
+        Board* b = m.find(args.at("id").str());
+        if (!b) return textResult("no board '" + args.at("id").str() + "'", true);
+        std::string unit = args.at("unit").str();
+        std::string endpoint = args.at("endpoint").str();
+        std::string err;
+        if (!b->connect(unit, endpoint, err)) return textResult(err, true);
+        endpoint = canonicalEndpoint(endpoint);
+        // A unit wired to `console` takes the console now, as after a monitor command --
+        // left alone, it writes guest output onto our stdout (issues #756, #759).
+        std::string conErr;
+        console(m, sess, conErr);
+        Json d = Json::obj();
+        d["id"] = Json(b->id);
+        d["unit"] = Json(unit);
+        d["endpoint"] = Json(endpoint);
+        std::string text = b->id + ":" + unit + " <-> " + endpoint;
+        for (const auto& t : sess.taken) text += "\n" + t;
+        sess.taken.clear();
+        return dataResult(d, text);
+    }
+
+    return textResult("no such tool: " + name, true);
+}
+
+void reply(std::ostream& out, const Json& id, const Json& result) {
+    Json r = Json::obj();
+    r["jsonrpc"] = Json("2.0");
+    r["id"] = id;
+    r["result"] = result;
+    out << r.dump() << "\n" << std::flush;
+}
+
+void replyError(std::ostream& out, const Json& id, int code, const std::string& msg) {
+    Json r = Json::obj();
+    r["jsonrpc"] = Json("2.0");
+    r["id"] = id;
+    Json e = Json::obj();
+    e["code"] = Json(code);
+    e["message"] = Json(msg);
+    r["error"] = e;
+    out << r.dump() << "\n" << std::flush;
+}
+
+// One line off the wire, already parsed (or not). Queued so the WORKER thread -- the only
+// one that ever touches the Machine or writes to `out` -- drains it in order, while the
+// READER thread (runMcp) keeps consuming stdin even during a long `run`. A parse failure
+// is queued too rather than answered on the spot: `out` has exactly one writer, ever.
+struct QueuedMsg {
+    bool        parseOk = true;
+    std::string parseErr;
+    Json        req;
+};
+
+// HOW DEEP THE QUEUE MAY GET before the reader stops taking more on. A client that
+// pipelines faster than the guest can execute -- or one that talks to a server parked
+// in a long `run` -- would otherwise grow this without limit, and the memory it costs
+// is the client's to spend and ours to pay. At the cap the reader simply stops reading
+// stdin until the worker has drained one; the kernel's pipe buffer takes up the slack
+// and the client blocks on its own write, which is what backpressure is supposed to
+// feel like. Nothing is dropped and nothing is answered out of order.
+//
+// The cap is generous on purpose: a cancellation is acted on in the reader BEFORE the
+// queue is touched, so it overtakes anything waiting -- but only if the reader is still
+// reading. Parking it is therefore one thing that can delay a cancel, and it takes this
+// many un-drained requests to get there, which a client driving a guest will never do by
+// accident.
+//
+// #490 adds a second, narrower way to park the reader: it now writes `status` replies
+// itself, through `safeReply`, which blocks on `outMu` if the worker is mid-write of a
+// large reply into a full pipe. That requires a client not reading its own stdout -- an
+// unusual failure on its own -- but while it lasts, the reader is parked on `outMu`
+// rather than on this cap, and a `notifications/cancelled` behind it waits the same way.
+constexpr size_t kMaxPending = 4096;
+
+} // namespace
+
+int runMcp(Machine& m, std::istream& in, std::ostream& out, const std::string& mirror,
+           const std::string& log) {
+    // Take the console off "console" NOW, before anything runs: under --mcp stdin is the
+    // JSON-RPC channel, not a keyboard, and a guest reading it would eat our next request.
+    // A scripted line is one the interactive tools own. Quietly does nothing if the
+    // machine has no console line (an empty backplane, a socket-only machine).
+    McpSession sess;
+    sess.mirror = mirror;
+    sess.log    = log;
+    std::string bindErr;
+    console(m, sess, bindErr);
+    for (const auto& t : sess.taken) std::cerr << "pascal100: --mcp: " << t << "\n";
+    sess.taken.clear();
+
+    // #490: seed the status snapshot HERE, single-threaded, before the reader/worker split
+    // below even exists -- the one place a direct CPU read is free. After the reader thread
+    // starts, only the `run` tool's own worker-thread loop may write `status`, and only
+    // through statusMu (see RunSnapshot, statusResult()). Left at its default (no board) on
+    // a backplane with no CPU at all.
+    if (m.cpu()) {
+        sess.status.boardId = cpuBoardId(m);
+        sess.status.pc      = m.cpu()->pc();
+    }
+
+    // A mirror that could not bind (its port is in use) is worth saying out loud -- but
+    // to STDERR, never `out`, which is the JSON-RPC channel a stray line would corrupt.
+    // The session still runs; the console just falls back to being un-rebound until a
+    // tool call retries and surfaces the same error to the client.
+    // The same goes for a --log file that could not be opened; with both asked for, the
+    // error text itself says which one it was (a port, or a file).
+    if (!bindErr.empty() && (!mirror.empty() || !log.empty())) {
+        std::cerr << "pascal100:";
+        if (!mirror.empty()) std::cerr << " --mirror " << mirror;
+        if (!log.empty()) std::cerr << " --log " << log;
+        std::cerr << " failed: " << bindErr << "\n";
+    }
+
+    // ^C AS AN OUT-OF-BAND STOP for a wedged `run` (#488, part 1): belt-and-braces for an
+    // external `kill -INT` on the whole process. Installed for the whole session, restored
+    // on return so nothing outlives this function.
+    SigintGuard sigintGuard;
+
+    // THE READER/WORKER SPLIT (#488, part 2): a single getline-then-dispatch loop cannot
+    // see a `notifications/cancelled` that arrives while it is blocked inside a long
+    // `run` -- it is not reading stdin again until that call returns. So a separate
+    // thread does nothing but read and parse lines, forever, and hands them to the loop
+    // below over a queue -- except `notifications/cancelled`, which it acts on
+    // immediately against the in-flight request's id instead of queuing, since queuing it
+    // would defeat the entire point: it would just wait behind the very call it is meant
+    // to interrupt. The reader thread never touches the Machine -- that is the line this
+    // split rests on, and a tool call's existing single-threaded access to it needs no
+    // change at all. Besides stdin it touches `pending`, `eof`, `currentId` and
+    // `haveCurrentId` under `mu`, and, since #490 gave it `status` to answer, the published
+    // snapshot under `sess.statusMu` and `out` itself through `safeReply` under `outMu`.
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::deque<QueuedMsg>   pending;
+    bool                    eof = false;
+    Json                    currentId;               // the request the worker is running now
+    bool                    haveCurrentId = false;    // false: nothing in flight to cancel
+
+    // #490 gives `out` a second writer -- the reader thread now answers `status` directly
+    // (below), instead of only ever handing lines to the worker. `reply`/`replyError` were
+    // written for a single writer and do not synchronize themselves, so every call from
+    // here on goes through one of these two wrappers instead of the bare functions.
+    std::mutex outMu;
+    auto safeReply = [&](const Json& id, const Json& result) {
+        std::lock_guard<std::mutex> lk(outMu);
+        reply(out, id, result);
+    };
+    auto safeReplyError = [&](const Json& id, int code, const std::string& msg) {
+        std::lock_guard<std::mutex> lk(outMu);
+        replyError(out, id, code, msg);
+    };
+
+    std::thread reader([&] {
+        std::string rline;
+        while (std::getline(in, rline)) {
+            if (rline.empty()) continue;
+            QueuedMsg qm;
+            qm.parseOk = Json::parse(rline, qm.req, qm.parseErr);
+            if (qm.parseOk && qm.req.at("method").str() == "notifications/cancelled") {
+                std::lock_guard<std::mutex> lk(mu);
+                const Json& target = qm.req.at("params").at("requestId");
+                if (haveCurrentId && !target.isNull() && target.dump() == currentId.dump())
+                    Debugger::requestStop();
+                continue;  // acted on immediately -- never queued, never replied to
+            }
+            // #490: `status` MUST answer even while the worker is stuck inside a wedged or
+            // long-running call of ANY kind -- adding it as an ordinary tool would not do
+            // that, since it would just sit in `pending` behind the very call it exists to
+            // report on (deltecent's own point on the issue: guaranteed-non-blocking is a
+            // property of the transport, not the tool). So, like a cancellation, it is
+            // answered HERE: `in_flight` reads `haveCurrentId` (below) under `mu`, and the
+            // rest of the reply comes from the published RunSnapshot under `sess.statusMu`
+            // -- see statusResult(). Deliberately does NOT set `currentId`/`haveCurrentId`
+            // itself: a status call is never in `pending` and never itself the target of a
+            // cancel, so it must stay invisible to that bookkeeping, not just skip it.
+            if (qm.parseOk && qm.req.at("method").str() == "tools/call" &&
+                qm.req.at("params").at("name").str() == "status") {
+                // `statusResult()` is evaluated to a plain Json value HERE, fully, before
+                // `safeReply` is even called -- so `mu`/`statusMu` are both already released
+                // by the time `safeReply` takes `outMu`. Keep it that way: folding this into
+                // `safeReply`'s own body (locking `outMu` first, then calling `statusResult`
+                // inside it) would nest `outMu` around `mu`/`statusMu`, and nothing else in
+                // this file ever takes `outMu` first -- that would be a new, real ordering.
+                safeReply(qm.req.at("id"), statusResult(sess, mu, haveCurrentId));
+                continue;
+            }
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return pending.size() < kMaxPending; });
+            pending.push_back(std::move(qm));
+            cv.notify_all();
+        }
+        std::lock_guard<std::mutex> lk(mu);
+        eof = true;
+        cv.notify_all();
+    });
+
+    for (;;) {
+        QueuedMsg qm;
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            auto ready = [&] { return !pending.empty() || eof; };
+            if (sess.free.running) {
+                // #602: THE GUEST RUNS HERE, between requests, on this thread. Wait for a
+                // request only until the next slice is due -- the pacing gap or an idle nap
+                // (freeRunSlice) -- and run the slice if none came. A request that arrives
+                // during the wait wakes us at once. FAIRNESS: a request served since the last
+                // slice lets a DUE slice go first, so a client polling `recv` in a tight loop
+                // cannot starve the guest it is polling.
+                const bool due = FreeRun::clk::now() >= sess.free.nextSlice;
+                if ((due && sess.free.servedSinceSlice) ||
+                    !cv.wait_until(lk, sess.free.nextSlice, ready)) {
+                    lk.unlock();
+                    freeRunSlice(m, sess);
+                    continue;
+                }
+            } else if (!sess.mirror.empty()) {
+                // #683: A MIRROR NEEDS HOST I/O WHILE NOTHING RUNS. The watcher's wire is
+                // serviced from pump(), and between requests nothing called it: the tail
+                // of a long listing sat in the mirror's queue (a pseudo-terminal's kernel
+                // buffer is about a kilobyte) and a watcher who arrived was not noticed
+                // until the next `run`. So with a mirror, wake on a short tick and pump --
+                // on THIS thread, the only one that may touch the machine. Without a
+                // mirror the wait is the plain one it always was. The tick is short because
+                // each one moves at most a kernel buffer's worth of a queued tail.
+                if (!cv.wait_for(lk, std::chrono::milliseconds(10), ready)) {
+                    lk.unlock();
+                    m.pump();
+                    continue;
+                }
+            } else {
+                cv.wait(lk, ready);
+            }
+            if (pending.empty() && eof) break;
+            qm = std::move(pending.front());
+            pending.pop_front();
+            cv.notify_all();  // room again -- a reader parked on the cap can take the next line
+        }
+
+        if (!qm.parseOk) {
+            safeReplyError(Json(), -32700, "parse error: " + qm.parseErr);
+            continue;
+        }
+        const Json& req    = qm.req;
+        std::string method = req.at("method").str();
+        Json        id     = req.at("id");
+        bool        freeRunInterrupted = false;  // #602: a ^C that ends the free run
+
+        {
+            // A stale stop request -- a ^C that landed after the previous call already
+            // returned, or while some other tool ran -- must not carry into this request
+            // and kill it on the first slice. Clear it HERE, under the same lock that
+            // publishes the id, and not at the top of the `run` tool: everything between
+            // marking a request in flight and that handler running is a window in which
+            // the reader could match a cancel, call requestStop(), and have the handler
+            // wipe it on the way past. Clearing before the id is visible closes it -- a
+            // cancel that arrives from this point on is for THIS request and survives.
+            //
+            // #602: while the guest free-runs, a ^C is not stale -- it is for the free run.
+            // Read it under the same lock, before the clear, and end the free run with it.
+            std::lock_guard<std::mutex> lk(mu);
+            freeRunInterrupted = sess.free.running && Debugger::stopRequested();
+            Debugger::clearStopRequest();
+            currentId     = id;
+            haveCurrentId = true;
+        }
+        if (freeRunInterrupted) endFreeRun(m, sess, stopReasonName(StopReason::StopRequested));
+
+        if (method == "initialize") {
+            Json r = Json::obj();
+            r["protocolVersion"] = Json("2024-11-05");
+            Json caps = Json::obj();
+            caps["tools"] = Json::obj();
+            r["capabilities"] = caps;
+            Json info = Json::obj();
+            info["name"] = Json("pascal100");
+            // The version number alone, not the commit: this field is a SemVer string
+            // by protocol, and a `git describe` is not one. SHOW VERSION is where the
+            // commit lives, and an MCP client can run it.
+            info["version"] = Json(versionNumber());
+            r["serverInfo"] = info;
+            safeReply(id, r);
+        } else if (method == "notifications/initialized") {
+            // no reply -- a notification, not a request
+        } else if (method == "tools/list") {
+            Json r = Json::obj();
+            r["tools"] = toolList();
+            safeReply(id, r);
+        } else if (method == "tools/call") {
+            const Json& params = req.at("params");
+            std::string name = params.at("name").str();
+            safeReply(id, callTool(m, sess, name, params.at("arguments")));
+        } else if (method == "ping") {
+            safeReply(id, Json::obj());
+        } else {
+            safeReplyError(id, -32601, "method not found: " + method);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            haveCurrentId = false;  // done -- a cancel for this id from here on matches nothing
+        }
+        if (sess.free.running) sess.free.servedSinceSlice = true;  // #602: fairness
+    }
+    reader.join();
+    return 0;
+}
+
+} // namespace altair

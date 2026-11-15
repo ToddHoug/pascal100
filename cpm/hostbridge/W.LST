@@ -1,0 +1,1256 @@
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   1
+
+
+                        ;-----------------------------------------------------------------------
+                        ; W.CMD: copy a file from CP/M to the host. CP/M-86, CP/M 8-16, MP/M 8-16.
+                        ;
+                        ;       W <cpmfile> [hostfile] [B|T]
+                        ;       W <pattern> [hostfolder] [B|T]  e.g.  W *.ASM     W B:*.* OUT
+                        ;
+                        ; Part of the Host Bridge. The 8086 version of W.ASM 1.4: the same steps
+                        ; and the same messages. Assemble it in the machine:
+                        ;
+                        ;       ASM86 W                 -> W.H86
+                        ;       GENCMD W                -> W.CMD
+                        ;
+                        ; W uses only BDOS calls for the disk, and only ports B0H and B1H. The
+                        ; BDOS is INT 224: CL = the function, DX = the value, the result in AL.
+                        ; It can change any register except the segment registers and SP. The
+                        ; code and the data are in separate segments (the small model); DS points
+                        ; at the base page: the CCP's FCB is at DS:005CH, the tail at DS:0080H.
+                        ;
+                        ; B copies every byte of every record. T stops at the first ^Z. CP/M
+                        ; keeps no byte count, so the last record of a text file holds the ^Z
+                        ; and up to 126 bytes of old data. With no switch, W looks at the
+                        ; extension of the CP/M name (PICKMD):
+                        ;
+                        ;   ASM MAC Z80 HEX PRN LST SYM INC SUB TXT A86 H86     -> T, and W says so
+                        ;   anything else                                       -> B
+                        ;
+                        ; The table lists text types, so a file that is not on it is copied
+                        ; byte for byte. .BAS and .DOC are not on it, because MBASIC saves
+                        ; tokens by default and a word processor file can hold a 1AH. A switch
+                        ; always wins over the extension. A86 and H86 (ASM86's source and hex)
+                        ; are on it here; the 8080 W.COM does not know them.
+                        ;-----------------------------------------------------------------------
+
+                        ;---- CP/M-86 ----------------------------------------------------------
+   0002                 CONOUT  EQU     2               ; DL = char
+   0009                 PRSTR   EQU     9               ; DX = string, ends in '$'
+   000F                 FOPEN   EQU     15
+   0011                 FSRCHF  EQU     17              ; search for first
+   0012                 FSRCHN  EQU     18              ; search for next
+   0014                 FREAD   EQU     20              ; read sequential
+   001A                 FSETDMA EQU     26              ; DX = the DMA offset
+   0033                 FDMASEG EQU     51              ; DX = the DMA segment
+
+   0080                 RECLEN  EQU     128             ; a CP/M record
+   0040                 HNMAX   EQU     64              ; a host name can be a path
+   0020                 IDMAX   EQU     32              ; room for the board's signature
+   0040                 MAXN    EQU     64              ; the most wildcard matches W holds
+   001A                 CPMEOF  EQU     1AH             ; ^Z
+   000D                 CR      EQU     0DH
+   000A                 LF      EQU     0AH
+
+                        ;---- The Host Bridge (HB.INC has the full list) ----------------------
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   2
+
+
+   00B0                 HBCMD   EQU     0B0H            ; OUT = command   IN = status
+   00B1                 HBDATA  EQU     0B1H            ; data, both ways
+
+   0010                 HERR    EQU     10H             ; the last operation failed
+
+   0000                 CIDENT  EQU     0
+   0002                 CVOPENW EQU     2
+   0003                 CCLOSE  EQU     3
+   0004                 CDIRF   EQU     4
+   0007                 CERROR  EQU     7
+   0008                 CRESET  EQU     8
+
+                        ;=======================================================================
+                        ; MAIN
+                        ;=======================================================================
+                                CSEG
+ 0000 9C                        PUSHF                   ; our own stack, with interrupts off
+ 0001 58                        POP     AX              ; while SS and SP change (as DRI's
+ 0002 FA                        CLI                     ; RANDOM.A86 does)
+ 0003 8CDB                      MOV     BX,DS
+ 0005 8ED3                      MOV     SS,BX
+ 0007 BC050C                    MOV     SP,OFFSET STACK
+ 000A 50                        PUSH    AX
+ 000B 9D                        POPF
+
+ 000C E89300       00A2         CALL    LOCK            ; MP/M: one user at a time on the board
+ 000F B008                      MOV     AL,CRESET       ; one byte puts the board in a known state
+ 0011 E6B0                      OUT     HBCMD,AL
+
+ 0013 8CDA                      MOV     DX,DS           ; every BDOS READ and SEARCH lands in DS:BUF
+ 0015 B133                      MOV     CL,FDMASEG
+ 0017 CDE0                      INT     224
+ 0019 BA9C06                    MOV     DX,OFFSET BUF
+ 001C B11A                      MOV     CL,FSETDMA
+ 001E CDE0                      INT     224
+
+ 0020 E8F902       031C         CALL    IDENT           ; exits if there is no board
+ 0023 E85203       0378         CALL    PARSE           ; the tail -> CNAME, HNAME, MODE
+ 0026 E83002       0259         CALL    INIFCB          ; the CCP's FCB at 5CH -> FCB
+
+ 0029 803ECE0700                CMP     CNAME,0
+ 002E 7503         0033         JNZ     MAIN1
+ 0030 E9D504       0508         JMP     USAGE           ; no arguments
+ 0033 E84702       027D MAIN1:  CALL    HASWLD          ; a '?' in the FCB name?
+ 0036 7506         003E         JNZ     MANY            ; yes: a pattern
+ 0038 E82A01       0165         CALL    ONEF            ; no: one file
+ 003B E95B00       0099         JMP     EXIT
+
+                        ;=======================================================================
+                        ; MANY: a wildcard. Copy each CP/M file that matches.
+                        ;
+                        ; W collects all the names first, then copies them. BDOS SEARCH NEXT
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   3
+
+
+                        ; keeps its place in the BDOS work area, and an OPEN or a READ
+                        ; overwrites it.
+                        ;
+                        ; More than MAXN matches is an error, and W copies nothing.
+                        ;
+                        ; A second word is a host folder: `W *.ASM SRC` writes SRC/FOO.ASM. The
+                        ; folder must exist. SETDIR checks it once, before the first file.
+                        ;=======================================================================
+ 003E E8BF00       0100 MANY:   CALL    SETDIR          ; HNAME -> HDIRP, "SRC/" (exits if bad)
+
+ 0041 C706BD080000              MOV     NCNT,0
+ 0047 C706C108C508              MOV     NPTR,OFFSET NAMES ; where the next match goes
+ 004D C706C308C508              MOV     CPTR,OFFSET NAMES ; where the copy reads from
+
+ 0053 BA2707                    MOV     DX,OFFSET FCB
+ 0056 B111                      MOV     CL,FSRCHF
+ 0058 CDE0                      INT     224
+ 005A 3CFF              MN1:    CMP     AL,0FFH
+ 005C 7412         0070         JZ      MN2             ; 0FFH = no more matches
+ 005E E83002       0291         CALL    STASH           ; AL = the directory code
+ 0061 7303         0066         JNC     MN1A
+ 0063 E9C004       0526         JMP     ETOOMNY
+ 0066 BA2707            MN1A:   MOV     DX,OFFSET FCB
+ 0069 B112                      MOV     CL,FSRCHN
+ 006B CDE0                      INT     224
+ 006D E9EAFF       005A         JMP     MN1
+
+ 0070 833EBD0800        MN2:    CMP     NCNT,0
+ 0075 7503         007A         JNZ     MN2A
+ 0077 E9A604       0520         JMP     ENOMAT
+
+                        ;---- copy each match --------------------------------------------------
+ 007A C706BF080000      MN2A:   MOV     DONE,0
+ 0080 A1BF08            MN3:    MOV     AX,DONE
+ 0083 3B06BD08                  CMP     AX,NCNT
+ 0087 7410         0099         JZ      EXIT            ; every match done
+ 0089 E83502       02C1         CALL    SETFCB          ; the next name -> FCB
+ 008C E8C000       014F         CALL    DIRHN           ; HNAME = the folder, then the CP/M name
+ 008F E8D300       0165         CALL    ONEF            ; reports its own errors and returns
+ 0092 FF06BF08                  INC     DONE
+ 0096 E9E7FF       0080         JMP     MN3
+
+ 0099 E85000       00EC EXIT:   CALL    UNLOCK          ; MP/M: give the board back
+ 009C B100                      MOV     CL,0            ; back to the CCP
+ 009E B200                      MOV     DL,0
+ 00A0 CDE0                      INT     224
+
+                        ;-----------------------------------------------------------------------
+                        ; LOCK and UNLOCK: one user at a time on MP/M-86.
+                        ;
+                        ; The board has one transfer stream. On MP/M, two users who run R, W or
+                        ; HDIR at the same time would mix their commands on it. So under MP/M
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   4
+
+
+                        ; the three programs share a mutual exclusion queue, MXhostbr: one
+                        ; message of zero length, a binary semaphore (MP/M-86 Programmer's
+                        ; Guide 1.3.2). The program that has read the message owns the board.
+                        ; It writes the message back at EXIT. If the program is aborted, MP/M
+                        ; writes the message back for it (1.3.2 again).
+                        ;
+                        ; Under CP/M-86 and CP/M 8-16 there is one user, and LOCK does nothing.
+                        ; Function 12 tells them apart: AH = 11H is MP/M-86 (p. 80).
+                        ;
+                        ; LOCK makes the queue the first time (function 134; it fails when the
+                        ; queue exists, which is fine), opens it (135), and puts the message in
+                        ; if this program made the queue (140, conditional: a full queue is not
+                        ; an error). Then it reads the message (138, conditional). If another
+                        ; user has it, LOCK says so and waits for it (137).
+                        ;-----------------------------------------------------------------------
+ 00A2 B10C              LOCK:   MOV     CL,12           ; RETURN VERSION NUMBER
+ 00A4 CDE0                      INT     224
+ 00A6 80FC11                    CMP     AH,11H
+ 00A9 7540         00EB         JNZ     LK9             ; not MP/M-86: nothing to share
+ 00AB B186                      MOV     CL,134          ; MAKE QUEUE
+ 00AD BA6E06                    MOV     DX,OFFSET MXQD
+ 00B0 CDE0                      INT     224
+ 00B2 A29A06                    MOV     MXMADE,AL       ; 0 = this program made it
+ 00B5 B187                      MOV     CL,135          ; OPEN QUEUE
+ 00B7 BA8A06                    MOV     DX,OFFSET MXQPB
+ 00BA CDE0                      INT     224
+ 00BC 0BC0                      OR      AX,AX
+ 00BE 752B         00EB         JNZ     LK9             ; no queue: go on without the lock
+ 00C0 803E9A0600                CMP     MXMADE,0
+ 00C5 7507         00CE         JNZ     LK1
+ 00C7 B18C                      MOV     CL,140          ; COND WRITE QUEUE: the one message
+ 00C9 BA8A06                    MOV     DX,OFFSET MXQPB
+ 00CC CDE0                      INT     224
+ 00CE B18A              LK1:    MOV     CL,138          ; COND READ QUEUE
+ 00D0 BA8A06                    MOV     DX,OFFSET MXQPB
+ 00D3 CDE0                      INT     224
+ 00D5 0BC0                      OR      AX,AX
+ 00D7 740D         00E6         JZ      LK2             ; the board is ours
+ 00D9 BA3C06                    MOV     DX,OFFSET MBUSY
+ 00DC E81E04       04FD         CALL    PRINT
+ 00DF B189                      MOV     CL,137          ; READ QUEUE: wait for the other user
+ 00E1 BA8A06                    MOV     DX,OFFSET MXQPB
+ 00E4 CDE0                      INT     224
+ 00E6 C6069B0601        LK2:    MOV     MXHELD,1
+ 00EB C3                LK9:    RET
+
+ 00EC 803E9B0600        UNLOCK: CMP     MXHELD,0
+ 00F1 740C         00FF         JZ      UL9
+ 00F3 C6069B0600                MOV     MXHELD,0
+ 00F8 B18B                      MOV     CL,139          ; WRITE QUEUE: give the board back
+ 00FA BA8A06                    MOV     DX,OFFSET MXQPB
+ 00FD CDE0                      INT     224
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   5
+
+
+ 00FF C3                UL9:    RET
+
+                        ;-----------------------------------------------------------------------
+                        ; SETDIR: HNAME -> HDIRP, the folder that a wildcard writes into.
+                        ;
+                        ; With no second word, HDIRP is empty. Otherwise W adds a `/` if the
+                        ; name does not end in `/` or `\`. Then DIR_FIRST lists the folder. It
+                        ; fails if the folder is not there or is a file, and it changes nothing
+                        ; on the host. On a failure W prints the host's message and stops.
+                        ;
+                        ; The folder must leave room in HNAME for a 12-character CP/M name,
+                        ; "FILENAME.EXT". W refuses a longer folder.
+                        ;-----------------------------------------------------------------------
+ 0100 BE4B07            SETDIR: MOV     SI,OFFSET HNAME
+ 0103 BF8C07                    MOV     DI,OFFSET HDIRP
+ 0106 B90000                    MOV     CX,0            ; CX counts the characters copied
+ 0109 8A04              SD1:    MOV     AL,[SI]
+ 010B 0AC0                      OR      AL,AL
+ 010D 7408         0117         JZ      SD2
+ 010F 8805                      MOV     [DI],AL
+ 0111 46                        INC     SI
+ 0112 47                        INC     DI
+ 0113 41                        INC     CX
+ 0114 E9F2FF       0109         JMP     SD1
+
+ 0117 E332         014B SD2:    JCXZ    SD9             ; no folder: HDIRP is only the NUL
+ 0119 4E                        DEC     SI              ; the last character typed
+ 011A 8A04                      MOV     AL,[SI]
+ 011C 3C2F                      CMP     AL,'/'
+ 011E 7409         0129         JZ      SD3
+ 0120 3C5C                      CMP     AL,5CH          ; backslash
+ 0122 7405         0129         JZ      SD3
+ 0124 C6052F                    MOV     BYTE PTR [DI],'/'
+ 0127 47                        INC     DI
+ 0128 41                        INC     CX
+ 0129 83F935            SD3:    CMP     CX,HNMAX-12+1
+ 012C 7203         0131         JB      SD4
+ 012E E9DD03       050E         JMP     ELONG           ; no room for FILENAME.EXT
+ 0131 C60500            SD4:    MOV     BYTE PTR [DI],0
+
+ 0134 B004                      MOV     AL,CDIRF
+ 0136 E6B0                      OUT     HBCMD,AL
+ 0138 BE8C07                    MOV     SI,OFFSET HDIRP
+ 013B E81502       0353         CALL    SENDZ
+ 013E E4B0                      IN      AL,HBCMD
+ 0140 A810                      TEST    AL,HERR
+ 0142 7501         0145         JNZ     SD5
+ 0144 C3                        RET                     ; the folder is there
+ 0145 E81502       035D SD5:    CALL    REPERR          ; "W: NOPE: no such file"
+ 0148 E94EFF       0099         JMP     EXIT
+
+ 014B C60500            SD9:    MOV     BYTE PTR [DI],0
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   6
+
+
+ 014E C3                        RET
+
+                        ;-----------------------------------------------------------------------
+                        ; DIRHN: HNAME = the folder in HDIRP, then the name in the FCB.
+                        ;-----------------------------------------------------------------------
+ 014F BE8C07            DIRHN:  MOV     SI,OFFSET HDIRP
+ 0152 BF4B07                    MOV     DI,OFFSET HNAME
+ 0155 8A04              DH1:    MOV     AL,[SI]
+ 0157 0AC0                      OR      AL,AL
+ 0159 7407         0162         JZ      DH2
+ 015B 8805                      MOV     [DI],AL
+ 015D 46                        INC     SI
+ 015E 47                        INC     DI
+ 015F E9F3FF       0155         JMP     DH1
+ 0162 E98501       02EA DH2:    JMP     FCB2HN          ; tail call. DI is where the name goes.
+
+                        ;=======================================================================
+                        ; ONEF: copy the CP/M file in FCB to the host.
+                        ;
+                        ; INIFCB or SETFCB built the FCB. HNAME is the host name, or empty to
+                        ; use the CP/M name.
+                        ;=======================================================================
+ 0165 E8B500       021D ONEF:   CALL    PICKMD          ; B or T for this file
+
+                        ; Clear the FCB fields after the name before each OPEN. After the first
+                        ; match of a wildcard, they hold what BDOS left.
+ 0168 C606330700                MOV     FCB+12,0        ; ex
+ 016D C606340700                MOV     FCB+13,0        ; s1
+ 0172 C606350700                MOV     FCB+14,0        ; s2
+ 0177 C606360700                MOV     FCB+15,0        ; rc
+ 017C C606470700                MOV     FCB+32,0        ; cr, the record cursor
+
+                        ; Open the CP/M file before the host file. OPEN_WRITE truncates a host
+                        ; file, so a CP/M name that is not on the disk must fail first.
+ 0181 BA2707                    MOV     DX,OFFSET FCB
+ 0184 B10F                      MOV     CL,FOPEN
+ 0186 CDE0                      INT     224
+ 0188 3CFF                      CMP     AL,0FFH
+ 018A 7503         018F         JNZ     OF0
+ 018C E9A003       052F         JMP     ENOCPM
+ 018F C606470700        OF0:    MOV     FCB+32,0        ; BDOS OPEN does not always clear cr
+
+ 0194 803E4B0700                CMP     HNAME,0
+ 0199 7506         01A1         JNZ     OF1             ; the user gave a host name
+ 019B BF4B07                    MOV     DI,OFFSET HNAME
+ 019E E84901       02EA         CALL    FCB2HN          ; or use the CP/M name
+                        OF1:
+
+                        ;---- Open the host file ----------------------------------------------
+ 01A1 B002                      MOV     AL,CVOPENW
+ 01A3 E6B0                      OUT     HBCMD,AL
+ 01A5 BE4B07                    MOV     SI,OFFSET HNAME
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   7
+
+
+ 01A8 E8A801       0353         CALL    SENDZ           ; the NUL commits the command
+ 01AB E4B0                      IN      AL,HBCMD
+ 01AD A810                      TEST    AL,HERR
+ 01AF 7516         01C7         JNZ     ONEBAD          ; read-only board, outside the sandbox, bad name
+
+ 01B1 E88102       0435         CALL    SAYXFR          ; "W: FOO.ASM -> FOO.ASM"
+ 01B4 E81300       01CA         CALL    COPY
+ 01B7 720D         01C6         JC      OF9             ; CY = it failed and printed why
+
+                        ;---- CLOSE commits the host file -------------------------------------
+                        ; The board holds the file in memory and writes it to the host at
+                        ; CLOSE. A write that is not closed is discarded.
+ 01B9 B003                      MOV     AL,CCLOSE
+ 01BB E6B0                      OUT     HBCMD,AL
+ 01BD E4B0                      IN      AL,HBCMD
+ 01BF A810                      TEST    AL,HERR
+ 01C1 7504         01C7         JNZ     ONEBAD          ; the host disk is full or read-only
+ 01C3 E89402       045A         CALL    SAYREC          ; "3 records, 384 bytes"
+ 01C6 C3                OF9:    RET
+
+ 01C7 E99301       035D ONEBAD: JMP     REPERR          ; tail call
+
+                        ;-----------------------------------------------------------------------
+                        ; COPY: CP/M records -> the host. Returns CY on failure.
+                        ;
+                        ; There is no wait for TBE. The board stores the file in memory, so it
+                        ; always takes the next byte.
+                        ;-----------------------------------------------------------------------
+ 01CA C70621070000      COPY:   MOV     RECS,0
+ 01D0 C70623070000              MOV     BYTESL,0        ; the true byte count, 32 bits. T mode can
+ 01D6 C70625070000              MOV     BYTESH,0        ; stop in a record, so RECS*128 is wrong.
+
+ 01DC BA2707            CP0:    MOV     DX,OFFSET FCB
+ 01DF B114                      MOV     CL,FREAD
+ 01E1 CDE0                      INT     224
+ 01E3 0AC0                      OR      AL,AL
+ 01E5 752F         0216         JNZ     CPEND           ; 1 = end of file. Any other code ends it too.
+ 01E7 FF062107                  INC     RECS            ; count the record now. T mode can stop in
+                                                        ; this record, and it was read.
+ 01EB BE9C06                    MOV     SI,OFFSET BUF
+ 01EE B98000                    MOV     CX,RECLEN
+ 01F1 8A04              CP1:    MOV     AL,[SI]
+ 01F3 803E1F0754                CMP     XMODE,'T'
+ 01F8 7504         01FE         JNZ     CP2             ; B: send every byte
+ 01FA 3C1A                      CMP     AL,CPMEOF
+ 01FC 7418         0216         JZ      CPEND           ; T: the first ^Z ends the file
+ 01FE E6B1              CP2:    OUT     HBDATA,AL
+ 0200 8306230701                ADD     BYTESL,1        ; count the byte sent
+ 0205 8316250700                ADC     BYTESH,0
+ 020A 46                        INC     SI
+ 020B E2E4         01F1         LOOP    CP1
+
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   8
+
+
+                        ; Check HERR once for each record. While it streams, a write fails only
+                        ; at the board's 8 MB limit, so one IN for each record finds it soon.
+ 020D E4B0                      IN      AL,HBCMD
+ 020F A810                      TEST    AL,HERR
+ 0211 7505         0218         JNZ     CPERR
+ 0213 E9C6FF       01DC         JMP     CP0
+
+ 0216 F8                CPEND:  CLC                     ; success
+ 0217 C3                        RET
+
+ 0218 E84201       035D CPERR:  CALL    REPERR
+ 021B F9                        STC
+ 021C C3                        RET
+
+                        ;-----------------------------------------------------------------------
+                        ; PICKMD: set XMODE, the mode for the file in FCB.
+                        ;
+                        ; A switch decides. With no switch, W looks for the extension in
+                        ; EXTTAB. On the list is T, and AUTO is set so SAYXFR says so. Off the
+                        ; list is B. The compare ignores bit 7 (see STASH).
+                        ;-----------------------------------------------------------------------
+ 021D C606200700        PICKMD: MOV     AUTO,0
+ 0222 A01C07                    MOV     AL,MODE
+ 0225 803E1D0700                CMP     MODSET,0
+ 022A 7529         0255         JNZ     PM9             ; a switch was given
+ 022C BB1501                    MOV     BX,OFFSET EXTTAB
+ 022F B042              PM1:    MOV     AL,'B'
+ 0231 803F00                    CMP     BYTE PTR [BX],0
+ 0234 741F         0255         JZ      PM9             ; the end of the table: B
+ 0236 BE3007                    MOV     SI,OFFSET FCB+9 ; the extension
+ 0239 B90300                    MOV     CX,3
+ 023C B200                      MOV     DL,0            ; DL collects the bits that differ
+ 023E 8A07              PM2:    MOV     AL,[BX]
+ 0240 3204                      XOR     AL,[SI]
+ 0242 247F                      AND     AL,7FH
+ 0244 0AD0                      OR      DL,AL
+ 0246 43                        INC     BX
+ 0247 46                        INC     SI
+ 0248 E2F4         023E         LOOP    PM2             ; all three, so BX ends on the next entry
+ 024A 0AD2                      OR      DL,DL
+ 024C 75E1         022F         JNZ     PM1
+ 024E C606200701                MOV     AUTO,1
+ 0253 B054                      MOV     AL,'T'
+ 0255 A21F07            PM9:    MOV     XMODE,AL
+ 0258 C3                        RET
+
+                        ;=======================================================================
+                        ; THE CP/M DIRECTORY
+                        ;=======================================================================
+
+                        ;-----------------------------------------------------------------------
+                        ; INIFCB: copy the CCP's FCB at 005CH to FCB.
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE   9
+
+
+                        ;
+                        ; The CCP's second FCB starts at 006CH, and an OPEN of the first writes
+                        ; into it. W uses a copy for this reason. Bytes 0-11 are the drive and
+                        ; the 8.3 name, with * already changed to ?. The rest starts at zero.
+                        ;-----------------------------------------------------------------------
+ 0259 BF2707            INIFCB: MOV     DI,OFFSET FCB
+ 025C B92400                    MOV     CX,36
+ 025F C60500            IF0:    MOV     BYTE PTR [DI],0
+ 0262 47                        INC     DI
+ 0263 E2FA         025F         LOOP    IF0
+ 0265 BE5C00                    MOV     SI,OFFSET TFCB
+ 0268 BF2707                    MOV     DI,OFFSET FCB
+ 026B B90C00                    MOV     CX,12
+ 026E 8A04              IF1:    MOV     AL,[SI]
+ 0270 8805                      MOV     [DI],AL
+ 0272 46                        INC     SI
+ 0273 47                        INC     DI
+ 0274 E2F8         026E         LOOP    IF1
+ 0276 A02707                    MOV     AL,FCB          ; keep the drive. SETFCB puts it back
+ 0279 A21E07                    MOV     DRIVE,AL        ; for each match.
+ 027C C3                        RET
+
+                        ;-----------------------------------------------------------------------
+                        ; HASWLD: NZ if the FCB name holds a '?', else Z. The CCP has already
+                        ; changed * to ?, so '?' is the only wildcard left.
+                        ;-----------------------------------------------------------------------
+ 027D BE2807            HASWLD: MOV     SI,OFFSET FCB+1
+ 0280 B90B00                    MOV     CX,11
+ 0283 803C3F            HW1:    CMP     BYTE PTR [SI],'?'
+ 0286 7406         028E         JZ      HWYES
+ 0288 46                        INC     SI
+ 0289 E2F8         0283         LOOP    HW1
+ 028B 3AC0                      CMP     AL,AL           ; Z
+ 028D C3                        RET
+ 028E 0BF6              HWYES:  OR      SI,SI           ; NZ: SI is not 0
+ 0290 C3                        RET
+
+                        ;-----------------------------------------------------------------------
+                        ; STASH: copy the name of the directory entry that BDOS found.
+                        ;
+                        ; BDOS SEARCH returns 0-3 in AL. The entry is at BUF + AL*32. Returns CY
+                        ; if the table is full.
+                        ;
+                        ; CP/M keeps R/O, SYSTEM and ARCHIVE in bit 7 of three name characters.
+                        ; STASH clears bit 7, because OPEN does not find a name that has it
+                        ; set. FLD, PICKMD and PRFCB also ignore bit 7, because a CP/M 3 OPEN
+                        ; writes the bits back into the FCB.
+                        ;-----------------------------------------------------------------------
+ 0291 833EBD0840        STASH:  CMP     NCNT,MAXN
+ 0296 7202         029A         JB      ST0
+ 0298 F9                        STC                     ; the table is full
+ 0299 C3                        RET
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  10
+
+
+ 029A FF06BD08          ST0:    INC     NCNT
+ 029E 250300                    AND     AX,3            ; documented as 0-3
+ 02A1 B105                      MOV     CL,5
+ 02A3 D3E0                      SHL     AX,CL           ; *32
+ 02A5 BE9D06                    MOV     SI,OFFSET BUF+1 ; the name, after the user number byte
+ 02A8 03F0                      ADD     SI,AX
+ 02AA 8B3EC108                  MOV     DI,NPTR         ; where it goes
+ 02AE B90B00                    MOV     CX,11
+ 02B1 8A04              ST1:    MOV     AL,[SI]
+ 02B3 247F                      AND     AL,7FH          ; clear the attribute bit
+ 02B5 8805                      MOV     [DI],AL
+ 02B7 46                        INC     SI
+ 02B8 47                        INC     DI
+ 02B9 E2F6         02B1         LOOP    ST1
+ 02BB 893EC108                  MOV     NPTR,DI
+ 02BF F8                        CLC
+ 02C0 C3                        RET
+
+                        ;-----------------------------------------------------------------------
+                        ; SETFCB: the next stashed name -> FCB, and move CPTR on.
+                        ;-----------------------------------------------------------------------
+ 02C1 BF2707            SETFCB: MOV     DI,OFFSET FCB
+ 02C4 B92400                    MOV     CX,36
+ 02C7 C60500            SF0:    MOV     BYTE PTR [DI],0
+ 02CA 47                        INC     DI
+ 02CB E2FA         02C7         LOOP    SF0
+ 02CD A01E07                    MOV     AL,DRIVE        ; the drive the user gave. A directory
+ 02D0 A22707                    MOV     FCB,AL          ; entry has a user number in this byte.
+ 02D3 8B36C308                  MOV     SI,CPTR         ; the stashed name
+ 02D7 BF2807                    MOV     DI,OFFSET FCB+1
+ 02DA B90B00                    MOV     CX,11
+ 02DD 8A04              SF1:    MOV     AL,[SI]
+ 02DF 8805                      MOV     [DI],AL
+ 02E1 46                        INC     SI
+ 02E2 47                        INC     DI
+ 02E3 E2F8         02DD         LOOP    SF1
+ 02E5 8936C308                  MOV     CPTR,SI         ; the next name
+ 02E9 C3                        RET
+
+                        ;-----------------------------------------------------------------------
+                        ; FCB2HN: the CP/M name in FCB -> "FOO.ASM" at DI.
+                        ;
+                        ; DI is HNAME, or the end of a folder already in it. The FCB pads each
+                        ; field with spaces, and a CP/M name has no space, so a space ends the
+                        ; field.
+                        ;-----------------------------------------------------------------------
+ 02EA BE2807            FCB2HN: MOV     SI,OFFSET FCB+1
+ 02ED B90800                    MOV     CX,8
+ 02F0 E81A00       030D         CALL    FLD
+ 02F3 A03007                    MOV     AL,FCB+9
+ 02F6 247F                      AND     AL,7FH          ; ignore the attribute bit (see STASH)
+ 02F8 3C20                      CMP     AL,' '
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  11
+
+
+ 02FA 740D         0309         JZ      F2Z             ; no extension: no dot
+ 02FC C6052E                    MOV     BYTE PTR [DI],'.'
+ 02FF 47                        INC     DI
+ 0300 BE3007                    MOV     SI,OFFSET FCB+9
+ 0303 B90300                    MOV     CX,3
+ 0306 E80400       030D         CALL    FLD
+ 0309 C60500            F2Z:    MOV     BYTE PTR [DI],0 ; the NUL that SENDZ needs
+ 030C C3                        RET
+
+                        ; FLD: copy up to CX characters from SI to DI, and stop at a space.
+                        ; Bit 7 is cleared (see STASH).
+ 030D 8A04              FLD:    MOV     AL,[SI]
+ 030F 247F                      AND     AL,7FH
+ 0311 3C20                      CMP     AL,' '
+ 0313 7406         031B         JZ      FLD2
+ 0315 8805                      MOV     [DI],AL
+ 0317 47                        INC     DI
+ 0318 46                        INC     SI
+ 0319 E2F2         030D         LOOP    FLD
+ 031B C3                FLD2:   RET
+
+                        ;=======================================================================
+                        ; THE HOST BRIDGE
+                        ;=======================================================================
+
+                        ;-----------------------------------------------------------------------
+                        ; IDENT: check that the board is there before anything else.
+                        ;
+                        ; An IN from a port that no board decodes reads 0FFH, and 0FFH has HERR
+                        ; set. Without this check, W would report a host error.
+                        ;-----------------------------------------------------------------------
+ 031C B000              IDENT:  MOV     AL,CIDENT
+ 031E E6B0                      OUT     HBCMD,AL
+ 0320 BF9108                    MOV     DI,OFFSET IDBUF
+ 0323 B92000                    MOV     CX,IDMAX
+ 0326 E4B1              ID1:    IN      AL,HBDATA
+ 0328 8805                      MOV     [DI],AL
+ 032A 0AC0                      OR      AL,AL
+ 032C 7406         0334         JZ      ID2             ; the terminator
+ 032E 47                        INC     DI
+ 032F E2F5         0326         LOOP    ID1
+ 0331 C60500                    MOV     BYTE PTR [DI],0 ; no terminator: 0FFH, so no board
+ 0334 BE9108            ID2:    MOV     SI,OFFSET IDBUF
+ 0337 BF0001                    MOV     DI,OFFSET IDWANT
+ 033A 8A05              ID3:    MOV     AL,[DI]
+ 033C 0AC0                      OR      AL,AL
+ 033E 7409         0349         JZ      ID4             ; a match: the board is there. This is a
+                                                        ; prefix compare, so a later signature
+                                                        ; such as "... 2" also matches.
+ 0340 3A04                      CMP     AL,[SI]
+ 0342 7506         034A         JNZ     IDBAD
+ 0344 46                        INC     SI
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  12
+
+
+ 0345 47                        INC     DI
+ 0346 E9F1FF       033A         JMP     ID3
+ 0349 C3                ID4:    RET
+
+ 034A BA3A01            IDBAD:  MOV     DX,OFFSET MNOHB
+ 034D E8AD01       04FD         CALL    PRINT
+ 0350 E946FD       0099         JMP     EXIT
+
+                        ;-----------------------------------------------------------------------
+                        ; SENDZ: send the string at SI to the data port, with its NUL. The NUL
+                        ; commits the command.
+                        ;-----------------------------------------------------------------------
+ 0353 8A04              SENDZ:  MOV     AL,[SI]
+ 0355 E6B1                      OUT     HBDATA,AL
+ 0357 46                        INC     SI
+ 0358 0AC0                      OR      AL,AL
+ 035A 75F7         0353         JNZ     SENDZ
+ 035C C3                        RET
+
+                        ;-----------------------------------------------------------------------
+                        ; REPERR: print the board's error message. The board sends a code byte,
+                        ; then the host's message as text. W prints the text.
+                        ;-----------------------------------------------------------------------
+ 035D B007              REPERR: MOV     AL,CERROR
+ 035F E6B0                      OUT     HBCMD,AL
+ 0361 E4B1                      IN      AL,HBDATA       ; the code byte: skip it
+ 0363 BA1905                    MOV     DX,OFFSET MERR
+ 0366 E89401       04FD         CALL    PRINT
+ 0369 E4B1              RPE1:   IN      AL,HBDATA       ; then the text, one character at a time
+ 036B 0AC0                      OR      AL,AL
+ 036D 7406         0375         JZ      RPE2
+ 036F E87E01       04F0         CALL    PUTCH
+ 0372 E9F4FF       0369         JMP     RPE1
+ 0375 E98A01       0502 RPE2:   JMP     CRLF            ; tail call
+
+                        ;=======================================================================
+                        ; THE COMMAND TAIL
+                        ;=======================================================================
+
+                        ;-----------------------------------------------------------------------
+                        ; PARSE: get up to three words from the command tail at 0080H.
+                        ;
+                        ;       W FOO.TXT                 CNAME=FOO.TXT
+                        ;       W FOO.TXT T               CNAME=FOO.TXT              MODE=T
+                        ;       W *.* B                   a wildcard takes the switch too
+                        ;       W FOO.TXT BAR.TXT         CNAME=FOO.TXT HNAME=BAR.TXT
+                        ;       W FOO.TXT SRC/BAR.TXT T   a subdirectory of hostdir
+                        ;       W *.ASM SRC               with a wildcard, HNAME is a folder
+                        ;
+                        ; A lone B or T as the second word is the switch. Write a host file
+                        ; named T as ./T, and a folder named B or T as B/.
+                        ;
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  13
+
+
+                        ; The FCB comes from the CCP (TFCB). CNAME only shows that the user
+                        ; typed something.
+                        ;
+                        ; PARSE clears HNAME, MODSET and MODE first: an RB holds old data.
+                        ;-----------------------------------------------------------------------
+ 0378 C6064B0700        PARSE:  MOV     HNAME,0
+ 037D C6061D0700                MOV     MODSET,0
+ 0382 C6061C0742                MOV     MODE,'B'
+ 0387 BE8100                    MOV     SI,OFFSET TAIL+1
+ 038A 8A0E8000                  MOV     CL,TAIL         ; CX = the length of the tail
+ 038E B500                      MOV     CH,0
+ 0390 E87500       0408         CALL    SKIPSP
+ 0393 BFCE07                    MOV     DI,OFFSET CNAME
+ 0396 E87C00       0415         CALL    TOKEN
+ 0399 E86C00       0408         CALL    SKIPSP
+ 039C BF0F08                    MOV     DI,OFFSET TOK2
+ 039F E87300       0415         CALL    TOKEN
+ 03A2 E86300       0408         CALL    SKIPSP
+ 03A5 BF5008                    MOV     DI,OFFSET TOK3
+ 03A8 E86A00       0415         CALL    TOKEN
+
+ 03AB 803E500800                CMP     TOK3,0
+ 03B0 740C         03BE         JZ      PA2             ; two words or fewer
+                        ; Three words: the host name, then the switch.
+ 03B2 BE0F08                    MOV     SI,OFFSET TOK2
+ 03B5 E84200       03FA         CALL    CPYHN
+ 03B8 BE5008                    MOV     SI,OFFSET TOK3
+ 03BB E92600       03E4         JMP     SETMOD
+
+ 03BE 803E0F0800        PA2:    CMP     TOK2,0
+ 03C3 7501         03C6         JNZ     PA2A
+ 03C5 C3                        RET                     ; one word
+ 03C6 803E100800        PA2A:   CMP     TOK2+1,0
+ 03CB 7511         03DE         JNZ     PA3             ; more than one character: a host name
+ 03CD A00F08                    MOV     AL,TOK2
+ 03D0 3C42                      CMP     AL,'B'
+ 03D2 7404         03D8         JZ      PA2S
+ 03D4 3C54                      CMP     AL,'T'
+ 03D6 7506         03DE         JNZ     PA3
+ 03D8 BE0F08            PA2S:   MOV     SI,OFFSET TOK2
+ 03DB E90600       03E4         JMP     SETMOD
+ 03DE BE0F08            PA3:    MOV     SI,OFFSET TOK2
+ 03E1 E91600       03FA         JMP     CPYHN           ; tail call
+
+ 03E4 8A04              SETMOD: MOV     AL,[SI]
+ 03E6 3C42                      CMP     AL,'B'
+ 03E8 7407         03F1         JZ      SM1
+ 03EA 3C54                      CMP     AL,'T'
+ 03EC 7403         03F1         JZ      SM1
+ 03EE E92301       0514         JMP     EBADSW
+ 03F1 A21C07            SM1:    MOV     MODE,AL
+ 03F4 C6061D0701                MOV     MODSET,1        ; a switch was given, so PICKMD does
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  14
+
+
+ 03F9 C3                        RET                     ; not look at the extension
+
+ 03FA BF4B07            CPYHN:  MOV     DI,OFFSET HNAME
+ 03FD 8A04              CH1:    MOV     AL,[SI]
+ 03FF 8805                      MOV     [DI],AL
+ 0401 46                        INC     SI
+ 0402 47                        INC     DI
+ 0403 0AC0                      OR      AL,AL
+ 0405 75F6         03FD         JNZ     CH1             ; the NUL is copied too
+ 0407 C3                        RET
+
+ 0408 E30A         0414 SKIPSP: JCXZ    SK2             ; nothing left
+ 040A 803C20                    CMP     BYTE PTR [SI],' '
+ 040D 7505         0414         JNZ     SK2
+ 040F 46                        INC     SI
+ 0410 49                        DEC     CX
+ 0411 E9F4FF       0408         JMP     SKIPSP
+ 0414 C3                SK2:    RET
+
+                        ; TOKEN: copy one word from SI to DI, and end it with a NUL. CX = the
+                        ; characters left in the tail. No word gives an empty string, which the
+                        ; callers test for. A word longer than HNMAX stops W with an error. W
+                        ; does not cut the word: a cut host name can name another file.
+ 0415 BA4000            TOKEN:  MOV     DX,HNMAX        ; DX = the room left, without the NUL
+ 0418 E317         0431 TK0:    JCXZ    TK2
+ 041A 803C20                    CMP     BYTE PTR [SI],' '
+ 041D 7412         0431         JZ      TK2
+ 041F 0BD2                      OR      DX,DX
+ 0421 7503         0426         JNZ     TK1             ; room for the character
+ 0423 E9F400       051A         JMP     EWORD           ; a character, and room for the NUL only
+ 0426 8A04              TK1:    MOV     AL,[SI]
+ 0428 8805                      MOV     [DI],AL
+ 042A 47                        INC     DI
+ 042B 4A                        DEC     DX
+ 042C 46                        INC     SI
+ 042D 49                        DEC     CX
+ 042E E9E7FF       0418         JMP     TK0
+ 0431 C60500            TK2:    MOV     BYTE PTR [DI],0
+ 0434 C3                        RET
+
+                        ;=======================================================================
+                        ; TALKING TO THE USER
+                        ;=======================================================================
+
+                        ; "W: FOO.ASM -> SRC/FOO.ASM"
+ 0435 BAE604            SAYXFR: MOV     DX,OFFSET MPFX
+ 0438 E8C200       04FD         CALL    PRINT
+ 043B E87100       04AF         CALL    PRFCB
+ 043E BAEA04                    MOV     DX,OFFSET MARROW
+ 0441 E8B900       04FD         CALL    PRINT
+ 0444 BE4B07                    MOV     SI,OFFSET HNAME
+ 0447 E85700       04A1         CALL    PSTR
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  15
+
+
+ 044A 803E200700                CMP     AUTO,0
+ 044F 7406         0457         JZ      SX1
+ 0451 BAEF04                    MOV     DX,OFFSET MBYEXT ; " (text, by extension)"
+ 0454 E8A600       04FD         CALL    PRINT
+ 0457 E9A800       0502 SX1:    JMP     CRLF
+
+                        ; "12 records, 1493 bytes"
+ 045A A12107            SAYREC: MOV     AX,RECS
+ 045D BA0000                    MOV     DX,0
+ 0460 E81600       0479         CALL    PRDEC
+ 0463 BA0505                    MOV     DX,OFFSET MRECS ; " records, "
+ 0466 E89400       04FD         CALL    PRINT
+ 0469 A12307                    MOV     AX,BYTESL       ; the bytes sent to the host
+ 046C 8B162507                  MOV     DX,BYTESH
+ 0470 E80600       0479         CALL    PRDEC
+ 0473 BA1005                    MOV     DX,OFFSET MBYTES ; " bytes",CR,LF
+ 0476 E98400       04FD         JMP     PRINT
+
+                        ;-----------------------------------------------------------------------
+                        ; PRDEC: print DX:AX (32 bits) in decimal. The digits go into a buffer
+                        ; from the end, and a '$' ends it, so one PRSTR prints the number. Each
+                        ; digit is two 16-bit divides: the high word, then the remainder and the
+                        ; low word, so no quotient overflows.
+                        ;-----------------------------------------------------------------------
+ 0479 BFBC08            PRDEC:  MOV     DI,OFFSET NUMEND
+ 047C C60524                    MOV     BYTE PTR [DI],'$'
+ 047F BB0A00                    MOV     BX,10
+ 0482 4F                PD1:    DEC     DI
+ 0483 8BC8                      MOV     CX,AX           ; CX = the low word
+ 0485 8BC2                      MOV     AX,DX
+ 0487 BA0000                    MOV     DX,0
+ 048A F7F3                      DIV     BX              ; AX = high/10, DX = high MOD 10
+ 048C 91                        XCHG    AX,CX           ; CX = the new high word, AX = the low word
+ 048D F7F3                      DIV     BX              ; AX = (rem*65536 + low)/10, DX = the digit
+ 048F 80C230                    ADD     DL,'0'
+ 0492 8815                      MOV     [DI],DL
+ 0494 8BD1                      MOV     DX,CX           ; DX:AX = the quotient
+ 0496 8BC8                      MOV     CX,AX
+ 0498 0BCA                      OR      CX,DX
+ 049A 75E6         0482         JNZ     PD1
+ 049C 8BD7                      MOV     DX,DI           ; the first digit
+ 049E E95C00       04FD         JMP     PRINT
+
+                        ; PSTR: print the string at SI, up to its NUL.
+ 04A1 8A04              PSTR:   MOV     AL,[SI]
+ 04A3 0AC0                      OR      AL,AL
+ 04A5 7407         04AE         JZ      PSTR2
+ 04A7 E84600       04F0         CALL    PUTCH
+ 04AA 46                        INC     SI
+ 04AB E9F3FF       04A1         JMP     PSTR
+ 04AE C3                PSTR2:  RET
+
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  16
+
+
+                        ; PRFCB: print the FCB as "d:NAME.EXT".
+ 04AF A02707            PRFCB:  MOV     AL,FCB
+ 04B2 0AC0                      OR      AL,AL
+ 04B4 740A         04C0         JZ      PF1             ; drive 0 is the current drive: no letter
+ 04B6 0440                      ADD     AL,'A'-1
+ 04B8 E83500       04F0         CALL    PUTCH
+ 04BB B03A                      MOV     AL,':'
+ 04BD E83000       04F0         CALL    PUTCH
+ 04C0 BE2807            PF1:    MOV     SI,OFFSET FCB+1
+ 04C3 B90800                    MOV     CX,8
+ 04C6 E81800       04E1         CALL    PFLD
+ 04C9 A03007                    MOV     AL,FCB+9
+ 04CC 247F                      AND     AL,7FH          ; ignore the attribute bit (see STASH)
+ 04CE 3C20                      CMP     AL,' '
+ 04D0 740E         04E0         JZ      PF2             ; no extension
+ 04D2 B02E                      MOV     AL,'.'
+ 04D4 E81900       04F0         CALL    PUTCH
+ 04D7 BE3007                    MOV     SI,OFFSET FCB+9
+ 04DA B90300                    MOV     CX,3
+ 04DD E80100       04E1         CALL    PFLD
+ 04E0 C3                PF2:    RET
+
+                        ; PFLD: print CX characters at SI, but not the spaces that pad an FCB.
+                        ; Bit 7 is ignored (see STASH).
+ 04E1 8A04              PFLD:   MOV     AL,[SI]
+ 04E3 247F                      AND     AL,7FH
+ 04E5 3C20                      CMP     AL,' '
+ 04E7 7403         04EC         JZ      PFL2
+ 04E9 E80400       04F0         CALL    PUTCH
+ 04EC 46                PFL2:   INC     SI
+ 04ED E2F2         04E1         LOOP    PFLD
+ 04EF C3                        RET
+
+                        ; PUTCH: print the character in AL. Keeps CX, SI and DI.
+ 04F0 51                PUTCH:  PUSH    CX
+ 04F1 56                        PUSH    SI
+ 04F2 57                        PUSH    DI
+ 04F3 8AD0                      MOV     DL,AL
+ 04F5 B102                      MOV     CL,CONOUT
+ 04F7 CDE0                      INT     224
+ 04F9 5F                        POP     DI
+ 04FA 5E                        POP     SI
+ 04FB 59                        POP     CX
+ 04FC C3                        RET
+
+                        ; PRINT: print the '$' string at DX.
+ 04FD B109              PRINT:  MOV     CL,PRSTR
+ 04FF CDE0                      INT     224
+ 0501 C3                        RET
+
+ 0502 BA1D05            CRLF:   MOV     DX,OFFSET MCRLF
+ 0505 E9F5FF       04FD         JMP     PRINT
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  17
+
+
+
+                        ;=======================================================================
+                        ; ERRORS
+                        ;
+                        ; Each error prints its message and ends W, except ENOCPM. ENOCPM comes
+                        ; from inside ONEF and returns with CY set, so a wildcard continues with
+                        ; the next file.
+                        ;=======================================================================
+ 0508 BAA101            USAGE:  MOV     DX,OFFSET MUSAGE
+ 050B E91B00       0529         JMP     EQUIT
+ 050E BA2005            ELONG:  MOV     DX,OFFSET MELONG
+ 0511 E91500       0529         JMP     EQUIT
+ 0514 BA5B05            EBADSW: MOV     DX,OFFSET MEBADSW
+ 0517 E90F00       0529         JMP     EQUIT
+ 051A BA4205            EWORD:  MOV     DX,OFFSET MEWORD
+ 051D E90900       0529         JMP     EQUIT
+ 0520 BA9A05            ENOMAT: MOV     DX,OFFSET MENOMAT
+ 0523 E90300       0529         JMP     EQUIT
+ 0526 BAB505            ETOOMNY:MOV     DX,OFFSET METOOM
+ 0529 E8D1FF       04FD EQUIT:  CALL    PRINT
+ 052C E96AFB       0099         JMP     EXIT
+
+ 052F BA2406            ENOCPM: MOV     DX,OFFSET MENOCPM
+ 0532 E8C8FF       04FD         CALL    PRINT
+ 0535 F9                        STC
+ 0536 C3                        RET
+
+                        ;=======================================================================
+                        ; DATA. The base page is at DS:0000; the program's data starts at 0100H.
+                        ;=======================================================================
+                                DSEG
+                                ORG     005CH
+ 005C                   TFCB    RB      36              ; the FCB that the CCP parsed. W's first
+                                                        ; word is a CP/M name, so this parse is
+                                                        ; correct for it, and * is already ?.
+                                ORG     0080H
+ 0080                   TAIL    RB      128             ; the command tail: length, then the text.
+                                                        ; The CCP folds it to upper case.
+                                ORG     0100H
+ 0100 414C54414952      IDWANT  DB      'ALTAIRSIM HOSTBRIDGE',0
+      53494D20484F
+      535442524944
+      474500
+
+                        ; EXTTAB: the text extensions (see the header). Three characters each,
+                        ; and a 0 ends the table.
+ 0115 41534D4D4143      EXTTAB  DB      'ASM','MAC','Z80','HEX','PRN'
+      5A3830484558
+      50524E
+ 0124 4C535453594D              DB      'LST','SYM','INC','SUB','TXT'
+      494E43535542
+      545854
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  18
+
+
+ 0133 413836483836              DB      'A86','H86'
+ 0139 00                        DB      0
+
+ 013A 0D0A573A206E      MNOHB   DB      CR,LF,'W: no hostbridge board at port B0H.',CR,LF
+      6F20686F7374
+      627269646765
+      20626F617264
+      20617420706F
+      727420423048
+      2E0D0A
+ 0161 416464206120              DB      'Add a hostbridge board to the machine, or set its port'
+      686F73746272
+      696467652062
+      6F6172642074
+      6F2074686520
+      6D616368696E
+      652C206F7220
+      736574206974
+      7320706F7274
+ 0197 20746F204230              DB      ' to B0.',CR,LF,'$'
+      2E0D0A24
+
+ 01A1 0D0A57202D2D      MUSAGE  DB      CR,LF,'W -- copy a file from CP/M out to the host.  (1.4, 8086)'
+      20636F707920
+      612066696C65
+      2066726F6D20
+      43502F4D206F
+      757420746F20
+      74686520686F
+      73742E202028
+      312E342C2038
+      30383629
+ 01DB 0D0A0D0A                  DB      CR,LF,CR,LF
+ 01DF 20202057203C              DB      '   W <cpmfile> [hostfile] [B|T]',CR,LF
+      63706D66696C
+      653E205B686F
+      737466696C65
+      5D205B427C54
+      5D0D0A
+ 0200 20202057203C              DB      '   W <pattern> [hostfolder] [B|T]',CR,LF,CR,LF
+      706174746572
+      6E3E205B686F
+      7374666F6C64
+      65725D205B42
+      7C545D0D0A0D
+      0A
+ 0225 4578616D706C              DB      'Examples',CR,LF
+      65730D0A
+ 022F 202020572046              DB      '   W FOO.ASM            CP/M FOO.ASM -> host FOO.ASM',CR,LF
+      4F4F2E41534D
+      202020202020
+      202020202020
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  19
+
+
+      43502F4D2046
+      4F4F2E41534D
+      202D3E20686F
+      737420464F4F
+      2E41534D0D0A
+ 0265 202020572046              DB      '   W FOO.ASM SRC/F.ASM  ...into a subdirectory of hostdir',CR,LF
+      4F4F2E41534D
+      205352432F46
+      2E41534D2020
+      2E2E2E696E74
+      6F2061207375
+      626469726563
+      746F7279206F
+      6620686F7374
+      6469720D0A
+ 02A0 202020572046              DB      '   W FOO.DAT T          stop at the first ^Z',CR,LF
+      4F4F2E444154
+      205420202020
+      202020202020
+      73746F702061
+      742074686520
+      666972737420
+      5E5A0D0A
+ 02CE 20202057202A              DB      '   W *.*                every match, each under its own name'
+      2E2A20202020
+      202020202020
+      202020202020
+      657665727920
+      6D617463682C
+      206561636820
+      756E64657220
+      697473206F77
+      6E206E616D65
+ 030A 0D0A                      DB      CR,LF
+ 030C 20202057202A              DB      '   W *.ASM SRC          ...into folder SRC, which must exist'
+      2E41534D2053
+      524320202020
+      202020202020
+      2E2E2E696E74
+      6F20666F6C64
+      657220535243
+      2C2077686963
+      68206D757374
+      206578697374
+ 0348 0D0A0D0A                  DB      CR,LF,CR,LF
+ 034C 4220636F7069              DB      'B copies every byte of every record, so a text file arrives'
+      657320657665
+      727920627974
+      65206F662065
+      766572792072
+      65636F72642C
+      20736F206120
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  20
+
+
+      746578742066
+      696C65206172
+      7269766573
+ 0387 20776974680D              DB      ' with',CR,LF
+      0A
+ 038E 746865207265              DB      'the rest of its last record: a ^Z and whatever follows it.'
+      7374206F6620
+      697473206C61
+      737420726563
+      6F72643A2061
+      205E5A20616E
+      642077686174
+      657665722066
+      6F6C6C6F7773
+      2069742E
+ 03C8 0D0A                      DB      CR,LF
+ 03CA 542073746F70              DB      'T stops at the first ^Z, which TRUNCATES anything binary.'
+      732061742074
+      686520666972
+      7374205E5A2C
+      207768696368
+      205452554E43
+      415445532061
+      6E797468696E
+      672062696E61
+      72792E
+ 0403 0D0A                      DB      CR,LF
+ 0405 57697468206E              DB      'With neither, the extension decides. These are text:',CR,LF
+      656974686572
+      2C2074686520
+      657874656E73
+      696F6E206465
+      63696465732E
+      205468657365
+      206172652074
+      6578743A0D0A
+ 043B 20202041534D              DB      '   ASM MAC Z80 HEX PRN LST SYM INC SUB TXT A86 H86',CR,LF
+      204D4143205A
+      383020484558
+      2050524E204C
+      53542053594D
+      20494E432053
+      554220545854
+      204138362048
+      38360D0A
+ 046F 457665727920              DB      'Every other file, a .CMD included, is copied byte for byte.'
+      6F7468657220
+      66696C652C20
+      61202E434D44
+      20696E636C75
+      6465642C2069
+      7320636F7069
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  21
+
+
+      656420627974
+      6520666F7220
+      627974652E
+ 04AA 0D0A                      DB      CR,LF
+ 04AC 48444952206C              DB      'HDIR lists what is on the host. R copies the other way.'
+      697374732077
+      686174206973
+      206F6E207468
+      6520686F7374
+      2E205220636F
+      706965732074
+      6865206F7468
+      657220776179
+      2E
+ 04E3 0D0A24                    DB      CR,LF,'$'
+
+ 04E6 573A2024          MPFX    DB      'W: $'
+ 04EA 202D3E2024        MARROW  DB      ' -> $'
+ 04EF 202874657874      MBYEXT  DB      ' (text, by extension)$'
+      2C2062792065
+      7874656E7369
+      6F6E2924
+ 0505 207265636F72      MRECS   DB      ' records, $'
+      64732C2024
+ 0510 206279746573      MBYTES  DB      ' bytes',CR,LF,'$'
+      0D0A24
+ 0519 573A2024          MERR    DB      'W: $'
+ 051D 0D0A24            MCRLF   DB      CR,LF,'$'
+
+ 0520 573A20746865      MELONG  DB      'W: the folder name is too long.',CR,LF,'$'
+      20666F6C6465
+      72206E616D65
+      20697320746F
+      6F206C6F6E67
+      2E0D0A24
+ 0542 573A2061206E      MEWORD  DB      'W: a name is too long.',CR,LF,'$'
+      616D65206973
+      20746F6F206C
+      6F6E672E0D0A
+      24
+ 055B 573A20746865      MEBADSW DB      'W: the switch is B (every byte) or T (stop at the first ^Z).'
+      207377697463
+      682069732042
+      202865766572
+      792062797465
+      29206F722054
+      202873746F70
+      206174207468
+      652066697273
+      74205E5A292E
+ 0597 0D0A24                    DB      CR,LF,'$'
+ 059A 573A206E6F20      MENOMAT DB      'W: no CP/M file matches.',CR,LF,'$'
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  22
+
+
+      43502F4D2066
+      696C65206D61
+      74636865732E
+      0D0A24
+ 05B5 573A206D6F72      METOOM  DB      'W: more than 64 files match. Narrow the pattern.',CR,LF
+      65207468616E
+      203634206669
+      6C6573206D61
+      7463682E204E
+      6172726F7720
+      746865207061
+      747465726E2E
+      0D0A
+ 05E7 2020204E6F74              DB      '   Nothing was copied -- half a backup is worse than none.'
+      68696E672077
+      617320636F70
+      696564202D2D
+      2068616C6620
+      61206261636B
+      757020697320
+      776F72736520
+      7468616E206E
+      6F6E652E
+ 0621 0D0A24                    DB      CR,LF,'$'
+ 0624 573A206E6F20      MENOCPM DB      'W: no such CP/M file.',CR,LF,'$'
+      737563682043
+      502F4D206669
+      6C652E0D0A24
+
+ 063C 573A20616E6F      MBUSY   DB      'W: another user has the host bridge. Waiting...',CR,LF,'$'
+      746865722075
+      736572206861
+      732074686520
+      686F73742062
+      72696467652E
+      205761697469
+      6E672E2E2E0D
+      0A24
+
+                        ; The MP/M-86 queue that LOCK and UNLOCK use (Programmer's Guide
+                        ; Figures 6-8 and 6-9).
+ 066E 00000000          MXQD    DW      0,0             ; QD: internal, zero
+ 0672 0100                      DW      0001H           ; flags: mutual exclusion
+ 0674 4D58686F7374              DB      'MXhostbr'      ; the name: all 8 bytes count
+      6272
+ 067C 0000                      DW      0               ; MSGLEN: a message of zero length
+ 067E 0100                      DW      1               ; NMSGS: one message
+ 0680 000000000000              DW      0,0,0,0         ; internal, zero
+      0000
+ 0688 0000                      DW      0               ; BUFFER: 0 from a transient program
+ 068A 0000              MXQPB   DW      0               ; QPB: reserved, set by OPEN QUEUE
+ 068C 0000                      DW      0               ; the queue ID, set by OPEN QUEUE
+CP/M ASM86 1.1  SOURCE: W.A86                                                                                PAGE  23
+
+
+ 068E 0100                      DW      1               ; NMSGS: one message a read or a write
+ 0690 8A06                      DW      OFFSET MXQPB    ; BUFFER: the message has no bytes
+ 0692 4D58686F7374              DB      'MXhostbr'
+      6272
+ 069A FF                MXMADE  DB      0FFH            ; 0 = this program made the queue
+ 069B 00                MXHELD  DB      0               ; 1 = this program has the message
+
+                        ;---- Variables -------------------------------------------------------
+                        ; BUF: the DMA buffer, one CP/M record. BDOS READ and SEARCH put their
+                        ; data here.
+ 069C                   BUF     RB      RECLEN
+ 071C                   MODE    RB      1               ; the switch, when one was given (PARSE)
+ 071D                   MODSET  RB      1               ; 1 = a switch was given (PARSE)
+ 071E                   DRIVE   RB      1               ; the drive the user gave (INIFCB)
+ 071F                   XMODE   RB      1               ; B or T for this file (PICKMD)
+ 0720                   AUTO    RB      1               ; 1 = the extension chose T
+ 0721                   RECS    RW      1               ; records read from CP/M
+ 0723                   BYTESL  RW      1               ; the true byte count, 32 bits: the low
+ 0725                   BYTESH  RW      1               ; word and the high word
+ 0727                   FCB     RB      36              ; W's copy of the CCP's FCB (INIFCB)
+ 074B                   HNAME   RB      HNMAX+1         ; the host name, given or made
+ 078C                   HDIRP   RB      HNMAX+2         ; a wildcard's host folder, "SRC/" (SETDIR)
+ 07CE                   CNAME   RB      HNMAX+1         ; the first word of the tail
+ 080F                   TOK2    RB      HNMAX+1
+ 0850                   TOK3    RB      HNMAX+1
+ 0891                   IDBUF   RB      IDMAX+1         ; the board's signature
+ 08B2                   NUMBUF  RB      10              ; 4294967295 is 10 digits
+ 08BC                   NUMEND  RB      1               ; PRDEC builds back from here
+
+ 08BD                   NCNT    RW      1               ; how many matches W found
+ 08BF                   DONE    RW      1               ; how many it has copied
+ 08C1                   NPTR    RW      1               ; the collect cursor into NAMES
+ 08C3                   CPTR    RW      1               ; the copy cursor into NAMES
+ 08C5                   NAMES   RB      MAXN*11         ; 11 characters each, no dot, no drive
+
+ 0B85                           RW      64              ; the stack
+ 0C05                   STACK   RB      1
+ 0C06 00                        DB      0               ; an end byte, so GENCMD keeps all of the
+                                                        ; data segment (as in DRI's RANDOM.A86)
+                                END
+
+
+END OF ASSEMBLY.  NUMBER OF ERRORS:   0.  USE FACTOR:  5%

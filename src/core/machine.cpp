@@ -1,0 +1,608 @@
+#include "core/machine.h"
+
+#include "boards/s100-memory.h"
+#include "boards/registry.h"
+#include "core/crc32.h"
+#include "core/statefile.h"
+#include "host/media.h"
+#include "host/stream.h"
+
+#include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <span>
+
+namespace altair {
+
+// A BOARD ID IS CASE-INSENSITIVE, AND THAT IS AN IDENTITY, NOT A CONVENIENCE.
+//
+// `ACR0` and `acr0` are ONE CARD. Not "one card and a kindness to whoever typed it
+// wrong" -- one card, on every road that reaches a board: the prompt, a machine
+// file, the MCP tools. All of them come through here, which is why this is the only
+// place it has to be said.
+//
+// It follows that Machine::add()'s duplicate check refuses `ACR0` when `acr0` is
+// already in the backplane. That is the point. Two cards you cannot tell apart at
+// the prompt are not two cards; they are a machine file with a bug in it.
+//
+// The SHORTHANDS -- dropping the trailing index, dropping a lone unit's name -- are
+// a different thing entirely, and they live in the monitor. A machine file must say
+// what it means (cli/monitor.cpp, Monitor::board()).
+Board* Machine::find(const std::string& id) {
+    std::string want = lowerAscii(id);
+    for (auto& b : boards_)
+        if (lowerAscii(b->id) == want) return b.get();
+    return nullptr;
+}
+
+Board* Machine::add(const std::string& type, const std::string& id, std::string& err) {
+    if (find(id)) {
+        err = "a board with id '" + id + "' already exists";
+        return nullptr;
+    }
+    auto b = makeBoard(type);
+    if (!b) {
+        err = "no board type '" + type + "'. SHOW BOARDS lists them.";
+        return nullptr;
+    }
+    b->id = id;
+    return adopt(std::move(b));
+}
+
+Board* Machine::adopt(std::unique_ptr<Board> b) {
+    Board* raw = b.get();
+    // Into the backplane, and onto the clock. A card that has nothing
+    // time-dependent on it never looks at the clock; a UART cannot work without
+    // it (DESIGN.md 7.5).
+    raw->attachClock(&clock);
+    boards_.push_back(std::move(b));
+    bus.attach(raw);
+    return raw;
+}
+
+void Machine::pump() {
+    bus.busClock().pump(clock);  // before the boards, so each reads this slice's count
+
+    // A WINDOW OPENED OR A TITLE CHANGED: name every line from its unit (Board::unitTitle),
+    // before the boards pump, so a new terminal window opens with its title rather than its
+    // connect string. Same reason as the greeting below -- the board resolved the stream and
+    // never told it what it is plugged into. Nothing new, nearly every slice: one compare.
+    if (ByteStream::titleEpoch() != titleEpochSeen_) {
+        titleEpochSeen_ = ByteStream::titleEpoch();
+        for (auto& b : boards_)
+            for (const auto& u : b->units())
+                if (u.kind == UnitKind::Serial)
+                    if (ByteStream* s = b->unitStream(u.name)) s->setTitle(b->unitTitle(u.name));
+    }
+
+    for (auto& b : boards_) b->pump();
+
+    // A CALLER ANSWERED A LISTENER THAT GREETS, and only the backplane can say which
+    // line it rang: the board resolved the endpoint and never told the stream its name.
+    // So name them all here, and each stream that owes its caller a banner pays it
+    // (ByteStream::greet). Nobody owed one -- nearly every slice -- is one compare.
+    if (ByteStream::greetingsDue() == 0) return;
+    for (auto& b : boards_)
+        for (const auto& u : b->units())
+            if (u.kind == UnitKind::Serial)
+                if (ByteStream* s = b->unitStream(u.name)) s->greet(b->id + ":" + u.name);
+}
+
+uint64_t Machine::rxBytes() const {
+    uint64_t n = 0;
+    for (const auto& b : boards_) n += b->rxBytes();
+    return n;
+}
+
+bool Machine::burn(uint32_t phys, uint8_t v, std::string& why) {
+    phys &= bus.addrMask();
+    const uint16_t addr = (uint16_t)phys;
+    // ASK WHO ANSWERS A READ, NOT A WRITE, and that is the whole trick. A ROM region
+    // does not decode a write -- that is what makes it a ROM -- so asking the bus who
+    // would take a write here gets the answer "nobody", on precisely the chip we are
+    // trying to program. But respondersTo() runs the REAL decode, PHANTOM* and all
+    // (bus.h), so whoever would hand the CPU a byte at this address is exactly whose
+    // chip this is. A shadowed board does not answer, which is right: you cannot burn
+    // a chip the machine currently cannot see, any more than the CPU could read it.
+    BusCycle probe;
+    probe.type = Cycle::MemRead;
+    probe.addr = addr;
+    probe.ext  = (uint8_t)(phys >> 16);
+
+    std::vector<MemoryBoard*> mem;
+    for (Board* b : bus.respondersTo(probe))
+        if (auto* mb = dynamic_cast<MemoryBoard*>(b)) mem.push_back(mb);
+
+    if (mem.empty()) {
+        why = "no board answers here -- there is no chip to program";
+        return false;
+    }
+    if (mem.size() > 1) {
+        // Contention is a bus fact and not ours to resolve (§4.6). Through the bus both
+        // boards would take the write; behind it we would have to pick one, and picking
+        // silently is how you spend an afternoon wondering which chip you burned.
+        why = "more than one board answers here (";
+        for (size_t i = 0; i < mem.size(); ++i) why += (i ? ", " : "") + mem[i]->id;
+        why += ") -- fix the contention, or phantom one of them out";
+        return false;
+    }
+    if (!mem[0]->pokeX(phys, v)) {  // A16-A23 too: one board may span several segments
+        why = mem[0]->id + " answers here but has no store at that address";
+        return false;
+    }
+    return true;
+}
+
+std::vector<uint32_t> Machine::contentionSegments() const {
+    std::vector<uint32_t> segs{0};
+    for (const auto& b : boards_)
+        for (uint32_t sg : segmentsOf(*b))
+            if (std::find(segs.begin(), segs.end(), sg) == segs.end()) segs.push_back(sg);
+    std::sort(segs.begin(), segs.end());
+    return segs;
+}
+
+std::vector<uint32_t> Machine::segmentsOf(const Board& b) const {
+    std::vector<uint32_t> segs;
+    if (!b.decodesExtended()) return segs;
+    const auto map = b.memMap();
+    for (uint32_t sg = 0; sg < 256; ++sg) {
+        bool hit = false;
+        // Both ends of each entry: a region that starts mid-segment and runs into the
+        // next one (8000-17FFF) has no byte at its own `lo` in that next segment.
+        for (const auto& e : map)
+            for (uint32_t a : {e.lo, e.hi})
+                for (Cycle t : {Cycle::MemRead, Cycle::MemWrite}) {
+                    BusCycle c;
+                    c.type = t;
+                    c.addr = (uint16_t)a;
+                    c.ext  = (uint8_t)sg;
+                    if (b.decodes(c)) hit = true;
+                }
+        if (hit) segs.push_back(sg);
+    }
+    return segs;
+}
+
+void Machine::replaceWith(Machine& built) {
+    // OUT WITH THE OLD, through the same door they came in by. bus.detach() is what
+    // takes a card's pins off the backplane -- its interrupt, its pHOLD, its VI lines,
+    // and the decode it was answering (bus.cpp) -- and none of that is in the
+    // destructor, so dropping the unique_ptr without detaching first would leave the
+    // bus counting an interrupt from a card that no longer exists.
+    while (!boards_.empty()) {
+        bus.detach(boards_.back().get());
+        boards_.pop_back();
+    }
+    debug.forgetCores();   // the debugger held pointers to those boards' cores
+
+    for (auto& held : built.boards_) {
+        Board* b = held.get();
+        built.bus.detach(b);  // off the scratch backplane...
+        b->attachClock(&clock);
+        boards_.push_back(std::move(held));
+        bus.attach(b);  // ...and onto this one, pins and all
+    }
+    built.boards_.clear();  // the unique_ptrs are empty now; do not leave them lying about
+
+    // The machine is the cards AND what the file said about them. `dir` especially:
+    // it is the only thing carrying "where this file was" to runStartup(), and a
+    // startup list from the new file with the old file's directory would resolve its
+    // paths against the wrong place (paths.h).
+    name     = built.name;
+    dir      = built.dir;
+    fromFile = built.fromFile;
+    startup  = built.startup;
+}
+
+void Machine::clear() {
+    // Out through the same door they came in by -- bus.detach() first, then drop the
+    // unique_ptr. This is the teardown half of replaceWith(), with no scratch machine to
+    // fit in its place: what is left is the empty backplane `-n` gives you.
+    while (!boards_.empty()) {
+        bus.detach(boards_.back().get());
+        boards_.pop_back();
+    }
+    debug.forgetCores();   // the debugger held pointers to those boards' cores
+    // ...and the identity that came with the file those cards were built from. A machine
+    // with no cards is not the one that was loaded; it is "none", exactly as `-n` names it,
+    // with no directory and no startup list to carry paths against (paths.h).
+    name = "none";
+    dir.clear();
+    fromFile = false;
+    startup.clear();
+}
+
+bool Machine::remove(const std::string& id, std::string& err) {
+    Board* b = find(id);
+    if (!b) {
+        err = "no board '" + id + "'";
+        return false;
+    }
+    if (dynamic_cast<CpuCard*>(b)) debug.forgetCores();   // its cores are about to go
+    bus.detach(b);
+    boards_.erase(std::remove_if(boards_.begin(), boards_.end(),
+                                 [&](const std::unique_ptr<Board>& p) { return p.get() == b; }),
+                  boards_.end());
+    return true;
+}
+
+void Machine::reset(Reset r) {
+    // The bus carries the signal to every card, and each card decides what it
+    // means -- POC* is board-dependent, and a board just needs to know it
+    // happened. Guest code cannot see it at all.
+    for (auto& b : boards_) b->reset(r);
+}
+
+void Machine::power() {
+    // Time starts now. THE ONLY thing that resets the clock is power -- a front
+    // panel RESET does not un-elapse the hours the machine has been on, and a
+    // board timing a disk's rotation would be very surprised if it did.
+    clock.power();
+    bus.busClock().power(clock);  // pin 49 starts counting with the power, too
+    for (auto& b : boards_) b->power();
+    for (auto& b : boards_) b->reset(Reset::PowerOn);
+}
+
+// ---------------------------------------------------------------------------
+// SNAPSHOT / RESTORE (DESIGN.md 13). The file:
+//
+//   magic "ALTRSNP1" | u32 version | str name | u32 boardCount
+//   blob clock
+//   { str id | str type | blob board-state } x boardCount
+//   u32 crc32   (over everything above)
+//
+// Each board's state is a length-prefixed blob so RESTORE hands it to the board in
+// a sub-reader that cannot over- or under-run into the next section, and so a board
+// that grows its state does not silently shift every board after it.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr char     kMagic[8]     = {'A', 'L', 'T', 'R', 'S', 'N', 'P', '1'};
+// 2: the ACR/Sol tape decks gained an auto-stop mark (`stopAt_`) in their state.
+// 3: the `sbc` board gained its auto-start latch and the onboard 1K RAM in its state.
+// 4: the `ss1` 8253 keeps each counter's phase in pin-49 ticks, not its load T-state.
+// 5: the `cadzilla` board gained its overlay SRAM in its state.
+// 6: the Z80 core keeps the last NMI* level it saw (the edge detector).
+// 7: every UART keeps two transmit deadlines, the holding and the shift register (#899).
+// 8: the `ss1` 2651 keeps the TxEN state of its transmitter: a byte held, a byte sent (#908).
+constexpr uint32_t kFormatVersion = 8;
+
+// The format in which each board's state last changed in a way that a length check cannot
+// see. RESTORE does not trust such a board's section in an older file; the board starts at
+// power-on instead. A board not listed here has kept its layout since format 1, or its
+// section is checked by its length (Machine::restore). A change to a board's state
+// bumps kFormatVersion AND adds or raises that board's row here.
+uint32_t stateSince(const std::string& type) {
+    static const struct {
+        const char* type;
+        uint32_t    since;
+    } kRows[] = {{"acr", 2}, {"sol", 2}, {"sbc", 3}, {"ss1", 8}, {"cadzilla", 5}, {"z80", 6}};
+    for (const auto& row : kRows)
+        if (type == row.type) return row.since;
+    return 1;
+}
+}  // namespace
+
+bool Machine::snapshot(const std::string& path, std::string& err) const {
+    StateWriter w;
+    w.raw((const uint8_t*)kMagic, sizeof(kMagic));
+    w.u32(kFormatVersion);
+    w.str(name);
+    w.u32((uint32_t)boards_.size());
+
+    {
+        StateWriter cw;
+        clock.serialize(cw);
+        w.blob(cw.data());
+    }
+
+    for (const auto& b : boards_) {
+        w.str(b->id);
+        w.str(b->type());
+        StateWriter bw;
+        b->serialize(bw);
+        w.blob(bw.data());
+    }
+
+    // A checksum over the whole payload, so RESTORE knows a truncated or edited file
+    // before it tries to make sense of one.
+    uint32_t crc = crc32(std::span<const uint8_t>(w.data().data(), w.data().size()));
+    w.u32(crc);
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        err = "cannot open '" + path + "' for writing";
+        return false;
+    }
+    f.write((const char*)w.data().data(), (std::streamsize)w.data().size());
+    if (!f) {
+        err = "write to '" + path + "' failed";
+        return false;
+    }
+    return true;
+}
+
+bool Machine::restore(const std::string& path, std::string& err,
+                      std::vector<std::string>& notes) {
+    notes.clear();
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        err = "cannot open '" + path + "'";
+        return false;
+    }
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    // The checksum is the last four bytes, over everything before it.
+    if (buf.size() < sizeof(kMagic) + 4 + 4) {
+        err = "'" + path + "' is not a pascal100 snapshot (too short)";
+        return false;
+    }
+    size_t   payloadLen = buf.size() - 4;
+    uint32_t stored = (uint32_t)buf[payloadLen] | ((uint32_t)buf[payloadLen + 1] << 8) |
+                      ((uint32_t)buf[payloadLen + 2] << 16) | ((uint32_t)buf[payloadLen + 3] << 24);
+    uint32_t calc = crc32(std::span<const uint8_t>(buf.data(), payloadLen));
+    if (stored != calc) {
+        err = "'" + path + "' is corrupt (checksum mismatch)";
+        return false;
+    }
+
+    StateReader r(buf.data(), payloadLen);
+    char magic[sizeof(kMagic)];
+    r.raw((uint8_t*)magic, sizeof(kMagic));
+    if (std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) {
+        err = "'" + path + "' is not a pascal100 snapshot";
+        return false;
+    }
+    uint32_t ver = r.u32();
+    if (ver == 0 || ver > kFormatVersion) {
+        err = "'" + path + "' is snapshot format " + std::to_string(ver) + "; this build reads " +
+              "formats 1 to " + std::to_string(kFormatVersion) + " -- it was written by a newer pascal100";
+        return false;
+    }
+    (void)r.str();  // the machine name, for the record; the boards are matched by id
+    uint32_t n = r.u32();
+
+    // PASS 1: read every section, applying nothing. A truncated file is refused whole.
+    struct Saved {
+        std::string          id, type;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<uint8_t> clockBytes = r.blob();
+    std::vector<Saved>   saved;
+    for (uint32_t i = 0; i < n && r.ok(); ++i) {
+        Saved s;
+        s.id    = r.str();
+        s.type  = r.str();
+        s.bytes = r.blob();
+        saved.push_back(std::move(s));
+    }
+    if (!r.ok()) {
+        err = "'" + path + "' is truncated";
+        return false;
+    }
+
+    // Match each board in the file to a board in this machine by id and type. A board on
+    // only one side is not an error: a machine gains and loses boards between releases,
+    // and the boards both sides hold are still worth having.
+    std::vector<const Saved*> match(boards_.size(), nullptr);
+    std::vector<bool>         noted(boards_.size(), false);
+    for (const auto& s : saved) {
+        bool found = false;
+        for (size_t i = 0; i < boards_.size(); ++i) {
+            if (match[i] || lowerAscii(s.id) != lowerAscii(boards_[i]->id)) continue;
+            if (s.type != boards_[i]->type()) {
+                notes.push_back("board '" + boards_[i]->id + "' is a " + s.type +
+                                " in the snapshot and a " + boards_[i]->type() +
+                                " in this machine");
+                noted[i] = true;
+                found    = true;
+                break;
+            }
+            match[i] = &s;
+            found    = true;
+            break;
+        }
+        if (!found)
+            notes.push_back("board '" + s.id + "' (" + s.type +
+                            ") is in the snapshot but not in this machine");
+    }
+    for (size_t i = 0; i < boards_.size(); ++i) {
+        if (!match[i]) continue;
+        uint32_t since = stateSince(boards_[i]->type());
+        if (ver < since) {
+            notes.push_back("board '" + boards_[i]->id + "' (" + boards_[i]->type() +
+                            "): its state is in snapshot format " + std::to_string(ver) +
+                            ", and this board needs format " + std::to_string(since) +
+                            " or later");
+            match[i] = nullptr;
+            noted[i] = true;
+        }
+    }
+    if (std::none_of(match.begin(), match.end(), [](const Saved* s) { return s != nullptr; })) {
+        err = "'" + path + "' holds no board that this machine has -- nothing was restored";
+        notes.clear();
+        return false;
+    }
+
+    // PASS 2: apply. Clock first (it empties the event queue and sets the time), then
+    // each board (which re-arms its own deadlines against that time), then rebuild
+    // what is derived: the bus decode cache and the interrupt/hold wires.
+    {
+        StateReader cr(clockBytes);
+        clock.deserialize(cr);
+    }
+    bus.busClock().rebase(clock);  // the count goes on from the restored T-state
+    for (size_t i = 0; i < boards_.size(); ++i) {
+        Board& b = *boards_[i];
+        if (match[i]) {
+            StateReader br(match[i]->bytes);
+            b.deserialize(br);
+            // The board must read its section exactly. A section of another length is a
+            // layout this build does not know (a change the format version missed), so
+            // its bytes were misread and the board starts over below.
+            if (br.ok() && br.remaining() == 0) continue;
+            notes.push_back("board '" + b.id + "' (" + b.type() +
+                            "): its saved state does not fit this build");
+        } else if (!noted[i]) {
+            notes.push_back("board '" + b.id + "' (" + b.type() + ") is not in the snapshot");
+        }
+        // NOT RESTORED: the board starts as at power-on. Keeping its old state is not an
+        // option -- the clock just emptied the event queue, so its deadlines are gone.
+        b.power();
+        b.reset(Reset::PowerOn);
+    }
+    bus.invalidateDecode();
+    for (auto& b : boards_) {
+        b->intChanged();
+        b->nmiChanged();
+        b->holdChanged();
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Who is driving the bus, and which chip is doing it.
+//
+// Note what these DON'T do: they do not look for a board called "cpu0", and they
+// do not look for a board whose type() is "8080". They ask what the board IS --
+// can it master the bus, does it carry a core -- so a Z80 card, or a card with an
+// 8080 and an 8085 on it, or a DMA controller that takes the bus away, all work
+// here without this file learning their names.
+// ---------------------------------------------------------------------------
+std::vector<Board*> Machine::masters() {
+    std::vector<Board*> out;
+    for (auto& b : boards_)
+        if (dynamic_cast<BusMaster*>(b.get())) out.push_back(b.get());
+    return out;
+}
+
+// The temporary masters (DMA boards) are the enabled boards with a BusMaster to drive.
+// The CPU card is the PERMANENT master and inherits BusMaster instead (board.h), so it
+// never shows up here. Walks the backplane, not boards_: a test rig may attach a card
+// to the bus by hand.
+bool Machine::tmaConflict(std::string& why) {
+    std::vector<Board*> tma;
+    for (Board* b : bus.boards())
+        if (b->enabled() && b->busMaster()) tma.push_back(b);
+    if (tma.size() < 2) return false;
+
+    for (Board* b : tma)
+        if (b->tmaPriority() < 0) {
+            Board* other = (b == tma[0]) ? tma[1] : tma[0];
+            why = b->id + " (" + b->type() + ") has no TMA0*-TMA3* lines, so it cannot share "
+                  "the bus with " + other->id + " -- take one of them out (BOARDS REMOVE)";
+            return true;
+        }
+    for (size_t i = 0; i < tma.size(); ++i)
+        for (size_t j = i + 1; j < tma.size(); ++j)
+            if (tma[i]->tmaPriority() == tma[j]->tmaPriority()) {
+                why = tma[i]->id + " and " + tma[j]->id + " both have TMA priority " +
+                      std::to_string(tma[i]->tmaPriority()) +
+                      " -- give each bus master its own dma_priority (0-15)";
+                return true;
+            }
+    return false;
+}
+
+BusMaster* Machine::master() {
+    for (auto& b : boards_)
+        if (auto* m = dynamic_cast<BusMaster*>(b.get())) return m;
+    return nullptr;  // no processor. A REAL machine, and the one 1a ran.
+}
+
+CpuCore* Machine::cpu() {
+    // A SWITCH PENDING ON A TWO-CORE BOARD IS APPLIED HERE, where anyone asks. Between
+    // instructions nothing is executing, so a processor-select flip-flop that an NMI or a
+    // pINT has reset has already handed over the bus (the Pascal-100 manual, ch. IV M-O).
+    // Asking here means no caller -- REGS, NEXT, `run from=`, the run loop's own start
+    // and stop -- can see the core that will NOT run next. A one-core board's
+    // settleSwitch() does nothing. The run loop also settles at each instruction boundary,
+    // through its cached board, without this walk.
+    for (auto& b : boards_)
+        if (auto* c = dynamic_cast<CpuCard*>(b.get())) {
+            c->settleSwitch();
+            return c->activeCore();
+        }
+    return nullptr;
+}
+
+// THE CARD, not the core -- so the run loop can hand back the achieved crystal
+// (CpuCard::reportAchievedHz) without knowing which board holds the processor or
+// what chip it is. Same walk as cpu(), same "nobody" answer on an empty backplane.
+CpuCard* Machine::cpuCard() {
+    for (auto& b : boards_)
+        if (auto* c = dynamic_cast<CpuCard*>(b.get())) return c;
+    return nullptr;
+}
+
+CpuCore* Machine::coreByRef(const std::string& ref, std::string* canonical) {
+    size_t colon = ref.find(':');
+    if (colon == std::string::npos) return nullptr;
+    Board* b = find(ref.substr(0, colon));
+    auto* card = dynamic_cast<CpuCard*>(b);
+    if (!card) return nullptr;
+    std::string unit = lowerAscii(ref.substr(colon + 1));
+    for (const CpuCard::CoreUnit& cu : card->cores()) {
+        std::string unitName = cu.unit;
+        // A one-core board's default cores() has no name (cpu.h): its Cpu unit has one.
+        if (unitName.empty())
+            for (const UnitDef& u : b->units())
+                if (u.kind == UnitKind::Cpu) {
+                    unitName = u.name;
+                    break;
+                }
+        if (unitName.empty() || lowerAscii(unitName) != unit) continue;
+        if (canonical) *canonical = b->id + ":" + unitName;
+        return cu.core;
+    }
+    return nullptr;
+}
+
+std::string Machine::coreUnit(const CpuCore* c) {
+    CpuCard* card = cpuCard();
+    if (!card || !c || card->coreCount() < 2) return "";
+    std::vector<CpuCard::CoreUnit> all = card->cores();
+    for (const CpuCard::CoreUnit& cu : all)
+        if (cu.core == c) return cu.unit;
+    return "";
+}
+
+std::string Machine::coreTag(const CpuCore* c) {
+    std::string unit = coreUnit(c);
+    return unit.empty() ? std::string() : "[" + unit + "] ";
+}
+
+std::string Machine::isa() {
+    CpuCore* c = cpu();
+    return c ? c->isa() : "";
+}
+
+// EVERY board gets to speak, not just the memory card. This was a
+// dynamic_cast<MemoryBoard*> and it was a wall: the disk controllers this exists
+// for -- a bad checksum, a write to a protected disk -- could not have got a word
+// through it. Board::drainLog() is virtual and the default is silence.
+std::vector<std::string> Machine::drainBoardLog() {
+    std::vector<std::string> out;
+    for (auto& b : boards_) {
+        for (auto& s : b->drainLog()) out.push_back(s);
+        // ...AND THE FAR END OF EVERY LINE. This is the ONLY place a stream's log is
+        // drained: a board's drainLog() returns its own and its chips' messages and
+        // never asks the stream. Before #685 nothing asked it for a board that overrides
+        // drainLog(), so where a `pty` line is, or a log file that could not be written,
+        // was lost; before #893 three boards and the Board default drained it too, each
+        // with its own prefix.
+        for (const auto& u : b->units()) {
+            ByteStream* line = b->unitStream(u.name);
+            if (!line) continue;
+            for (auto& s : line->drainLog())
+                out.push_back(b->id + ":" + u.name + ": " + std::move(s));
+        }
+    }
+    // A medium with no board at its failing sync() call site speaks here instead --
+    // a TNFS mount whose write-back to the server just failed (or recovered). See
+    // host/media.h's logMediaMessage.
+    for (auto& s : drainMediaLog()) out.push_back(std::move(s));
+    return out;
+}
+
+} // namespace altair

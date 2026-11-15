@@ -1,0 +1,74 @@
+# The machine you get when you name none: a CompuPro-style IEEE 696 workbench.
+#
+#     pascal100
+#     MOUNT fd0:drive0 "CPM22N.DSK"
+#     RUN 0
+#
+# WHY THIS MACHINE. pascal100 simulates the Digicomp Pascal-100 and the IEEE 696 boards around it.
+# The default is the same backplane without the Pascal-100 card: a plain Z80 card in its place, so
+# that a public CompuPro CP/M 2.2N disk boots on it. The Pascal-100 machine (examples/pascal) is the real
+# box; this one is the bench for the boards. (Until 2026-11 the default was the MITS Altair machine of
+# altairsim; that machine and the Altair bus are not in pascal100.)
+#
+# THE BUS is IEEE 696, the only bus pascal100 has.
+#
+# THE CPU is the generic `z80` card, flat out (`clock_hz = 0`). `SET cpu0 clock_hz=4000000` gives
+# a 4 MHz card with the real waiting.
+#
+# THE CONSOLE is channel A of a CompuPro Interfacer 1 at 00-01, the port CP/M 2.2N uses. Channel B
+# at 02-03 is not connected.
+#
+# THE TERMINAL folds the Backspace key's DEL to BS (`bsdel`). It does not set `strip7out`, as the
+# Pascal-100 machine does not: the Pascal-100 build was tested without it. CompuPro's FORMAT.COM
+# (2.2B) ends two messages with a control byte that has bit 7 set (8A, 88), and a terminal may show
+# a stray mark there. `CONSOLE strip7out=on` clears bit 7; the disk1 and disk1a test machines set it.
+#
+# THE DISK 1 at C0, boot routine 4: after a reset its EPROM answers at 0000-00FF (reads only) and
+# reads track 0 of drive 0 by DMA. No disk is mounted: with an empty drive, RUN 0 waits for one.
+#
+# THE HOST BRIDGE at B0 is for the R, W and HDIR utilities: hostdir "" = the shell's directory.
+#
+# THE MEMORY is 64K of RAM in segment 00, 16-bit capable, filled at random as real static RAM is.
+
+[machine]
+name = "default"
+bus  = "ieee696"
+
+[[board]]
+type     = "z80"
+id       = "cpu0"
+clock_hz = 0
+
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "console"
+
+[console]
+bsdel = "bs"
+
+[[board]]
+type   = "disk1"
+id     = "fd0"
+port   = C0
+
+[[board]]
+type    = "hostbridge"
+id      = "hb0"
+port    = B0
+hostdir = ""
+
+[[board]]
+type           = "memory"
+id             = "mem0"
+fill           = "random"
+honors_phantom = "read"
+ext            = true
+sixteen_bit    = true
+
+  [[board.region]]
+  type = "ram"
+  at   = 0000
+  size = "64K"

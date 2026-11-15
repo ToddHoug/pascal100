@@ -1,0 +1,73 @@
+# Digicomp Pascal-100: a Z80 and the WD MicroEngine, a CompuPro Disk 1 and an Interfacer 1 console.
+#
+# A TEST FIXTURE. Until 2026-11-14 this was the built-in `pascal100` machine; pascal100 now
+# builds in only `default`. Tests load this file by path (or as a `base`).
+#
+#     pascal100 tests/media/pascal100/machine-pascal100.toml
+#     MOUNT fd0:drive0 "PASCAL.DSK"
+#     RUN 0
+#
+# THE MACHINE is the user's Pascal-100 system as it is today (2026-11). The disk is a UCSD
+# Pascal III.0 system disk built for this hardware by manual ch. V D: the distribution disks need
+# that build step before they boot. examples/pascal has a built disk, ready to boot.
+#
+# THE BUS is IEEE 696. The Pascal-100 Map drives A16, and the MicroEngine moves 16-bit words.
+#
+# THE PASCAL-100 (docs/boards/digicomp-pascal100.md) has the System Control Port at D0 and the
+# Map Output Port at D1. After a reset the Z80 has control and the Map is off, so the Z80
+# boots from the Disk 1 EPROM exactly as CP/M does (manual ch. V B.1). Jump-on-reset goes to
+# 0000, where the EPROM answers.
+#
+# THE DISK 1 at C0, boot routine 4: the EPROM reads track 0 of drive 0 by DMA and falls into
+# it. From there the disk's own hard boot (FBOOT) reads SBQB and the Z80 BIOS to 280H.
+#
+# THE CONSOLE is channel A of an Interfacer 1 at 00-01. Channel B at 02-03 is not connected.
+#
+# THE MEMORY is the box's CompuPro RAM 23: 128K of RAM in segments 00 and 01, set up as in
+# tests/media/ieee696/cpm22n-seg128k.toml. Its 16-bit transfers are NOT VERIFIED against the
+# RAM 23 manual. The EPROM shadows 0000-00FF on reads only, as on the disk1 machine.
+#
+# NO SYSTEM SUPPORT 1. The box has none, and the BIOS uses no port in 50-5F.
+#
+# NO IO4. The box once had an SSM IO4 at 04-07 for a printer and a modem, and the BIOS still
+# has code for it. With no IO4, output to the printer can hang, as on the real box.
+
+[machine]
+name    = "pascal100"
+bus     = "ieee696"
+
+[[board]]
+type     = "pascal100"
+id       = "cpu0"
+clock_hz = 0
+
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "console"
+
+[console]
+bsdel = "bs"
+
+[[board]]
+type = "disk1"
+id   = "fd0"
+port = C0
+
+# 128K of static RAM on one board, as in the real machine (a CompuPro RAM 23,
+# 000000-01FFFF). The same machine has also run with two 64K RAM 16 boards; that is
+# two [[board]] tables, each `ext = true` and 64K, one at 000000 and one at 010000.
+[[board]]
+type           = "memory"
+id             = "mem0"
+fill           = "random"
+honors_phantom = "read"
+ext            = true
+sixteen_bit    = true
+
+  [[board.region]]
+  type = "ram"
+  at   = 000000
+  size = "128K"

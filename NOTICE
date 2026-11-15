@@ -1,0 +1,25 @@
+pascal100
+Copyright (c) 2026 Timothy Geuy
+
+pascal100 is a derivative of altairsim:
+  altairsim, a simulator of the MITS Altair 8800 and the S-100 bus
+  Copyright (c) 2026 Patrick Linstruth
+  https://github.com/deltecent/altairsim
+  MIT License
+
+pascal100 started from altairsim on 2026-11-02. Both projects use the
+MIT License. The full text is in LICENSE, which carries both copyright
+lines. The altairsim notice stays, as the MIT License requires.
+
+pascal100 is not part of altairsim, and the author of altairsim does
+not support it.
+
+Third-party files in this repository (ROM images, disk images, manuals
+in reference/) keep the terms of their own authors.
+
+third_party/clk holds part of Clock Signal (CLK), the x86 instruction-set
+core that runs pascal100's 8088:
+  Copyright (c) 2015 Thomas Harte
+  https://github.com/TomHarte/CLK
+  MIT License (third_party/clk/LICENCE)
+pascal100's changes to it are listed in third_party/clk/README.pascal100.md.

@@ -1,0 +1,799 @@
+;-----------------------------------------------------------------------
+; R.CMD: copy a file from the host into CP/M. CP/M-86, CP/M 8-16, MP/M 8-16.
+;
+;       R <hostfile> [cpmfile]
+;       R <pattern>                     e.g.  R *.ASM     R SRC/*.MAC
+;
+; Part of the Host Bridge. The 8086 version of R.ASM 1.3: the same steps
+; and the same messages. Assemble it in the machine:
+;
+;       ASM86 R                 -> R.H86
+;       GENCMD R                -> R.CMD
+;
+; R uses only BDOS calls for the disk, and only ports B0H and B1H. The
+; BDOS is INT 224: CL = the function, DX = the value, the result in AL.
+; It can change any register except the segment registers and SP. The
+; code and the data are in separate segments (the small model); DS points
+; at the base page, so the command tail is at DS:0080H.
+;-----------------------------------------------------------------------
+
+;---- CP/M-86 ----------------------------------------------------------
+CONOUT	EQU	2		; DL = char
+PRSTR	EQU	9		; DX = string, ends in '$'
+FCLOSE	EQU	16
+FDELET	EQU	19
+FWRITE	EQU	21		; write sequential
+FMAKE	EQU	22
+FSETDMA EQU	26		; DX = the DMA offset
+FDMASEG EQU	51		; DX = the DMA segment
+
+RECLEN	EQU	128		; a CP/M record
+HNMAX	EQU	64		; a host name can be a path
+IDMAX	EQU	32		; room for the board's signature
+CPMEOF	EQU	1AH		; ^Z
+CR	EQU	0DH
+LF	EQU	0AH
+
+;---- The Host Bridge (HB.INC has the full list) ----------------------
+HBCMD	EQU	0B0H		; OUT = command   IN = status
+HBDATA	EQU	0B1H		; data, both ways
+
+DAV	EQU	02H		; a byte is waiting
+HEOF	EQU	08H		; the stream has no more data
+HERR	EQU	10H		; the last operation failed
+
+CIDENT	EQU	0
+CVOPENR EQU	1
+CDIRF	EQU	4
+CDIRN	EQU	5
+CERROR	EQU	7
+CRESET	EQU	8
+
+;=======================================================================
+; MAIN
+;=======================================================================
+	CSEG
+	PUSHF			; our own stack, with interrupts off
+	POP	AX		; while SS and SP change (as DRI's
+	CLI			; RANDOM.A86 does)
+	MOV	BX,DS
+	MOV	SS,BX
+	MOV	SP,OFFSET STACK
+	PUSH	AX
+	POPF
+
+	CALL	LOCK		; MP/M: one user at a time on the board
+	MOV	AL,CRESET	; one byte puts the board in a known state
+	OUT	HBCMD,AL
+
+	CALL	IDENT		; exits if there is no board
+	CALL	PARSE		; the tail -> HNAME, CNAME
+
+	CMP	HNAME,0
+	JNZ	MAIN1
+	JMP	USAGE		; no arguments
+MAIN1:	CALL	HASWLD		; a * or ? in the host name?
+	JNZ	MANY		; yes: walk the host directory
+	CALL	ONE		; no: one file
+	JMP	EXIT
+
+;-----------------------------------------------------------------------
+; MANY: a wildcard. Copy each host file that matches.
+;
+; DIR_FIRST and DIR_NEXT keep their place across an OPEN_READ, so R
+; copies each match as the board lists it.
+;-----------------------------------------------------------------------
+MANY:	CMP	CNAME,0
+	JZ	MANY0
+	JMP	EWILD		; a wildcard takes no CP/M name
+MANY0:	MOV	AL,CDIRF
+	OUT	HBCMD,AL
+	MOV	SI,OFFSET HNAME	; the pattern
+	CALL	SENDZ
+
+MANY1:	IN	AL,HBCMD
+	TEST	AL,HERR
+	JNZ	MANYE		; a bad pattern or a bad folder
+	TEST	AL,HEOF
+	JNZ	EXIT		; no more names. With no matches at all,
+				; R comes here on the first pass.
+
+	MOV	DI,OFFSET HNAME	; the match replaces the pattern. The
+	MOV	CX,HNMAX	; board keeps the pattern.
+	CALL	RECVZ
+
+	CALL	ISDIR		; a folder ends in '/'
+	JZ	MANY2		; and is not copied
+	CALL	ONE
+
+MANY2:	MOV	AL,CDIRN
+	OUT	HBCMD,AL
+	JMP	MANY1
+
+MANYE:	CALL	REPERR
+				; fall into EXIT
+EXIT:	CALL	UNLOCK		; MP/M: give the board back
+	MOV	CL,0		; back to the CCP
+	MOV	DL,0
+	INT	224
+
+;-----------------------------------------------------------------------
+; LOCK and UNLOCK: one user at a time on MP/M-86.
+;
+; The board has one transfer stream. On MP/M, two users who run R, W or
+; HDIR at the same time would mix their commands on it. So under MP/M
+; the three programs share a mutual exclusion queue, MXhostbr: one
+; message of zero length, a binary semaphore (MP/M-86 Programmer's
+; Guide 1.3.2). The program that has read the message owns the board.
+; It writes the message back at EXIT. If the program is aborted, MP/M
+; writes the message back for it (1.3.2 again).
+;
+; Under CP/M-86 and CP/M 8-16 there is one user, and LOCK does nothing.
+; Function 12 tells them apart: AH = 11H is MP/M-86 (p. 80).
+;
+; LOCK makes the queue the first time (function 134; it fails when the
+; queue exists, which is fine), opens it (135), and puts the message in
+; if this program made the queue (140, conditional: a full queue is not
+; an error). Then it reads the message (138, conditional). If another
+; user has it, LOCK says so and waits for it (137).
+;-----------------------------------------------------------------------
+LOCK:	MOV	CL,12		; RETURN VERSION NUMBER
+	INT	224
+	CMP	AH,11H
+	JNZ	LK9		; not MP/M-86: nothing to share
+	MOV	CL,134		; MAKE QUEUE
+	MOV	DX,OFFSET MXQD
+	INT	224
+	MOV	MXMADE,AL	; 0 = this program made it
+	MOV	CL,135		; OPEN QUEUE
+	MOV	DX,OFFSET MXQPB
+	INT	224
+	OR	AX,AX
+	JNZ	LK9		; no queue: go on without the lock
+	CMP	MXMADE,0
+	JNZ	LK1
+	MOV	CL,140		; COND WRITE QUEUE: the one message
+	MOV	DX,OFFSET MXQPB
+	INT	224
+LK1:	MOV	CL,138		; COND READ QUEUE
+	MOV	DX,OFFSET MXQPB
+	INT	224
+	OR	AX,AX
+	JZ	LK2		; the board is ours
+	MOV	DX,OFFSET MBUSY
+	CALL	PRINT
+	MOV	CL,137		; READ QUEUE: wait for the other user
+	MOV	DX,OFFSET MXQPB
+	INT	224
+LK2:	MOV	MXHELD,1
+LK9:	RET
+
+UNLOCK: CMP	MXHELD,0
+	JZ	UL9
+	MOV	MXHELD,0
+	MOV	CL,139		; WRITE QUEUE: give the board back
+	MOV	DX,OFFSET MXQPB
+	INT	224
+UL9:	RET
+
+;=======================================================================
+; ONE: copy the host file named in HNAME into CP/M.
+;
+; It runs once for one file, and once for each match of a wildcard.
+;=======================================================================
+ONE:	MOV	RECS,0		; records written
+	MOV	BYTESL,0	; the true host byte count, 32 bits. The
+	MOV	BYTESH,0	; last record is padded, so RECS*128 is wrong.
+
+; R opens the host file before it changes the CP/M directory. If the
+; host file is not there, the CP/M file of that name stays as it was.
+	MOV	AL,CVOPENR
+	OUT	HBCMD,AL
+	MOV	SI,OFFSET HNAME
+	CALL	SENDZ
+
+	IN	AL,HBCMD
+	TEST	AL,HERR
+	JZ	ONENAM
+	JMP	REPERR		; no such host file, outside the sandbox, ...
+				; (tail call: REPERR returns for us)
+
+;---- the CP/M name ----------------------------------------------------
+ONENAM: MOV	SI,OFFSET CNAME	; the name the user gave
+	CMP	CNAME,0
+	JNZ	ONEFCB
+	CALL	BASENM		; no second word: SRC/FOO.ASM -> FOO.ASM
+ONEFCB: CALL	MKFCB
+
+	CALL	SAYXFR		; "R: SRC/FOO.ASM -> FOO.ASM"
+
+;---- make the CP/M file -----------------------------------------------
+; Delete the old file first. BDOS MAKE on a name that exists makes a
+; second directory entry with the same name.
+	MOV	DX,OFFSET FCB
+	MOV	CL,FDELET
+	INT	224		; 0FFH = there was no file. That is fine.
+
+	MOV	DX,OFFSET FCB
+	MOV	CL,FMAKE
+	INT	224
+	CMP	AL,0FFH
+	JNZ	ONE2
+	JMP	ENODIR		; directory full
+
+ONE2:	MOV	DX,DS		; BDOS writes each record from DS:BUF
+	MOV	CL,FDMASEG
+	INT	224
+	MOV	DX,OFFSET BUF
+	MOV	CL,FSETDMA
+	INT	224
+
+	CALL	COPY
+	JC	ONE3		; CY = the copy failed and said so
+
+	MOV	DX,OFFSET FCB
+	MOV	CL,FCLOSE
+	INT	224
+	CMP	AL,0FFH
+	JNZ	ONE4
+	JMP	ECLOSE
+ONE4:	CALL	SAYREC		; "3 records, 300 bytes"
+ONE3:	RET
+
+;-----------------------------------------------------------------------
+; COPY: the host stream -> CP/M records. Returns CY on failure.
+;
+; The board reads the whole file into memory when OPEN_READ commits.
+; DAV clear means the end of the data, so R does not wait for DAV.
+;-----------------------------------------------------------------------
+COPY:	IN	AL,HBCMD
+	TEST	AL,DAV
+	JNZ	CP0
+	CLC			; no more data: done, no carry. An empty
+	RET			; host file makes an empty CP/M file.
+
+CP0:	MOV	DI,OFFSET BUF	; start a record
+	MOV	CX,RECLEN
+CP1:	IN	AL,HBCMD
+	TEST	AL,DAV
+	JZ	CPPAD		; the data ended in the record: pad it
+	IN	AL,HBDATA
+	MOV	[DI],AL
+	INC	DI
+	LOOP	CP1
+	MOV	AX,RECLEN	; a full record: count 128 bytes
+	CALL	ADDBYT
+	JMP	CPWRIT
+
+; Pad the rest of the last record with ^Z. CP/M keeps no byte count, and
+; TYPE and ED stop at the ^Z.
+CPPAD:	MOV	AX,RECLEN	; count only the bytes from the host:
+	SUB	AX,CX		; 128 - the slots left
+	CALL	ADDBYT		; ADDBYT keeps CX and DI
+CPPAD1: MOV	BYTE PTR [DI],CPMEOF
+	INC	DI
+	LOOP	CPPAD1
+
+CPWRIT: MOV	DX,OFFSET FCB
+	MOV	CL,FWRITE
+	INT	224
+	OR	AL,AL
+	JZ	CPW2
+	JMP	EDISK		; disk full, or read-only
+CPW2:	INC	RECS
+	JMP	COPY		; the next record
+
+;=======================================================================
+; THE HOST BRIDGE
+;=======================================================================
+
+;-----------------------------------------------------------------------
+; IDENT: check that the board is there before anything else.
+;
+; An IN from a port that no board decodes reads 0FFH, and 0FFH has DAV
+; set. Without this check, R would fill the disk with 0FFH bytes.
+;-----------------------------------------------------------------------
+IDENT:	MOV	AL,CIDENT
+	OUT	HBCMD,AL
+	MOV	DI,OFFSET IDBUF
+	MOV	CX,IDMAX
+	CALL	RECVZ		; no terminator (0FFH, no board): RECVZ
+				; cuts the string, and the compare fails
+	MOV	SI,OFFSET IDBUF
+	MOV	DI,OFFSET IDWANT
+ID3:	MOV	AL,[DI]
+	OR	AL,AL
+	JZ	ID4		; all of IDWANT matched
+	CMP	AL,[SI]
+	JNZ	IDBAD
+	INC	SI
+	INC	DI
+	JMP	ID3
+ID4:	RET
+
+IDBAD:	MOV	DX,OFFSET MNOHB
+	CALL	PRINT
+	JMP	EXIT
+
+;-----------------------------------------------------------------------
+; SENDZ: send the string at SI to the data port, with its NUL. The NUL
+; commits the command.
+;-----------------------------------------------------------------------
+SENDZ:	MOV	AL,[SI]
+	OUT	HBDATA,AL
+	INC	SI
+	OR	AL,AL
+	JNZ	SENDZ
+	RET
+
+;-----------------------------------------------------------------------
+; RECVZ: read a string from the data port into DI.
+;        CX = the room, without the NUL: the buffer is CX+1 bytes.
+;-----------------------------------------------------------------------
+RECVZ:	IN	AL,HBDATA
+	MOV	[DI],AL
+	OR	AL,AL
+	JZ	RZ2
+	INC	DI
+	LOOP	RECVZ
+	MOV	BYTE PTR [DI],0	; no room left: cut the string here
+RZ2:	RET
+
+;-----------------------------------------------------------------------
+; REPERR: print the board's error message. The board sends a code byte,
+; then the host's message as text. R prints the text.
+;-----------------------------------------------------------------------
+REPERR: MOV	AL,CERROR
+	OUT	HBCMD,AL
+	IN	AL,HBDATA	; the code byte: skip it
+	MOV	DX,OFFSET MERR
+	CALL	PRINT
+RPE1:	IN	AL,HBDATA	; then the text, one character at a time
+	OR	AL,AL
+	JZ	RPE2
+	CALL	PUTCH
+	JMP	RPE1
+RPE2:	JMP	CRLF		; tail call
+
+;=======================================================================
+; THE COMMAND TAIL
+;=======================================================================
+
+;-----------------------------------------------------------------------
+; PARSE: get two words from the command tail at 0080H.
+;
+; R does not use the CCP's FCBs at 005CH and 006CH. The CCP parses the
+; first word as 8.3, so `readme.markdown` would become `README  MAR`.
+;-----------------------------------------------------------------------
+PARSE:	MOV	SI,OFFSET TAIL+1
+	MOV	CL,TAIL		; CX = the length of the tail
+	MOV	CH,0
+	CALL	SKIPSP
+	MOV	DI,OFFSET HNAME
+	MOV	DX,HNMAX
+	CALL	TOKEN
+	CALL	SKIPSP
+	MOV	DI,OFFSET CNAME
+	MOV	DX,HNMAX
+	JMP	TOKEN		; tail call
+
+SKIPSP: JCXZ	SK2		; nothing left
+	CMP	BYTE PTR [SI],' '
+	JNZ	SK2
+	INC	SI
+	DEC	CX
+	JMP	SKIPSP
+SK2:	RET
+
+; Copy one word from SI to DI, and end it with a NUL. CX = the characters
+; left in the tail, DX = the room at DI without the NUL. With no word, the
+; result is an empty string. A word that does not fit stops R with an
+; error. R does not cut the word: a cut host name can name another file.
+TOKEN:	JCXZ	TK2
+	CMP	BYTE PTR [SI],' '
+	JZ	TK2
+	OR	DX,DX
+	JNZ	TK1		; room for the character
+	JMP	EWORD		; a character, and room for the NUL only
+TK1:	MOV	AL,[SI]
+	MOV	[DI],AL
+	INC	DI
+	DEC	DX
+	INC	SI
+	DEC	CX
+	JMP	TOKEN
+TK2:	MOV	BYTE PTR [DI],0
+	RET
+
+;-----------------------------------------------------------------------
+; HASWLD: NZ if HNAME has a * or a ?, else Z.
+;-----------------------------------------------------------------------
+HASWLD: MOV	SI,OFFSET HNAME
+HW1:	MOV	AL,[SI]
+	OR	AL,AL
+	JZ	HWNO
+	CMP	AL,'*'
+	JZ	HWYES
+	CMP	AL,'?'
+	JZ	HWYES
+	INC	SI
+	JMP	HW1
+HWNO:	CMP	AL,AL		; Z
+	RET
+HWYES:	OR	AL,AL		; NZ: AL is '*' or '?'
+	RET
+
+;-----------------------------------------------------------------------
+; ISDIR: Z if HNAME ends in '/'. The board marks a folder that way.
+; A wildcard can match a folder, and R does not try to open it.
+;-----------------------------------------------------------------------
+ISDIR:	MOV	SI,OFFSET HNAME
+	CMP	BYTE PTR [SI],0
+	JNZ	IS1
+	OR	SI,SI		; empty name: not a folder (NZ: SI is not 0)
+	RET
+IS1:	CMP	BYTE PTR [SI],0
+	JZ	IS2
+	INC	SI
+	JMP	IS1
+IS2:	DEC	SI		; the last character
+	CMP	BYTE PTR [SI],'/'	; Z if it is a folder
+	RET
+
+;-----------------------------------------------------------------------
+; BASENM: SI = the last part of the path in HNAME.
+; SRC/FOO.ASM -> FOO.ASM. CP/M has no folders.
+;-----------------------------------------------------------------------
+BASENM: MOV	SI,OFFSET HNAME
+	MOV	BX,SI		; BX = the start of the last part so far
+BN1:	MOV	AL,[SI]
+	OR	AL,AL
+	JZ	BN9
+	INC	SI
+	CMP	AL,'/'
+	JZ	BN2
+	CMP	AL,5CH		; backslash. The board accepts both
+	JNZ	BN1		; separators on every host.
+BN2:	MOV	BX,SI		; the character after the separator
+	JMP	BN1
+BN9:	MOV	SI,BX
+	RET
+
+;=======================================================================
+; THE FCB
+;=======================================================================
+
+;-----------------------------------------------------------------------
+; MKFCB: build FCB from the name at SI.
+;
+; It reads a drive prefix ("B:FOO.ASM"), cuts the name to 8.3, and
+; drops each character that CP/M cannot store in a name. A host name
+; such as `my-notes(2).txt` becomes MY-NOTES.TXT.
+;
+; It also folds the name to upper case. The CCP folds every name that
+; the user types, so a lower case CP/M name cannot be typed. A lower case
+; name comes from the host, as a wildcard match or through BASENM.
+;-----------------------------------------------------------------------
+MKFCB:	MOV	DI,OFFSET FCB	; zero the FCB
+	MOV	CX,36
+MF0:	MOV	BYTE PTR [DI],0
+	INC	DI
+	LOOP	MF0
+	MOV	DI,OFFSET FCB+1	; then fill the name and type with
+	MOV	CX,11		; spaces
+MF1:	MOV	BYTE PTR [DI],' '
+	INC	DI
+	LOOP	MF1
+
+; A drive letter: a ':' in the second position.
+	MOV	AL,[SI]
+	OR	AL,AL
+	JZ	MF9		; empty name. The caller checked.
+	MOV	BX,SI
+	CMP	BYTE PTR 1[BX],':'
+	JNZ	MF3		; no colon, no drive
+	CALL	UPCASE
+	SUB	AL,'A'-1	; 'A' -> 1, 'B' -> 2. 0 = the current drive.
+	MOV	FCB,AL
+	ADD	SI,2		; step over "B:"
+
+; The name: up to 8 characters, to the '.' or the end.
+MF3:	MOV	DI,OFFSET FCB+1
+	MOV	CX,8
+MF4:	MOV	AL,[SI]
+	OR	AL,AL
+	JZ	MF9		; the end: no extension
+	CMP	AL,'.'
+	JZ	MF5
+	CALL	FCBCH		; store it if it is legal and there is room
+	INC	SI
+	JMP	MF4
+
+; The type: up to 3 characters after the '.'.
+MF5:	INC	SI		; step over the '.'
+	MOV	DI,OFFSET FCB+9
+	MOV	CX,3
+MF6:	MOV	AL,[SI]
+	OR	AL,AL
+	JZ	MF9
+	CALL	FCBCH
+	INC	SI
+	JMP	MF6
+MF9:	RET
+
+; FCBCH: fold AL to upper case. If CP/M can store it and CX (the room left
+; in the field) is not 0, store it at DI and count it.
+FCBCH:	CALL	UPCASE
+	CALL	LEGAL		; CY = CP/M cannot store this character
+	JC	FC2
+	JCXZ	FC2		; the field is full: skip the rest
+	MOV	[DI],AL
+	INC	DI
+	DEC	CX
+FC2:	RET
+
+;-----------------------------------------------------------------------
+; UPCASE: fold a lower case letter in AL to upper case. Other values do
+;         not change.
+;-----------------------------------------------------------------------
+UPCASE: CMP	AL,'a'
+	JB	UC2
+	CMP	AL,'z'
+	JA	UC2
+	SUB	AL,'a'-'A'
+UC2:	RET
+
+;-----------------------------------------------------------------------
+; LEGAL: CY set if CP/M cannot put the character in AL in a name.
+;        AL is kept.
+;
+; A space or a control character ends a name for the CCP. DEL and a
+; byte with bit 7 set are bad too, because CP/M keeps the file
+; attributes in bit 7. R checks these ranges first, then ILLCHR.
+;-----------------------------------------------------------------------
+LEGAL:	CMP	AL,21H		; a space, or below
+	JB	LGBAD
+	CMP	AL,7FH		; DEL, or bit 7 set
+	JAE	LGBAD
+	MOV	BX,OFFSET ILLCHR
+LG1:	CMP	BYTE PTR [BX],0
+	JZ	LGOK		; the end of the table: it is legal
+	CMP	AL,[BX]
+	JZ	LGBAD
+	INC	BX
+	JMP	LG1
+LGOK:	CLC
+	RET
+LGBAD:	STC
+	RET
+
+;=======================================================================
+; MESSAGES TO THE USER
+;=======================================================================
+
+; "R: SRC/FOO.ASM -> B:FOO.ASM"
+SAYXFR: MOV	DX,OFFSET MPFX
+	CALL	PRINT
+	MOV	SI,OFFSET HNAME
+	CALL	PSTR
+	MOV	DX,OFFSET MARROW
+	CALL	PRINT
+	CALL	PRFCB
+	JMP	CRLF
+
+; "12 records, 1493 bytes"
+SAYREC: MOV	AX,RECS
+	MOV	DX,0
+	CALL	PRDEC
+	MOV	DX,OFFSET MRECS	; " records, "
+	CALL	PRINT
+	MOV	AX,BYTESL	; the bytes from the host
+	MOV	DX,BYTESH
+	CALL	PRDEC
+	MOV	DX,OFFSET MBYTES ; " bytes",CR,LF
+	JMP	PRINT
+
+; ADDBYT: add AX to the 32-bit count BYTESH:BYTESL.
+ADDBYT: ADD	BYTESL,AX
+	ADC	BYTESH,0
+	RET
+
+;-----------------------------------------------------------------------
+; PRDEC: print DX:AX (32 bits) in decimal. The digits go into a buffer
+; from the end, and a '$' ends it, so one PRSTR prints the number. Each
+; digit is two 16-bit divides: the high word, then the remainder and the
+; low word, so no quotient overflows.
+;-----------------------------------------------------------------------
+PRDEC:	MOV	DI,OFFSET NUMEND
+	MOV	BYTE PTR [DI],'$'
+	MOV	BX,10
+PD1:	DEC	DI
+	MOV	CX,AX		; CX = the low word
+	MOV	AX,DX
+	MOV	DX,0
+	DIV	BX		; AX = high/10, DX = high MOD 10
+	XCHG	AX,CX		; CX = the new high word, AX = the low word
+	DIV	BX		; AX = (rem*65536 + low)/10, DX = the digit
+	ADD	DL,'0'
+	MOV	[DI],DL
+	MOV	DX,CX		; DX:AX = the quotient
+	MOV	CX,AX
+	OR	CX,DX
+	JNZ	PD1
+	MOV	DX,DI		; the first digit
+	JMP	PRINT
+
+; PSTR: print the string at SI.
+PSTR:	MOV	AL,[SI]
+	OR	AL,AL
+	JZ	PSTR2
+	CALL	PUTCH
+	INC	SI
+	JMP	PSTR
+PSTR2:	RET
+
+; PRFCB: print the FCB as "d:NAME.EXT".
+PRFCB:	MOV	AL,FCB
+	OR	AL,AL
+	JZ	PF1		; drive 0 = the current drive: no letter
+	ADD	AL,'A'-1
+	CALL	PUTCH
+	MOV	AL,':'
+	CALL	PUTCH
+PF1:	MOV	SI,OFFSET FCB+1
+	MOV	CX,8
+	CALL	PFLD
+	CMP	FCB+9,' '
+	JZ	PF2		; no extension
+	MOV	AL,'.'
+	CALL	PUTCH
+	MOV	SI,OFFSET FCB+9
+	MOV	CX,3
+	CALL	PFLD
+PF2:	RET
+
+; PFLD: print CX characters at SI, and skip the pad spaces.
+PFLD:	MOV	AL,[SI]
+	CMP	AL,' '
+	JZ	PFL2
+	CALL	PUTCH
+PFL2:	INC	SI
+	LOOP	PFLD
+	RET
+
+; PUTCH: print the character in AL. Keeps CX, SI and DI.
+PUTCH:	PUSH	CX
+	PUSH	SI
+	PUSH	DI
+	MOV	DL,AL
+	MOV	CL,CONOUT
+	INT	224
+	POP	DI
+	POP	SI
+	POP	CX
+	RET
+
+; PRINT: print the '$' string at DX.
+PRINT:	MOV	CL,PRSTR
+	INT	224
+	RET
+
+CRLF:	MOV	DX,OFFSET MCRLF
+	JMP	PRINT
+
+;=======================================================================
+; ERRORS
+;=======================================================================
+USAGE:	MOV	DX,OFFSET MUSAGE
+	CALL	PRINT
+	JMP	EXIT
+
+EWILD:	MOV	DX,OFFSET MEWILD
+	CALL	PRINT
+	JMP	EXIT
+
+EWORD:	MOV	DX,OFFSET MEWORD
+	CALL	PRINT
+	JMP	EXIT
+
+; ENODIR, EDISK and ECLOSE come from inside ONE (EDISK from inside COPY,
+; which ONE called), so ESAY returns, with CY set.
+ENODIR: MOV	DX,OFFSET MENODIR
+	JMP	ESAY
+EDISK:	MOV	DX,OFFSET MEDISK
+	JMP	ESAY
+ECLOSE: MOV	DX,OFFSET MECLOSE
+ESAY:	CALL	PRINT
+	STC
+	RET
+
+;=======================================================================
+; DATA. The base page is at DS:0000; the program's data starts at 0100H.
+;=======================================================================
+	DSEG
+	ORG	0080H
+TAIL	RB	128		; the command tail: length, then the text.
+				; The CCP folds it to upper case. The board
+				; folds host names to match, so
+				; `R readme.txt` finds readme.txt.
+	ORG	0100H
+IDWANT	DB	'ALTAIRSIM HOSTBRIDGE',0
+
+; The printable characters that CP/M does not store in a name. LEGAL
+; checks a space, a control character and DEL and up before this table.
+; 5CH is the backslash and 2FH the slash. BASENM removed the path first.
+ILLCHR	DB	'<>.,'
+	DB	3BH		; ';'
+	DB	':=?*[]|'
+	DB	5CH,2FH,0
+
+MNOHB	DB	CR,LF,'R: no hostbridge board at port B0H.',CR,LF
+	DB	'Add a hostbridge board to the machine, or set its port'
+	DB	' to B0.',CR,LF,'$'
+
+MUSAGE	DB	CR,LF,'R -- copy a file from the host into CP/M.  (1.3, 8086)'
+	DB	CR,LF,CR,LF
+	DB	'   R <hostfile> [cpmfile]',CR,LF
+	DB	'   R <pattern>',CR,LF,CR,LF
+	DB	'Examples',CR,LF
+	DB	'   R FOO.ASM            host FOO.ASM -> CP/M FOO.ASM',CR,LF
+	DB	'   R FOO.ASM B:BAR.ASM  ...to B:, under another name',CR,LF
+	DB	'   R SRC/FOO.ASM        out of a subdirectory of hostdir',CR,LF
+	DB	'   R *.ASM              every match',CR,LF,CR,LF
+	DB	'Files are copied BYTE FOR BYTE. The last CP/M record is'
+	DB	' padded with ^Z.',CR,LF
+	DB	'HDIR lists what is on the host. W copies the other way.'
+	DB	CR,LF,'$'
+
+MPFX	DB	'R: $'
+MARROW	DB	' -> $'
+MRECS	DB	' records, $'
+MBYTES	DB	' bytes',CR,LF,'$'
+MERR	DB	'R: $'
+MCRLF	DB	CR,LF,'$'
+
+MEWILD	DB	'R: a wildcard copies each file under its own name -- so a'
+	DB	' second name',CR,LF,'   cannot mean anything. Drop it.'
+	DB	CR,LF,'$'
+MENODIR DB	'R: the CP/M directory is full.',CR,LF,'$'
+MEDISK	DB	'R: the CP/M disk is full, or is read-only.',CR,LF,'$'
+MEWORD	DB	'R: a name is too long.',CR,LF,'$'
+MECLOSE DB	'R: could not close the CP/M file.',CR,LF,'$'
+
+MBUSY	DB	'R: another user has the host bridge. Waiting...',CR,LF,'$'
+
+; The MP/M-86 queue that LOCK and UNLOCK use (Programmer's Guide
+; Figures 6-8 and 6-9).
+MXQD	DW	0,0		; QD: internal, zero
+	DW	0001H		; flags: mutual exclusion
+	DB	'MXhostbr'	; the name: all 8 bytes count
+	DW	0		; MSGLEN: a message of zero length
+	DW	1		; NMSGS: one message
+	DW	0,0,0,0		; internal, zero
+	DW	0		; BUFFER: 0 from a transient program
+MXQPB	DW	0		; QPB: reserved, set by OPEN QUEUE
+	DW	0		; the queue ID, set by OPEN QUEUE
+	DW	1		; NMSGS: one message a read or a write
+	DW	OFFSET MXQPB	; BUFFER: the message has no bytes
+	DB	'MXhostbr'
+MXMADE	DB	0FFH		; 0 = this program made the queue
+MXHELD	DB	0		; 1 = this program has the message
+
+;---- variables --------------------------------------------------------
+BUF	RB	RECLEN		; the DMA buffer: one CP/M record
+RECS	RW	1		; records written to CP/M
+BYTESL	RW	1		; the host byte count, 32 bits: the low
+BYTESH	RW	1		; word and the high word
+FCB	RB	36		; R's own FCB, not the CCP's at 5CH
+HNAME	RB	HNMAX+1		; the host name, the pattern, or a match
+CNAME	RB	HNMAX+1		; the CP/M name, if the user gave one. MKFCB
+				; cuts it to 8.3.
+IDBUF	RB	IDMAX+1		; the board's signature
+NUMBUF	RB	10		; 4294967295 is 10 digits
+NUMEND	RB	1		; PRDEC ends here
+
+	RW	64		; the stack
+STACK	RB	1
+	DB	0		; an end byte, so GENCMD keeps all of the
+				; data segment (as in DRI's RANDOM.A86)
+	END

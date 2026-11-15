@@ -1,0 +1,918 @@
+# Serial ports, sockets and telnet
+
+A CompuPro machine had no screen of its own. It had a serial board, such as the Interfacer 1, and
+you connected a device to it: a video terminal, a printer, a modem or a paper-tape reader. The
+board did not know which device it was. It moved characters.
+
+`pascal100` works in the same way. **Every board that moves characters has one or more UNITS,
+and you can CONNECT each unit to an ENDPOINT.** The unit is the connector on the back of the
+board. The endpoint is what you connect to it.
+
+```
+pascal100> CONNECT if1:a socket:2323
+pascal100> DISCONNECT if1:a
+```
+
+## The same in a machine file
+
+`CONNECT` connects a unit now. A machine file makes the same connection each time that the
+machine starts. `CONNECT <id>:<unit> <endpoint>` becomes `connect = "<endpoint>"` in the
+`[board.unit.<unit>]` table of the board that has that `id`.
+
+```
+pascal100> CONNECT if1:a telnet:2323
+```
+
+In a machine file:
+
+```toml
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "telnet:2323"
+```
+
+This is the `[[board]]` of the Interfacer 1 in a machine file, for example in a copy of
+`examples/cpm22/cpm22-buffered.toml`. The `connect` line of unit `a` is the only line that
+changes. The other boards of the file stay as they are.
+
+The endpoint is always one string in quotes, with its options and its tap.
+
+You can get the same result in two other ways:
+
+- Type the `CONNECT` command at the monitor, and then type `CONFIG SAVE mine.toml`. The saved
+  file is a complete machine with no `base`. It lists every board and every setting.
+- Put the command in the `startup` list: `startup = ["CONNECT if1:a telnet:2323", "RUN 0"]`.
+
+In this chapter, the words "In a machine file:" introduce the machine-file form of the command
+above them. Each sample shows only the `[[board]]` or the table that changes, not the whole
+file.
+
+## The endpoints
+
+This is the complete list.
+
+| Endpoint | What it is |
+|---|---|
+| `console` | the terminal where you started the program: your keyboard and your screen |
+| `null` | nothing. Writes go nowhere, and a read never gets a byte |
+| `loopback` | the unit itself. What the guest writes comes back as a read |
+| `socket:PORT` | **listens** on that TCP port, and passes the bytes unchanged. Add `?banner` to greet each caller |
+| `socket:HOST:PORT` | **calls** that host and port, and passes the bytes unchanged |
+| `telnet:PORT` | **listens** like `socket:PORT`, and uses the **Telnet protocol**, so that a `telnet` client works well. Use it when a **person** connects. It greets each caller, and `?banner=off` stops that |
+| `telnet:HOST:PORT` | **calls** like `socket:HOST:PORT`, as a telnet client |
+| `serial:DEVICE` | a real serial port on your computer |
+| `pty` | a pseudo-terminal that a terminal program opens as a serial port. Only on macOS and Linux. `pty:LINK` selects the name |
+| `in:PATH` | a file that the board reads, like a **paper-tape reader** |
+| `out:PATH` | a file that the board writes, like a **paper-tape punch** |
+| `in:PATH,out:PATH` | a reader and a punch on one line, with two files |
+| `terminal` | a terminal in its own window: a VT100, ADM-3A, VT52 or H19 |
+| `printer:QUEUE` | a print queue on your computer. Only on a build that has host printing |
+| `scripted` | a terminal that a program types into, for the MCP tools and the tests |
+
+You can add two things to any endpoint. `|FILE` writes every byte on the line to a log file, and
+`|socket:PORT` lets a second person watch the line and type on it (`|pty` does the same for a
+terminal program, on macOS and Linux, and `|serial:DEVICE` does the same for a terminal on a
+serial port). See "Tap a line to a log
+file" and "Mirror a line", below.
+
+### `null` is not an error
+
+A unit that is not connected is `null`. **This is a correct state, not a fault.** A UART with no
+cable is always ready to send. A program that writes to it runs correctly, and nobody receives
+the output. A read never completes, because nothing sends. A real board with no cable does the
+same.
+
+### The colon makes the difference
+
+`socket:2323` **listens**. `socket:localhost:2323` **calls out**. A port alone is a port that
+you own. A host with a port is a place that you go to.
+
+### An endpoint with a space in it
+
+Put quotes around **all** of the endpoint, as you do for a `MOUNT` path:
+
+```
+pascal100> CONNECT if1:b "out:My Files/log.txt"
+if1:b: connected to out:My Files/log.txt
+```
+
+Without the quotes, or with quotes that start in the middle (`out:"My Files/log.txt"`),
+`CONNECT` refuses the line and shows the correct form. In a machine file,
+the TOML string is enough: `connect = "out:My Files/log.txt"`.
+
+## Only one unit can hold the console
+
+The console is **your keyboard**, and you have one. When you connect a second unit to `console`,
+**it takes the console, and says which unit it took it from**:
+
+```
+pascal100> CONNECT if1:b console
+console taken from if1:a
+if1:b: connected to console
+```
+
+This is not an error. If two boards read one keyboard, each one would get about half the
+characters. `SHOW CONSOLE` shows which unit has the console, and the console settings.
+
+## Use telnet to connect to the guest
+
+Connect a unit to a `telnet:` port, and the guest has a serial port with a terminal on it:
+
+```
+pascal100> CONNECT if1:a telnet:2323
+pascal100> RUN
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  connect = "telnet:2323"
+```
+
+In another terminal on your computer, type:
+
+```
+$ telnet localhost 2323
+Connected to pascal100 X.Y.Z (commit) (if1:a) on port 2323
+```
+
+The console of the guest is now that window. Your first terminal still has the monitor and
+`Ctrl-E`.
+
+Unit `a` is the console port of the `default` machine. To keep the console where it is and give
+the guest a second terminal, connect unit `b`: write `if1:b` at the monitor, or
+`[board.unit.b]` in the machine file.
+
+### `socket:` or `telnet:`
+
+Both raise carrier when a caller connects, and drop it when the caller leaves. The guest cannot
+tell them apart. They differ in what they send to the far end:
+
+| | `socket:` | `telnet:` |
+|---|---|---|
+| Use it for | another program or another machine | a **person** with `telnet` or `nc` |
+| What goes on the line | the bytes of the guest, and nothing else | the bytes of the guest, and the Telnet settings for echo and single keys |
+| What the person sees | each key two times, and a whole line sent at Enter | each key one time, sent when it is pressed |
+| Greeting | none, unless you add `?banner` | one line with the machine, the unit and the port |
+
+Use `telnet:` when a person types to the guest. Use `socket:` when a program is at the far end:
+one `pascal100` connected to another, a file transfer, or a tool that uses raw bytes.
+
+A `telnet` client on a raw `socket:` shows each key two times, because the client and the guest
+both echo it. Enter sends a whole line, with a line feed in place of the carriage return. You
+cannot fix this from the keyboard. The Telnet protocol sets up the two ends to agree.
+
+### The connect banner
+
+A `telnet:PORT` line greets each person who connects, before the guest sends anything. This is
+the `Connected to ...` line above. It names the build, the unit and the port, so that you know
+that you reached the correct machine. Only the caller sees it, and nothing goes to the board. To
+turn it off, add `?banner=off`:
+
+```
+pascal100> CONNECT if1:a telnet:2323?banner=off
+```
+
+A `socket:PORT` line has no banner, because a program at the far end would read the banner as
+data. To greet a person on a raw socket, add `?banner`: `CONNECT if1:a socket:2323?banner`. A
+banner is only for a port that listens. On a line that calls out, the program refuses `?banner`.
+
+## A terminal in its own window
+
+A telnet client must be installed and pointed at the correct port. It changes any byte that
+looks like a telnet command, which can break cursor sequences and file transfers. A modern
+terminal also emulates a modern terminal, not the ADM-3A or VT52 that the software of the period
+expects.
+
+`terminal` is a terminal that the program draws itself, in its own window:
+
+```
+pascal100> CONNECT if1:a terminal
+pascal100> RUN
+```
+
+The console of the guest is now that window. The monitor and `Ctrl-E` stay in the terminal that
+you started from. The window opens when you connect the line. It answers the reports that a
+program of the period asks for, such as `ESC[6n`.
+
+`terminal` alone is a VT100 in an 80×24 window. Give options after a `?`, joined by `&`:
+
+```
+pascal100> CONNECT if1:a terminal?emulation=adm3a
+pascal100> CONNECT if1:a terminal?emulation=vt52&size=80x24
+pascal100> CONNECT if1:a terminal?emulation=h19&size=132x24
+pascal100> CONNECT if1:a terminal?emulation=vt100&phosphor=amber&width=1100
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  connect = "terminal?emulation=vt52&size=80x24"
+```
+
+The options are part of the string. A machine file always has quotes around the endpoint, so
+the `&` needs no special quotes there.
+
+- `emulation` is `vt100` (the default, and `ansi` is the same), `adm3a` (the Lear Siegler
+  ADM-3A, the usual CP/M terminal), `vt52`, or `h19` (the Heath/Zenith H19, a VT52 with an ANSI
+  mode).
+- `size` is *columns*×*rows*. The default is `80x24`.
+- `phosphor` is the color of the tube: `green` (the default) or `amber`.
+- `width` is the width of the window when it opens, in pixels. Without it, the window is about
+  half as wide as the screen.
+
+The text uses the **DEC VT220** character set. It goes well with `[display] crt = true`, which
+the configuring chapter describes. With `crt = true`, a `width` opens the window at that size.
+
+The window has its own settings for changing bytes, under `[terminal]`. See "The built-in
+terminal has these too", below.
+
+### Several terminal windows
+
+**Each terminal window types on its own line.** Connect a `terminal` to several units, and each
+unit gets its own window. Click a window, and what you type goes to the line of that window.
+This is how you run a multi-user system, such as MP/M, with one window for each user.
+
+A key typed in a window that is not a terminal, such as the window of a VDM-1, goes to the
+console, as before.
+
+### Copy from a terminal window
+
+**Drag with the left mouse button to select text, then press Cmd-C on a Mac, or Ctrl-Shift-C on
+Windows and Linux.** The selected cells show in reverse. The selection runs in reading order,
+from the cell where you started to the cell where you stopped. A bare Ctrl-C is not copy: the
+guest gets ^C.
+
+- **With no selection, Cmd-C copies the whole screen.** Use this to give all of the screen to
+  another program, or to an AI assistant.
+- **Each screen row is one line.** Blanks at the end of a row are left out, and so are blank rows
+  at the bottom of the screen when you copy the whole screen.
+- **A key that you type clears the selection.** A click without a drag also clears it.
+- **The selection stays on the same cells.** If the guest scrolls the screen, the cells that are
+  selected can show different text. Copy before the screen moves.
+
+### Paste into a terminal window
+
+**Cmd-V on a Mac, Ctrl-Shift-V on Windows and Linux, pastes the clipboard into the window.**
+The text goes down the line of that window as keystrokes, the same as if you typed it, so you
+can paste a command, a BASIC program or a block of text into an editor. A bare Ctrl-V is not
+paste: the guest gets ^V, as from a real terminal.
+
+- **Each line end becomes a CR**, the byte that the Return key sends. A line end at the end of
+  the text is kept, so a pasted command line runs.
+- **TAB and printable ASCII stay.** Other control characters are left out. A character that
+  is not ASCII, such as a curly quote, arrives as `?`, so that you can see it and correct it.
+- **No character is lost in the simulator.** The keys wait in the line until the guest reads
+  them. A guest program can still throw away keys that come while it is busy, as it would
+  with a fast typist. For a long BASIC program, paste a few lines at a time, or move the file
+  with the host bridge (`R`) instead.
+
+### The title of the window
+
+**The window shows the name of the unit twice:** in the title bar of your computer, and on a bar
+at the top of the terminal screen. The bar in the window is grey, and it uses the font of the
+terminal, so the name is as large as the text. The title bar of your computer has the size that your system sets.
+
+The `title` setting of the unit gives the name:
+
+```
+pascal100> SET if4:user3 title=tty1
+```
+
+In a machine file:
+
+```toml
+  [board.unit.user3]
+  connect = "terminal?emulation=vt52"
+  title   = "tty1"
+```
+
+- **Every serial unit has `title`.** The title belongs to the unit, so it stays when you connect
+  a different endpoint.
+- **An empty title gives the default:** the product, the unit and the board id, for example
+  `MITS 88-2SIO a (sio0)`. On the Interfacer 3 and the Interfacer 4, the default gives the port
+  number that CompuPro software uses, for example `CompuPro Interfacer 4 port 7 (if4)`.
+- **The program does not read names from the guest.** MP/M keeps its names for the terminals in
+  its own files on the disk. To use those names, set `title` in the machine file.
+- The title bar of your computer shows `pascal100 -- `, the machine name, then the title of the
+  unit.
+- **The bar in the window is one row of text above the screen.** The guest cannot see it or
+  write to it: the screen is still the size that you set, for example 80×24. A title that is
+  longer than the screen is cut at the right. A character that is not printable ASCII shows
+  as `?`.
+- `SET TERMINAL titlebar=off` removes the bar from every terminal window, and the windows get
+  one row shorter.
+
+## Call another computer
+
+```
+pascal100> CONNECT if1:b socket:bbs.example.com:23
+```
+
+The program opens the connection. The guest sees a serial line with carrier, and it can run a
+terminal program of the period over it.
+
+## A real serial port
+
+```
+pascal100> CONNECT if1:a serial:/dev/tty.usbserial-A600K1XY
+pascal100> CONNECT if1:a serial:COM3
+```
+
+The second form is for Windows. The bytes go out of a real UART, down a real cable, to the
+device at the other end. The modem control lines (DCD, CTS and RTS) are connected too.
+
+**`SHOW SERIAL` lists the serial ports on your computer.** For each port, it also shows the
+unit that holds it:
+
+```
+pascal100> SHOW SERIAL
+serial  (host serial ports for CONNECT <id>:<u> serial:<device>)
+
+  DEVICE                           IN USE BY
+  /dev/cu.Bluetooth-Incoming-Port
+  /dev/cu.debug-console
+  /dev/cu.usbmodem1121101
+  /dev/cu.usbserial-AB0NW409
+  /dev/cu.usbserial-AL009KFH
+
+  Only names that look like a serial port are listed. Another device path
+  still opens with serial:<path>.
+```
+
+The list has only the names that look like a serial port. A device with a different name still
+opens when you give its full path. If you give a wrong device name, `CONNECT` also lists the
+ports. A cable can appear under a name that is one character different from what you expected,
+and the list shows you the correct name.
+
+### The board sets the frame on the line
+
+The program opens the port at 9600 8N1. **The board then sets the port again at once**, because
+only the board knows what frame it sends. To send 300 baud, 7 bits and even parity, set it on
+the **board**, where the operator of the period set it.
+
+On the **Interfacer 1**, a switch sets the baud rate (`baud`), and straps set the word format
+(`data_bits`, `parity`, `parity_sense` and `stop_bits`). The **guest can change the word format**:
+each 1 bit that it writes to the control latch inverts one strap. The frame on the line is the
+straps with the guest's changes. A guest that selects 7E1 sets the cable to 7E1. `SHOW if1`
+shows the properties of each unit.
+
+**`data_bits` is a frame, not a mask.** `data_bits=7` puts seven data bits in each character on
+the line. It does not clear bit 7 of the byte that the guest wrote. Do not use it to fix a
+prompt on your screen. Use the console settings (below).
+
+### Give the machine its real crystal before you transfer a file
+
+```
+pascal100> SET cpu0 clock_hz=2000000
+```
+
+A guest has no clock. It counts instructions. At full speed, its "three-second" timeout passes
+in a few milliseconds, and it decides that your sender is dead. Full speed is correct for a
+machine that talks only to itself. **A machine that talks to the outside world needs the real
+crystal.** The troubleshooting chapter tells you more.
+
+### The port, the baud rate and the crystal in a machine file
+
+The three commands are:
+
+```
+pascal100> SET cpu0 clock_hz=2000000
+pascal100> SET if1:a baud=9600
+pascal100> CONNECT if1:a serial:/dev/tty.usbserial-A600K1XY
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id       = "cpu0"
+clock_hz = 2000000             # SET cpu0 clock_hz=2000000
+
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  baud    = 9600               # SET if1:a baud=9600
+  connect = "serial:/dev/tty.usbserial-A600K1XY"
+```
+
+A `SET` on a board is a key in the `[[board]]` of that board. A `SET` on a unit is a key in the
+table of that unit.
+
+## A pseudo-terminal for a terminal program
+
+On macOS and Linux, a line can go to a **pseudo-terminal**. A terminal program, such as
+`screen`, `minicom` or `cu`, opens a pseudo-terminal as it opens a serial port. No cable and no
+port number are necessary. A file transfer program can use the line also, because each byte
+goes through unchanged.
+
+```
+pascal100> CONNECT if1:b pty
+if1:b: connected to pty
+pty: /tmp/pascal1000 (/dev/ttys004)
+```
+
+The program prints the name of the line. The first line is `/tmp/pascal1000`, and the next one
+is `/tmp/pascal1001`. Type `screen /tmp/pascal1000` in a second window to use the line. The
+name is a link to the device in the brackets. The program removes the link when the line
+disconnects, and when the program stops.
+
+To select the name, give a path after `pty:`. The name is then the same each time. A path that
+is not absolute is relative to the folder of the machine file.
+
+```
+pascal100> CONNECT if1:b pty:/tmp/p100-line
+if1:b: connected to pty:/tmp/p100-line
+pty: /tmp/p100-line (/dev/ttys004)
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.b]
+  connect = "pty:/tmp/p100-line"
+```
+
+When the machine file starts the machine, the program prints the same `pty:` line, with the
+name of the unit before it.
+
+- **When no program has the name open, the line discards what the guest sends.** The guest
+  does not wait.
+- **A program that has the name open is the carrier.** The DCD and DSR pins of the line are on
+  while a program has the name open, and off when it closes the name. The board decides which
+  of these the guest can read. The board reference tells you which status bits a board has.
+- **A program that reads slowly makes the guest wait.** The guest loses no bytes.
+- **`pty:` replaces a link that is at the path.** If the path is a file that is not a link,
+  the program refuses, and does not replace the file.
+- **Windows has no pseudo-terminal, and refuses `pty`.** Use `socket:PORT` or `telnet:PORT`.
+
+To let a second person watch a line that goes to a different endpoint, use `|pty`. See "A
+mirror on a pseudo-terminal", below.
+
+## A file as a reader or a punch: `in:` and `out:`
+
+A **paper-tape station** was connected to a serial or parallel line. The program makes one from
+two files on your computer:
+
+```
+pascal100> CONNECT if1:b out:printout.txt               # a punch: save what the board sends
+pascal100> CONNECT if1:b in:reader.tap                  # a reader: give a file to the board
+pascal100> CONNECT if1:b in:reader.tap,out:punch.tap    # both, on one line
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.b]
+  connect = "in:reader.tap,out:punch.tap"
+```
+
+The name of the table is the name of the unit: `b` here.
+
+`in:` is a **reader**. It gives the bytes of the file to the board one at a time, from the
+start. When the file ends, the line goes **quiet**, with no error and no end-of-file byte, as a
+reader with no more tape does. If the file does not exist, `CONNECT` refuses, and names the
+path.
+
+`out:` is a **punch**. The board's output goes to the file. If the file does not exist, the
+punch makes it. **The punch does not truncate the file.** It writes from the start, and the end
+of a longer old file stays in the file.
+
+The reader and the punch are **separate files, each with its own position**. Both are 8-bit
+clean: the bytes on the line are the bytes in the file. A relative path starts from the
+machine's folder.
+
+### A reader with a speed
+
+A program that times its input needs a reader with a real speed. Add `?cps=N` (characters per
+second) or `?baud=N` (a line rate, at 10 bits for each character):
+
+```
+pascal100> CONNECT if1:b in:tape.tap?cps=300       # a high-speed reader
+pascal100> CONNECT if1:b in:tape.tap?cps=30        # a slow reader
+```
+
+Give only one of `cps` or `baud`. Without either, the reader runs as fast as possible. The punch
+takes no options.
+
+## Print on a real printer
+
+On macOS and Linux, a line can go to a print queue on your computer. These examples use a
+`c700` printer board with the id `lpt0`, which the boards chapter adds:
+
+```
+pascal100> CONNECT lpt0:prn printer:linewriter
+```
+
+Here `linewriter` is the name of the print queue, as you made it in the printer settings of
+your operating system. The examples below use it, and other queue names, the same way.
+
+The **Windows** builds do not have host printing yet. On Windows, send the output to a file
+(`out:`) or a socket (`socket:`). To see what your build can do, connect to `printer:` with no
+name. The program lists the queues that it can reach, or tells you that the build has no host
+printing.
+
+Any line can use `printer:`, not only the `c700`. An Interfacer 1 unit can use it too. The bytes go into a
+buffer, and then to the print system as one **job**.
+
+**A printer has no "done" signal, so the program decides where a job ends.** Set it on the
+endpoint:
+
+| Option | Ends the job | Default |
+|---|---|---|
+| `?idle=N` | after **N seconds** with nothing more printed. `0` means never | `5` |
+| `?onff` | also on a **form feed** (the page-eject character) | off |
+| `?max=N` | at **N bytes**, so that a program that does not stop cannot fill memory | a large number |
+
+```
+pascal100> CONNECT lpt0:prn printer:linewriter?idle=15
+pascal100> CONNECT lpt0:prn printer:linewriter?onff
+pascal100> CONNECT lpt0:prn printer:linewriter?idle=0&onff
+```
+
+`?onff` with no value turns the option on. The first option that applies ends the job. **An
+empty buffer never prints**, so a form feed and then silence does not print a blank page. A job
+also prints when you `DISCONNECT` the line, load another machine or quit. **With `?idle=0`, the
+job sits in the buffer until one of those three does it**: the timer is off, so unless a form
+feed (`?onff`) or the `?max` ceiling ends it first, `DISCONNECT` is what sends it.
+
+**The `?idle` timer runs on your computer's clock, not the simulated machine's.** While the
+timer is on (`?idle` above zero), a finished job prints `?idle=N` seconds after its last byte
+even while the machine is stopped at the `pascal100>` prompt — you do not have to keep the
+machine running, and, in an interactive session, you do not have to disconnect. The prompt
+flush holds only there: a session run from a pipe or a script has no idle tick at the
+prompt, so there the job waits until you `DISCONNECT`, load another machine or quit.
+
+**Use a *raw* queue**, which passes the bytes to the printer unchanged. A normal queue can
+change a printer control language that it does not recognize. Make the raw queue one time, in
+the printer settings of your operating system.
+
+## Tap a line to a log file
+
+Add **`|FILE`** to any endpoint, and the program writes every byte that crosses the line, in
+both directions, to a text file. It writes hex and ASCII, with times. The guest cannot tell that
+the tap is there, and the tap never changes a byte. For this reason, you can use it on a binary
+transfer.
+
+```
+pascal100> CONNECT if1:a socket:2323|bbs.hex
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  connect = "socket:2323|bbs.hex"
+```
+
+Connect with telnet, and use the guest. `bbs.hex` fills with the conversation:
+
+```
+# pascal100 capture  socket:2323  2026-07-29 14:03:11  fmt=dump
++0.001000  TX 0000  41 54 5A 0D                                       ATZ.
++0.048213  RX 0000  0D 0A 4F 4B 0D 0A                                 ..OK..
++9.100000  [DCD^]
++45.30000  [DTR_]
+```
+
+- `TX` is what the guest sent, and `RX` is what came back.
+- The offset counts the bytes in a burst.
+- The right column is the ASCII, with a `.` for a character that cannot be printed.
+- A line in `[...]` is a change on a **modem control line**, such as carrier, DTR or RTS. `^` is
+  a rising edge, and `_` is a falling edge.
+
+The program empties the file each time that you connect. Add the `append` option to keep what
+the file holds, and to add to the end of it. `SHOW` prints the tap, and `CONFIG SAVE` saves it,
+so a machine file can have a line that is always traced.
+
+### The layouts and the options
+
+The tap takes options after the file name, in the `?key=value` form:
+
+```
+pascal100> CONNECT if1:a socket:2323|bbs.hex?fmt=cols
+pascal100> CONNECT if1:a in:reader.tap?cps=300|trace.log?fmt=jsonl
+```
+
+- **`fmt=dump`** (the default) is the layout above: one hex row on each line, in time order.
+- **`fmt=cols`** puts what the guest sent on the **left**, and what it received on the
+  **right**. A request and its reply read down the page.
+- **`fmt=jsonl`** writes one JSON record for each transfer, for another program to read.
+- `ts=elapsed` (the default, seconds from the first byte), `ts=wall` (the clock of your
+  computer), or `ts=none`
+- `width=N`: the bytes in each hex row. The default is 16
+- `gap=MS`: how long a quiet line waits before it writes a part row. The default is 200 ms
+- `pins=off`: leave out the changes on the modem control lines
+- `append`: add to the end of the file. Without `append`, the program empties the file first
+
+### A log of plain text: `fmt=text`
+
+**`fmt=text`** writes no hex. The file holds only the characters that the guest prints, with
+nothing added. Use it to keep a record of a session that you can read:
+
+```
+pascal100> CONNECT if1:a console|session.log?fmt=text
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  connect = "console|session.log?fmt=text"
+```
+
+- The program writes each character to the file at the time that the guest prints it. The file
+  is an ordinary text file, and you can read it, search it or copy it while the line is in use.
+  For example, `tail -f session.log` in a second window follows the session. In PowerShell on
+  Windows, the command is `Get-Content -Wait session.log`.
+- The file does not hold what you type. If the guest echoes a character, the echo is in the
+  file, as it is on a terminal.
+- The file holds each byte as the guest sent it. The `[console]` settings do not change the
+  bytes on a line (see "The console settings change bytes, and a line does not", below).
+- `append` is the only option that `fmt=text` accepts. The options `ts`, `width`, `gap` and
+  `pins` are for the hex layouts, and `fmt=text` refuses them.
+
+### A tap on a mirror
+
+A line can have a mirror and a tap together. Put the tap last:
+
+```
+pascal100> CONNECT if1:a console|socket:2323|session.log?fmt=text
+```
+
+The next section describes the mirror.
+
+## Mirror a line so a person can watch and take over
+
+A **mirror** sends the line to a *socket*, in both directions. Add `|socket:PORT` to any
+endpoint. A second person can then type `nc localhost PORT` (or `telnet localhost PORT`; a new
+Mac has `nc` but no `telnet`) to see every character that the guest prints, and can also **type
+on the line**:
+
+```
+pascal100> CONNECT if1:a console|socket:2323
+```
+
+The guest talks to your terminal as before. The usual use is a console that a program drives. A
+person connects, watches the program work, and types when they want to.
+
+The mirror adds no echo. The watcher sees what the guest sends, and what the watcher types goes
+to the guest. A password that the guest does not echo stays hidden. One watcher can connect at a
+time.
+
+Add `?ro` to make the mirror **watch-only**:
+
+```
+pascal100> CONNECT if1:a console|socket:2323?ro
+```
+
+A slow watcher never slows the guest. The watcher loses some output, and the guest loses no
+bytes. `SHOW` prints the mirror, and `CONFIG SAVE` saves it.
+
+`nc` and `telnet` stop when the simulator stops, and Windows installs neither. The scripts
+`tools/mirror-watch.sh` and `tools/mirror-watch.ps1` in the package watch a mirror, and connect
+again when the simulator starts again. They only watch. The chapter *The MCP server* describes
+them.
+
+### A mirror on a pseudo-terminal
+
+On macOS and Linux, a mirror can go to a **pseudo-terminal** as an alternative to a socket. A
+terminal program, such as `screen`, `minicom` or `cu`, opens a pseudo-terminal as it opens a
+serial port. Add `|pty` to any endpoint:
+
+```
+pascal100> CONNECT if1:a console|pty
+if1:a: connected to console|pty
+mirror: /tmp/pascal1000 (/dev/ttys004)
+```
+
+The first mirror is `/tmp/pascal1000`, and the next one is `/tmp/pascal1001`. A second person
+types `screen /tmp/pascal1000` to watch the line and to type on it. The name is a link to the
+device in the brackets, and the program removes the link when the line disconnects.
+
+To select the name, give a path after `pty:`. A path that is not absolute is relative to the
+folder of the machine file. Use this form in a machine file, because the name stays the same:
+
+```
+pascal100> CONNECT if1:a console|pty:/tmp/console
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  connect = "console|pty:/tmp/console"
+```
+
+`?ro` makes this mirror watch-only also. When no program has the name open, the mirror discards
+what the guest prints. If `pty:` names a file that is not a link, the program refuses, and does
+not replace the file. Windows has no pseudo-terminal, and refuses `|pty`.
+
+### A mirror on a serial port
+
+A mirror can go to a **serial port** on your computer. A hardware terminal, or a second
+computer with a terminal program, then watches the line and types on it. Add `|serial:DEVICE`
+to any endpoint:
+
+```
+pascal100> CONNECT if1:a console|serial:/dev/cu.usbserial-AL009KFH
+if1:a: connected to console|serial:/dev/cu.usbserial-AL009KFH
+mirror: /dev/cu.usbserial-AL009KFH at 9600 baud
+```
+
+The port is 8 data bits, no parity and 1 stop bit, with no flow control. The rate is 9600 baud.
+`?baud=N` selects a different rate, and the terminal must use the same one. No board programs
+this port, as it does for `serial:` as an endpoint, so the rate is part of the mirror:
+
+```
+pascal100> CONNECT if1:a console|serial:/dev/cu.usbserial-AL009KFH?baud=19200
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  connect = "console|serial:/dev/cu.usbserial-AL009KFH?baud=19200"
+```
+
+`?ro` makes this mirror watch-only also. Use `&` to give two options:
+`serial:COM3?baud=19200&ro`.
+
+Three things are different from a socket or a pseudo-terminal:
+
+- **The program cannot tell when a terminal is there.** The mirror sends the output to the port
+  at all times. A terminal that you connect later shows the output that is still waiting to go,
+  which is at most 256 KB, and the oldest output is discarded first.
+- **The port sets the speed.** At 9600 baud a long listing takes time to print, and the guest
+  does not wait for it. Only a terminal that falls behind loses the oldest text.
+- **A key that you type reaches the guest only while the guest runs.** This is the same as for
+  a socket.
+
+If the device does not open, the program refuses, and lists the serial ports that it can see.
+The port cannot be the same one that the line uses.
+
+## An endpoint that `CONNECT` does not understand is an error
+
+If the program cannot read your endpoint, it **refuses, and lists the forms that it accepts**:
+
+```
+pascal100> CONNECT if1:a sockit:2323
+no endpoint 'sockit:2323'. Try: console | null | loopback | scripted | socket:PORT[?banner] | socket:HOST:PORT |
+telnet:PORT[?banner=off] | telnet:HOST:PORT | serial:DEVICE | pty[:LINK] |
+in:PATH | out:PATH | terminal[?emulation=vt100&size=80x24] | printer:QUEUE |
+<endpoint>|FILE | <endpoint>|socket:PORT | <endpoint>|pty[:LINK] |
+<endpoint>|serial:DEVICE[?baud=N]
+```
+
+It never uses `null` in its place. A machine that boots and prints nothing sends you to look for
+the fault in the wrong place.
+
+## The console settings change bytes, and a line does not
+
+**The console settings are the only part of the program that changes a byte. Every serial line
+is 8-bit clean.** No board has a setting that clears a bit.
+
+| Setting | What it does |
+|---|---|
+| `upper` | changes what you type to upper case |
+| `strip7in` | clears bit 7 of every character that you type |
+| `strip7out` | clears bit 7 of every character that the guest prints |
+| `crlf` | changes line endings |
+| `echo` | shows your keys locally |
+| `bell` | rings the bell of your terminal on `Ctrl-G` |
+| `bsdel` | makes Backspace and Delete send the same code: `off` (the default), `bs`, or `del`. The `default` machine sets `bs`, and also `strip7out`. `SHOW CONSOLE` shows the values in use |
+| `stop` | the STOP key, a control character. The default is `Ctrl-E`. `attn` is the same setting |
+| `base` | `hex` or `octal`: how the **monitor** prints numbers. It does not change a byte |
+
+Set them with `CONSOLE k=v`, or `SET CONSOLE k=v`. You can give several at one time:
+
+```
+pascal100> CONSOLE strip7out=on
+pascal100> CONSOLE upper=on crlf=off
+pascal100> CONSOLE stop=1D
+```
+
+In a machine file:
+
+```toml
+[console]
+strip7out = true
+upper     = true
+crlf      = false
+stop      = 0x1D
+```
+
+`[console]` is a table of its own, not a `[[board]]`. A setting that is `on` or `off` at the
+monitor is `true` or `false` in the file.
+
+`stop=1D` moves the STOP key from `Ctrl-E` to `Ctrl-]`. **The STOP key must be a control
+character**, so that you cannot press it by accident in the middle of a word.
+
+### Why bit 7 belongs to the console
+
+Some programs **set bit 7 of the last character of every message**, to mark the end of the
+string. `E` is `45`, and with bit 7 set, it is `C5`. Your terminal prints whatever `C5` means to
+it.
+
+On the real machine, the board sent all eight bits. A Teletype at the other end **did not read
+bit 7**, because on a Model 33 bit 7 is the parity position. It printed `E`. **`strip7out` is
+the terminal that does not read bit 7**, so it belongs on the console, not on the board.
+
+A 7-bit mask on the board would fix the message, and it would also **damage every XMODEM
+transfer through that port**. XMODEM sends binary data, and bit 7 is a real bit in half of its
+bytes. A line can carry binary. Only the terminal knows that it shows text.
+
+### Where the console settings stop
+
+The settings belong to the console, so they stop where the console stops:
+
+```
+pascal100> CONSOLE strip7out=on
+console: strip7out=true
+pascal100> CONNECT if1:a socket:2323
+if1:a: connected to socket:2323
+```
+
+Connect with telnet, and the wrong character is back. The same is true of `upper`, `crlf`, `echo`,
+`bell` and `bsdel`, and of a `serial:` port. The console settings are still on, but the byte no
+longer goes through the console. It goes from the Interfacer 1 to the socket to your telnet client, and
+every step on that path is 8-bit clean.
+
+Set the same thing on the terminal that shows the text. Every terminal program and telnet client
+has these settings, with its own names: strip parity or 7-bit display for `strip7out`, local
+echo for `echo`, and newline handling for `crlf`.
+
+The STOP key also belongs to **your keyboard**. The program never looks for it on a socket or a
+serial line. A `05` that comes down a cable is part of somebody's data.
+
+### The built-in terminal has these too
+
+The built-in `terminal` window draws the text itself, so it has the same kind of settings, under
+`[terminal]` in place of `[console]`:
+
+| Setting | What it does |
+|---|---|
+| `upper` | changes what you type to upper case |
+| `strip7in` | clears bit 7 of every character that you type |
+| `strip7out` | clears bit 7 of every character that the guest prints |
+| `crlf` | adds an LF after every CR that the guest prints. Off by default |
+| `echo` | shows your keys locally, for half-duplex software |
+| `bell` | passes `Ctrl-G` to the terminal. On by default |
+| `bsdel` | makes Backspace and Delete send the same code: `off` (the default), `bs`, or `del` |
+| `titlebar` | shows the title of the unit on a bar at the top of the window. On by default |
+
+Set them with `SET TERMINAL k=v`, read them with `SHOW TERMINAL`, or put a `[terminal]` table in
+a machine file. The settings apply to the `terminal` line that is open.
+
+```
+pascal100> CONNECT if1:a terminal
+pascal100> SET TERMINAL strip7out=on
+```
+
+In a machine file:
+
+```toml
+[[board]]
+id = "if1"
+
+  [board.unit.a]
+  connect = "terminal"
+
+[terminal]
+strip7out = true
+```
+
+`strip7out` is useful for a program that sends **even parity**. Such a program puts parity in
+bit 7 of every character, so it can send a carriage return as `8D`. In the terminal window, `8D` is
+not a carriage return, and every line feeds without going back to the left. `strip7out=on` fixes
+this. `crlf=on` is for a guest that sends a CR alone and expects the terminal to add the LF.

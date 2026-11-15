@@ -1,0 +1,74 @@
+# CompuPro CP/M 2.2K on a Z80, an Interfacer 1 console, a Disk 1 and 64K of RAM.
+#
+#     cd examples/cpm22 && pascal100 cpm22-buffered.toml
+#     -> CP/M boots and you land at the A> prompt. Type DIR to see the disk.
+#
+# THIS FILE IS THE WHOLE MACHINE. Each [[board]] table below is one card in the backplane.
+# Nothing comes from a built-in machine.
+#
+# THE BOOT. After a reset, the Disk 1 boot EPROM answers at 0000. RUN 0 starts it: the EPROM
+# reads track 0 of drive 0 and starts CP/M, as on the real machine.
+#
+# THE DISK is cpm22k-64k.dsk: CompuPro's 64K CP/M 2.2K with the BIOS at F300, the Digital
+# Research tools, MAC and Z80.LIB, LS, the host bridge tools R, W and HDIR, and the FujiNet tools.
+#
+# Drive 0 is read/write, as on a real machine. Copy the image first if you test writes.
+
+[machine]
+name    = "cpm22-buffered"
+bus     = "ieee696"          # IEEE 696 (S-100), the only bus pascal100 has
+startup = ["RUN 0"]
+
+# THE CPU: a generic Z80 card, flat out (clock_hz = 0). SET cpu0 clock_hz=4000000 gives a 4 MHz
+# card with the real waiting.
+[[board]]
+type     = "z80"
+id       = "cpu0"
+clock_hz = 0
+
+# THE CONSOLE: channel A of a CompuPro Interfacer 1 at 00-01, the port CP/M 2.2K uses. `console`
+# is the terminal you started pascal100 in. Channel B at 02-03 is not connected.
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "console"
+
+# The Backspace key sends DEL; CP/M wants BS.
+[console]
+bsdel = "bs"
+
+# THE DISK 1 at C0, boot routine 4: after a reset its EPROM answers at 0000-00FF (reads only)
+# and reads track 0 of drive 0 by DMA.
+[[board]]
+type = "disk1"
+id   = "fd0"
+port = C0
+
+  [[board.drive]]
+  unit  = 0
+  mount = "cpm22k-64k.dsk"
+
+# THE HOST BRIDGE at B0, for the R, W and HDIR utilities. hostdir "" = the folder you started
+# pascal100 in.
+[[board]]
+type    = "hostbridge"
+id      = "hb0"
+port    = B0
+hostdir = ""
+
+# THE MEMORY: 64K of RAM in segment 00, 16-bit capable, filled at random as real static RAM is.
+# It gives way to the Disk 1 EPROM on reads while the EPROM is on (honors_phantom).
+[[board]]
+type           = "memory"
+id             = "mem0"
+fill           = "random"
+honors_phantom = "read"
+ext            = true
+sixteen_bit    = true
+
+  [[board.region]]
+  type = "ram"
+  at   = 0000
+  size = "64K"

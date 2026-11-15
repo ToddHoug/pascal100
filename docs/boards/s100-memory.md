@@ -1,0 +1,419 @@
+# `memory` — Static memory card (RAM and/or ROM)
+
+**Status:** done. **The first board, and for a while the only one.**
+
+## The real hardware
+
+Period S-100 memory cards are a **base address** and a set of **populated areas**, both set by jumpers, DIP switches, and which sockets you actually filled. Several cards live in one machine and together they make up the memory map.
+
+Three facts about real cards drive this design. The first two are commonly missed; the third is the one that shapes the whole board.
+
+1. **A card was frequently only partly populated.** You bought a 16K card and soldered in 4K of chips, meaning to fill it later. The card decoded its full range but **only answered where the chips actually were.** So "size" and "which addresses respond" are *not* the same thing.
+2. **RAM contents are lost when power is removed — and only then.** Pressing the reset button does not clear memory, and a board that clears its store on RESET\* is modeling a machine nobody ever built.
+3. **One card could carry both RAM and ROM, in several areas at once.** A PROM card is a row of sockets — four 2708s at F000/F400/F800/FC00 — and any of them may be empty. Combo RAM+ROM cards existed too.
+
+## Why one board and not two
+
+An earlier draft had a `ram` board and planned a separate `rom` board. That is wrong, and fact 3 is why: a real card may hold **two ROM areas and two RAM areas**, and modeling it as four boards would put four lines in `BOARDS` for one physical card — breaking the premise the whole bus model rests on, that a board *is* a card.
+
+So there is **one `memory` board, holding a list of regions.** A region is *an area of the card that is populated with something*:
+
+| Region `type` | Reads | Writes |
+|---|---|---|
+| `ram` | from the store | **stored** |
+| `rom` | from the store | **not decoded** |
+
+That is the only difference between them. A ROM socket and a RAM chip-range are otherwise the same thing, and collapsing them makes the board *smaller*, not bigger: an unpopulated ROM socket and an unpopulated RAM page are now the same case, handled by the same page map, floating to the same `0xFF`.
+
+### There is no write-protect on this board
+
+An earlier draft also modeled the Altair front panel's **PROTECT / UNPROTECT** here. It is gone, at Patrick's direction (2026-07-11), and the reason is worth keeping because someone will otherwise re-add it.
+
+Protect was standing in for *"load a HEX file and treat it as ROM."* It is the wrong tool for that, and the reason is fact 2: **RAM is lost at power-off.** So the image has to be re-loaded on every power cycle — and the protect map *survives* while the bytes do not, leaving a region that is confidently marked protected and full of garbage. A `rom` region re-reads its file on power-up, which is what a PROM does.
+
+> If the front-panel feature is ever wanted as a *replica*, it comes back — but it needs a manual first (its granularity is unsourced; `DESIGN.md` §0.1), and it must not be reintroduced merely because "ROM ought to be write-protectable." **ROM is not protected RAM. It is a region that does not decode writes.**
+
+## Sources
+
+| Source | Path | Authority |
+|---|---|---|
+| Page granularity, size shortcuts | Patrick (2026-07-11) | 256-byte (100H) pages; `48K`/`64K` shortcuts. |
+| **A reset never clears RAM; only power-off does** | Patrick (2026-07-11) | See *Reset*, below. |
+| **One card may hold several RAM and ROM areas** | Patrick (2026-07-11) | Hence regions, and hence no separate `rom` board. |
+| No write-protect | Patrick (2026-07-11) | See above. |
+
+> This card is a *generic* memory board, not a replica of a specific part number — it is not claiming to be an 88-16MCS and should not pretend to be.
+
+## Register reference
+
+**No registers at all.** The board decodes memory cycles only, claims no I/O port, and the guest cannot reconfigure it. Regions are *configuration*.
+
+## Regions
+
+```toml
+[[board]]
+type = "memory"
+id   = "mem0"
+honors_phantom = "all"         # a jumper: another board pulls PHANTOM*, do I switch off?
+                               #   none | read | all.  "read" = off for reads, still
+                               #   answering writes -- what a Tarbell needs beneath it.
+
+  [[board.region]]
+  type = "ram"
+  at   = 0x0000
+  size = "48K"                 # 0000-BFFF
+
+  [[board.region]]
+  type = "rom"
+  at   = 0xF000
+  mount = "roms/monitor.bin"   # 2048 bytes -> decodes F000-F7FF
+
+  [[board.region]]
+  type = "rom"
+  at   = 0xFF00
+  mount = "roms/boot.hex"      # 256 bytes  -> decodes FF00-FFFF
+```
+
+**A `rom` region's size comes from its image**, rounded up to a 100H page. A short image decodes a short range — drop a 256-byte boot PROM anywhere and it occupies one page.
+
+### Built-in ROMs — `mount = "builtin:<name>"`
+
+**The common ROMs are compiled into the simulator.** There is no portable place to put ROM images across macOS, Linux, and Windows — `/usr/share`, `~/Library`, `%APPDATA%`, and "next to the binary" are four different answers, and every one of them is a support question. ROMs are small (a boot PROM is 256 bytes; a monitor is 2K), so they are embedded and the question disappears:
+
+```toml
+  [[board.region]]
+  type  = "rom"
+  at    = 0xF000
+  mount = "builtin:ssm-8080mon" # compiled in. Works on a fresh checkout, on any OS,
+                               #   with no download and nothing to install.
+
+  [[board.region]]
+  type  = "rom"
+  at    = 0xF800
+  mount = "roms/my-boot.hex"   # a bare path is still a host file. Yours wins.
+```
+
+The `builtin:` prefix follows the same scheme idiom the design already uses for `connect` (`socket:`, `serial:`, `in:`/`out:`, `console`) — so it needs no new grammar, and `CONFIG SAVE` round-trips the string `builtin:ssm-8080mon` rather than a wad of bytes.
+
+**Every built-in ROM must have a provenance row in `docs/roms.md`** — what it is, where the dump came from, its exact size, and its CRC32. This is `DESIGN.md` §0.1 applied to binaries: *an embedded blob with no source is a second-hand fact*, and a ROM that silently differs from the real part is the single most expensive bug this project could ship, because every piece of software above it would be debugged against the wrong ground truth. A unit test verifies each CRC at build time, so a corrupted embed fails the build instead of failing a user.
+
+```
+pascal100> SHOW ROMS
+name        file            size  CRC32     decodes    description
+ddboot      DDBOOT.HEX       581  631C3AD5  F000-F24D  Jade Double D host boot PROM (DDBOOT, CP/M 2.2 Release 2) at F000 -- starts the board Z80, loads CP/M; console at ports 00/01
+ddboot-2sio DDBOOT2.HEX      581  A017E174  F000-F24D  Jade Double D host boot PROM (DDBOOT), patched for an 88-2SIO console at ports 10/11 -- starts the board Z80, loads CP/M
+disk1       DISK1.HEX       2048  EBA8EE41  0000-07FF  CompuPro Disk 1 boot EPROM (2716; routines 4-7 for the 8080/Z80, 0-3 for the 8086)
+disk1a      291B_1.HEX      8192  93DBAEF4  0000-1FFF  CompuPro Disk 1A boot EPROM (2764, sixteen 512-byte routines)
+ssm-8080mon SSM-8080MON.HEX 2008  27636BB0  F000-F7FF  SSM 8080 System Monitor V1.0 by C. E. Ohme (2K EPROM, F000-F7FF)
+tarbell-sd  TARPROM.HEX       32  55E3446D  0000-001F  Tarbell floppy boot PROM -- 32-byte cold-start bootstrap (reads T0/S1 to 0000, jumps 07D)
+
+Use as: mount = "builtin:<name>".  The description names who wrote each one,
+and the CRC32 says exactly which image this is; full provenance is in the
+project's source tree, not in the package.
+```
+
+Built-ins are a **convenience, never a lock-in**: a path always overrides, so anyone with a different dump of the same part can use it without patching the simulator.
+
+**`F800`–`FEFF` above is an empty socket.** The board does not decode it. If nothing else in the machine does either, it floats to `0xFF` (see below). This needed no new mechanism: an empty ROM socket and an unpopulated RAM page are the same case.
+
+**Regions are sub-units**, exactly like the 88-DCDD's drives and the 88-2SIO's units, so the existing `id:unit` addressing already reloads a socket with no new monitor syntax:
+
+```
+pascal100> MOUNT mem0:rom0 newmon.hex
+mem0:rom0: mounted newmon.hex
+```
+
+### An empty socket is still a socket
+
+A `rom` region with **no `mount`** is a socket with no chip in it, and that is an ordinary thing for a card to be — a four-socket PROM board with two chips in it is a machine somebody actually owned. It decodes nothing, so those pages float; it still has a unit name, so you can `MOUNT` a chip into it.
+
+**`UNMOUNT` pulls the chip. It does not unsolder the socket.** The region stays, empty, and keeps its name. This is not fussiness: the sockets are **numbered**, so erasing the region would renumber every socket behind it — pull the chip out of `rom0` and the chip sitting in `rom1` would silently *become* `rom0`, and `MOUNT mem0:rom0` would then put it in the wrong socket. You cannot unsolder a socket by pulling its chip.
+
+`BOARDS` shows it as `rom1(empty)` in UNITS, and it is **absent from the memory column** — because the memory map is a map of what is decoded, and an empty socket is not.
+
+## More than 64K on one board: `ext = true`
+
+IEEE 696 has two kinds of memory addressing (2.2.2): **standard**, A0-A15 (64K), and
+**extended**, A0-A23 (16M). `ext` chooses between them:
+
+- **`ext = false`** (the default): standard addressing. The board does not look at A16-A23, so it
+  answers in every 64K segment, and it holds at most 64K. Region `at` is 0000-FFFF.
+- **`ext = true`**: extended addressing. Region `at` is a 24-bit bus address, and a region may be
+  any size up to the top of the 16M space. One board can be a 128K or a 1M block, or hold blocks
+  in unrelated segments.
+
+```toml
+[[board]]
+type        = "memory"
+id          = "mem0"
+ext         = true            # decode A16-A23
+sixteen_bit = true
+
+  [[board.region]]
+  type = "ram"
+  at   = 000000
+  size = "128K"               # 000000-01FFFF
+```
+
+- The board answers only where its regions are. A region may cross a segment boundary:
+  `at = 008000` with `size = "64K"` is 008000-017FFF.
+- Without `ext`, a region larger than 64K or above FFFF is refused, and the message says to set
+  `ext = true`. `SET ... ext=false` is refused while a region does not fit in 64K.
+- A ROM region may sit anywhere in the 16M space. A HEX image places itself with 24-bit addresses
+  (type 04 records); a binary image, or one with `relocate = true`, goes to `at`.
+- `pages`, the region list, `CONFIG SAVE` and `SHOW BUS MAP` print 24-bit addresses with `ext`.
+- 16-bit transfers, the PROM burner (`Machine::burn`), `SNAPSHOT`/`RESTORE` and `CONFIG SAVE`
+  all cover the whole board.
+- Storage: one 64K plane for each segment a region uses, so a board with RAM at 000000 and a ROM
+  at FF0000 costs 128K, not 16M.
+
+The board is a generic block of 8- or 16-bit memory, not a model of one card. It has no rule such
+as "128K starts on an even segment"; set the regions where the real card's switches put them.
+
+## How it is simulated
+
+**The page is the unit of everything: 256 bytes (100H).** A 64K space is 256 pages, `00`–`FF`. The board keeps one page map — *which region, if any, owns this page?* — and it drives `decodes()`. With `ext = true` (see "More than 64K on one board" above) the map has 256 pages for each of the 256 segments:
+
+```cpp
+bool MemoryBoard::decodes(const BusCycle& c) const {
+    // Someone ELSE is shadowing me; I switch OFF. A card does not shut itself
+    // off with a signal it is itself driving -- without `!assertsPhantom(c)` a
+    // ROM card honors its own assertion, nobody drives the address, and the ROM
+    // reads back FF. That was a real bug; the acceptance tests caught it.
+    if (c.phantom && honors(c) && !assertsPhantom(c)) return false;
+    const Region* r = owner(key(c));  // key: A0-A15, or A0-A23 with `ext`
+    if (!r) return false;                            // empty socket / unpopulated page
+    if (c.type == Cycle::MemWrite && r->kind == Rom) return false;   // <- ROM never answers a write
+    return true;
+}
+
+uint8_t MemoryBoard::read (const BusCycle& c) { return store_[plane(c.addr)]; }
+void    MemoryBoard::write(const BusCycle& c) { store_[plane(c.addr)] = c.data; }
+```
+
+That is the whole board. Note what `write()` does **not** contain: any check at all. **A write that reaches the board is stored, unconditionally** — because a real static RAM chip that is selected with `WE` asserted *stores the byte*; it has no opinion. And a write can only reach the board if `decodes()` let it, which a ROM region never does.
+
+### Writes to ROM — the board does not decode them
+
+**A `rom` region does not "reject" a write, or "ignore" it, or log it. It never answers the cycle.** This is the single most important line in this document, because everything else falls out of it and nothing needs a special case.
+
+What happens *next* is emergent, decided by what else is in the machine — **the bus arbitrates nothing** (`DESIGN.md` §4.2):
+
+| What else covers that address | This board's `phantom` strap | A guest write does |
+|---|---|---|
+| Nothing | any | **Nothing latches it. The byte is gone.** The write half of the floating bus. |
+| Another card's RAM | `read` | **Lands in that RAM.** Reads still come back from ROM — shadow-RAM. This is how the **Tarbell** boot PROM loads a sector into the RAM it is sitting on top of. |
+| Another card's RAM | `all` *(default)* | That card honors PHANTOM\* and switches itself off for writes too. **The write vanishes.** |
+
+The `read` row is a genuine footgun and it is *supposed* to be: write `42` to a shadowed address, read it back, and you get the ROM byte. That is correct hardware and it will still confuse you at 1am, so `DUMP` annotates bytes that came from a phantom overlay (§10.2).
+
+### Getting bytes *into* a ROM region
+
+The guest cannot write ROM. **The operator can**: `LOAD <file> ROM` is the PROM burner. It
+reaches behind the bus, straight into the board's store. A plain `LOAD` writes through the bus,
+so a ROM does not take it, and `LOAD` says how many bytes landed nowhere:
+
+```
+pascal100> LOAD newmon.hex ROM          ; the PROM burner. Not a bus cycle.
+loaded 2008 bytes (8 pages) from newmon.hex (00F000-00F7FF) (ROM override)
+
+pascal100> DEPOSIT F000 41              ; a bus cycle. mem0 doesn't decode it.
+F000: no board decodes writes here (mem0 answers reads -- it is ROM). byte discarded.
+                                        ; ^ not silence. see Quirks.
+```
+
+That distinction is not a simulator convenience — it is physically what happens. Burning a PROM is *not a bus operation*; you pull the chip and put it in a programmer. Modeling it as a bus write would require the bus to know who originated a cycle, which a real backplane cannot know and which no board should ever have to ask.
+
+Intel HEX carries its own load addresses, so the file places the bytes; a `.bin` needs `AT`. The loader is already specified (§10.3), checksums every record, and fails loudly with the record number.
+
+### The floating bus
+
+**An unpopulated page needs no special case.** The board just doesn't decode it. If no *other* board does either, nobody drives the bus, it floats high, and **the CPU reads `0xFF`** — the same rule that yields `RST 7` on an unvectored interrupt (`DESIGN.md` §4.4). One mechanism; unpopulated memory and empty ROM sockets both fall out of it for free.
+
+A **write** to an unclaimed address is the mirror image: nobody latches it, and it is simply gone.
+
+### PHANTOM\* — this board both honors and asserts it
+
+`honors_phantom` is a **jumper on real cards**, so it is a config property (`DESIGN.md` §4.2). When another board pulls PHANTOM\* (S-100 pin 67) for a cycle, a card strapped to honor it **takes itself off the bus for that cycle**. Nobody arbitrates; the asserting board is simply the only one still answering.
+
+`phantom` is the other half — **this** board's assert strap, `none | read | all`:
+
+- **`all` (default)** — assert on reads *and* writes in my ROM regions. A ROM that shadows completely. This is what you want when you mean "treat this as ROM."
+- **`read`** — assert on reads only. Writes fall through to whatever is underneath: **shadow RAM**.
+- **`none`** — never assert. If another card's RAM sits under this one's ROM, they both drive, and that is **real bus contention** — reported (§4.6), and exactly the bug a real backplane would have handed you. Do not "fix" it in the bus.
+
+> ### `phantom = read` — sourced. The card is the Tarbell.
+>
+> **Settled 2026-07-11 by Patrick.** The **Tarbell single-density floppy disk controller** carries a 32-byte boot PROM and asserts PHANTOM\* **on reads only**: while it is shadowing, *"the memory boards installed in the system must allow writes to their RAM, but not reads."* That is `phantom = read`, exactly, and it is a real card doing a real job — the bootstrap needs to **write the sector it is loading into the RAM underneath itself.** See `docs/boards/tarbell-sd.md`.
+>
+> **This box used to say the opposite,** and the history is worth keeping. Earlier drafts justified `read` by claiming it was "what the DBL boot PROM wants." **I fabricated that**, and the ROM disproves it: DBL copies itself to `2C00` and runs there, so it never writes to `FFxx` at all. The strap was right; my reason for it was invented. The lesson is not "the guess worked out" — it is that a fabricated citation was **indistinguishable from a real one** until someone checked, and the real one turned out to be a different card doing a different thing for a different reason. §0.1 stands.
+>
+> **Where the read/write distinction lives — corrected 2026-07-12 by Patrick, from the Tarbell schematic.** It lives on the **honoring** board, which is why `honors_phantom` is `none | read | all` and not a bool. The Tarbell holds PHANTOM\* asserted continuously, like an interrupt, from RESET until A5 releases it — on reads *and* writes. It does **not** AND the pin with its read strobe.
+>
+> This box previously argued the reverse, in bold, and told the reader that `honors_phantom` "must never grow a `read` mode." That was reasoned, not sourced. And the quote directly above it — *"the memory boards installed in the system must allow writes to their RAM, but not reads"* — was saying so all along. **The memory boards.** Reading past a source to keep an argument is the same failure as inventing one.
+
+## Banking is a different board
+
+This board has **no** banking and **no** I/O port. Bank switching lives on its own board, `bankmem` — see `docs/boards/bankmem.md`. A banked card decodes an I/O port that swaps a whole 64K plane underneath the same address range, which is different enough hardware, with a genuinely different decoder on every real card, that folding it into this one was the mistake. This board stays what fact 3 above already made it: plain, unbanked RAM and ROM.
+
+This board is also the honest model of the **SD Systems ExpandoRAM I**: unlike the boards on `bankmem`, the ExpandoRAM I has **no I/O port at all** — it is static-strapped memory, no different from a jumper-configured 16K board — so it belongs here, not there.
+
+## Fill on power-up — real RAM does not come up zeroed
+
+`fill = zero | random`, applied to `ram` regions. **`random` is the honest default for a bench**, because real static RAM powers up in an indeterminate state, and software that *assumes* zeroed memory is buggy software that a zero-filling simulator will never catch. `zero` is available because it makes failures reproducible when you are chasing something else.
+
+> **`random` must take a `seed`, and the seed must go in the snapshot** — otherwise it is a source of nondeterminism outside the `EventQueue`, and deterministic replay (§13) is dead the first time you need it. Exactly the class of thing §7.5 exists to prevent.
+
+`rom` regions are not filled. They are **re-read from their files** on power-up.
+
+## Properties
+
+| Property | Type | Runtime? | Meaning |
+|---|---|---|---|
+| `region` | Region[] | config | The populated areas. Each is `type` (`ram`\|`rom`), `at` (page-aligned), and either `size` (ram) or `mount` (rom). |
+| `pages` | PageMap | **read-only** | The composite page map, as a range list — which pages this board answers for. **Derived from the regions**, and not a key you may set: the regions are the truth, and a page map you could edit behind them would be a second, disagreeing one. |
+| `honors_phantom` | Enum | config | A **jumper**. Another board pulls PHANTOM\* — do I switch off? `none` (never), `read` (reads only), `all`. Default `all`. |
+| `phantom` | Enum | config | What **I** assert over my `rom` regions: `none \| read \| all`. Default `all`. |
+| `fill` | Enum | config | `random` (default) or `zero`. Applies to `ram` regions. |
+| `seed` | Int | config | RNG seed for `fill=random`. **Snapshotted**, so replay stays deterministic. |
+
+There are **no board-specific commands**, and the monitor learns nothing about memory. What a
+card decodes is decided by the regions you declare, in the machine file — there is no runtime
+verb that punches a hole in a populated card.
+
+`SHOW mem0` prints the regions, the sockets, and the properties:
+
+```
+pascal100> SHOW mem0
+mem0  (memory)
+  regions:
+    0  ram  0000-DFFF  56K
+    1  rom  F000-F7FF  builtin:ssm-8080mon
+
+  unit     kind    holds
+    rom0    rom     builtin:ssm-8080mon  (read-only)
+
+  property         value            legal
+  honors_phantom   all              none|read|all
+  phantom          all              none|read|all
+  fill             random           zero|random
+  seed             1
+  ext              false            true|false
+  sixteen_bit      false            true|false
+  pages            0000-DFFF,F000-F7FF (read-only)
+
+  [[board.region]]  (in a machine file)
+
+  key              type             legal
+  type             enum             ram|rom
+  at               int              0000..FFFFFF
+  size             int              1..16777216
+  mount            string
+  relocate         bool             true|false
+```
+
+**`pages` is the hole, stated as a range list.** This card answers for `0000-DFFF` and
+`F000-F7FF` and nothing else, so `E000-EFFF` and `F800-FFFF` are unpopulated and reads there float to `FF`. That
+is the difference between a user understanding their machine and filing a bug — a hole in memory
+is invisible otherwise. And a `rom` region does not decode writes at all, which is the single
+most confusing thing this board can do to you: the write does not fail, it simply never happened.
+
+## Multiple cards
+
+Several `memory` boards coexist, each with its own regions and maps — which is what a real backplane looks like, and it exercises multi-board decode and contention (§4.6):
+
+```toml
+# A plain 16K RAM card at the bottom of memory.
+[[board]]
+type = "memory"
+id   = "mem0"
+fill = "random"           # real RAM powers up indeterminate
+seed = 12345              # ...but reproducibly so. Snapshotted; replay stays deterministic.
+  [[board.region]]
+  type = "ram"
+  at   = 0x0000
+  size = "16K"
+
+# A second, static-strapped card above it -- an SD Systems ExpandoRAM I has
+# no I/O port, so it is plain memory too, not a bankmem card.
+[[board]]
+type = "memory"
+id   = "mem1"
+  [[board.region]]
+  type = "ram"
+  at   = 0x4000
+  size = "48K"
+```
+
+Overlap two cards and the bus reports it, naming both.
+
+## Reset
+
+**A reset never changes memory. RAM is lost only when the machine is powered off.** (Patrick, 2026-07-11.) Say it out loud, because the code will be tempted to conflate the two.
+
+| Event | Monitor | `ram` contents | `rom` contents | `pages` |
+|---|---|---|---|---|
+| **Power applied** | `POWER` | **indeterminate** — filled per `fill` | **re-read from their files** | configured |
+| **`Reset::PowerOn`** (POC\*) | *(part of `POWER`)* | untouched | untouched | untouched |
+| **`Reset::Bus`** (RESET\*, the front-panel button) | `RESET` | untouched | untouched | untouched |
+
+POC\* and power coming up coincide on real hardware, which is why they share the `POWER` command — but they are **different things**, and the memory array is the proof: a RAM chip has no POC\* pin. Its contents are indeterminate because *the chips just powered up*, not because a signal arrived. Model the fill as belonging to power, and let both resets leave the store alone.
+
+**A reset on this board touches nothing at all** — there is no bank latch here to clear. (`bankmem` has its own reset behavior; see `docs/boards/bankmem.md`.)
+
+And the trap in the other direction: *"my program vanished when I hit reset"* reads like a memory-model bug rather than a reset bug, and will cost you a day.
+
+## Quirks reproduced
+
+| Quirk | If you get it wrong |
+|---|---|
+| **A `rom` region does not decode writes** — it does not reject them | Reject them *in the board* and "writes fall through to the RAM underneath" becomes a special case in the bus, which is the mistake §4.2 exists to prevent. |
+| **Unpopulated pages read `0xFF`**, not `0x00` | Memory-sizing routines find 64K on every machine and CP/M builds itself the wrong size. A zero-filled hole also disassembles as a field of `NOP`s, which is a uniquely confusing thing to stare at. |
+| **A write to ROM with nothing beneath is silently gone** | It has to be — nothing latched it. But **report it at the monitor** when the operator does it by hand, or `DEPOSIT` looks broken. Do *not* report it for guest writes: period software scans memory by writing and reading back, and it would spew. |
+| **A reset preserves memory; only power-off clears it** | Clear on reset and the user's program vanishes on a reset-button press — which reads like a memory-model bug, not a reset bug. |
+| **A partially-populated card decodes only where chips are** | Model `size` as a plain contiguous range and holes become inexpressible — a real 16K card with 4K fitted cannot be represented at all. |
+| **RAM powers up with indeterminate contents** | Zero-fill and you will never catch guest code that assumes zeroed memory — until it runs on real hardware. |
+
+## Limitations and deliberate departures
+
+- **This card is generic, not a specific period part.** Its jumper semantics are ours. A modeled MITS 88-16MCS would get its own doc.
+- **A `rom` region's size comes from its image file**, rounded up to a page. Real cards decode a whole chip's worth (a 2708 covers 1K whether or not the image fills it), and `at` would have to be chip-aligned. We take the file's word instead — simpler, and it lets a 256-byte boot PROM sit at FF00, which a strict 1K-chip model could not express.
+- **POC\*'s 200 ns minimum pulse width is not modeled.** It is an analog property of the reset circuit (and on real machines, an RC network that drifts — many owners fit a dedicated supervisor IC to get a clean edge). We assume a clean POC\*. Nothing in the digital model depends on the width.
+- **No parity, no error detection, no wait states.** Period cards had none worth modeling.
+
+## Verification
+
+These run in a machine with no CPU card in it, where **the monitor is the bus master** — `FILL` and `DUMP` originate real bus cycles with nothing else in the machine. (`DEPOSIT` is the front panel's switch, and like the panel it deposits through the processor, so step 6 adds a CPU board.) That is not a workaround; it is a free early test of the `BusMaster` abstraction (§3).
+
+**RAM and the floating bus**
+
+1. A 48K `ram` region; `DUMP C000-C0FF` returns **all `FF`**. The hole is real and reads float.
+2. `LOAD test.bin AT 0100`, `DUMP`, `SAVE`, `COMPARE` — byte-identical round trip. Same for Intel HEX.
+3. `FILL 0000-BFFF 00`, then `RESET` → contents **survive**. `POWER` → contents **re-filled** per `fill`.
+4. `fill=random` with a fixed `seed` → **byte-identical memory across two runs**, and the seed survives `SNAPSHOT`/`RESTORE`.
+
+**ROM regions**
+
+5. A `rom` region at FF00 from a 256-byte file decodes **FF00–FFFF and nothing else**; `DUMP FF00` shows the image.
+6. With a CPU board added, `DEPOSIT FF00 41` (a bus write) is **not decoded** — `DUMP FF00` is unchanged, and the monitor **says so** rather than silently succeeding.
+7. `LOAD other.hex RAW mem0` **does** change it. The operator has a PROM burner; the guest does not.
+8. An **empty socket** between two ROM regions (F800–FEFF above) reads `FF`, exactly like unpopulated RAM. One mechanism.
+9. A short image decodes a short range: a 2048-byte file at F000 owns F000–F7FF, and F800 is not this board's problem.
+
+**PHANTOM\* — all three straps, because the difference is silent**
+
+10. `phantom=all` (default), ROM over another card's RAM: reads come from ROM, and **a write vanishes** — the RAM beneath does not receive it.
+11. `phantom=read`, same setup: reads come from ROM, and **a write lands in the RAM beneath**. Read it back through the bus and you get the ROM byte; read it `RAW` from the RAM card and you get `41`. Shadow RAM, correctly.
+12. `honors_phantom=false` on the RAM card beneath: **both boards drive → contention reported**, naming both. This is a bug the real backplane would have handed you, and it must not be silently resolved.
+13. A phantom shadow is **not** reported as contention (§4.6) — only case 12 is.
+
+**Round trip**
+
+14. Two `memory` cards at overlapping bases → **contention reported**, naming both.
+15. `CONFIG SAVE` then `CONFIG LOAD` reproduces the regions and page map exactly.
+
+## References
+
+- `DESIGN.md` §4.1 (decode), §4.2 (PHANTOM\*), §4.6 (contention, the floating bus), §5 (properties), §6 (reset), §10.2 (`RAW`), §10.3 (Intel HEX), §10.3.1 (built-in ROMs).
+- `docs/roms.md` — the built-in ROM registry and its provenance rule.
+- `docs/boards/bankmem.md` — the banked-memory board (banking now lives there, not here).

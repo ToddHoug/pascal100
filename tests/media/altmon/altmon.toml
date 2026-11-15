@@ -1,0 +1,45 @@
+# ALTMON test machine: Mike Douglas's 1K Altair ROM monitor at F800 on a 2SIO console.
+#
+# A TEST FIXTURE, not a pascal100 machine (2026-11-09). The MCP tests (tests/test_mcp.cpp)
+# need a small guest that boots with no disk, prints a banner and answers commands. ALTMON
+# was that guest upstream; its ROM is kept here, mounted from this folder, not built in.
+# Upstream's `altmon` machine had an 8080, a front panel and an 88-DCDD; here it is a Z80 on
+# the IEEE 696 bus with no disk controller (a test that needs one adds it). ALTMON is 8080
+# code and runs unchanged on the Z80.
+
+[machine]
+name    = "altmon"
+bus     = "ieee696"
+startup = ["RUN F800"]
+
+[[board]]
+type     = "z80"
+id       = "cpu0"
+clock_hz = 0
+
+[[board]]
+type = "2sio"
+id   = "sio0"
+port = 10
+  [board.unit.a]
+  connect = "console"
+  baud    = 9600
+  [board.unit.b]
+  connect = "null"
+  baud    = 9600
+
+[[board]]
+type           = "memory"
+id             = "mem0"
+fill           = "random"
+honors_phantom = "read"
+ext            = true
+sixteen_bit    = true
+  [[board.region]]
+  type = "ram"
+  at   = 0000
+  size = "62K"
+  [[board.region]]
+  type  = "rom"
+  at    = F800
+  mount = "ALTMON.HEX"

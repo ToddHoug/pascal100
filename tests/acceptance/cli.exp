@@ -1,0 +1,198 @@
+#!/usr/bin/expect -f
+#
+# THE INTERACTIVE CLI SMOKE TEST -- the simulator driven through a REAL TERMINAL.
+#
+# Every other test in this suite drives the CLI through a pipe (`-s script`), and a pipe is
+# not a terminal. Three things only exist on a tty and are therefore untested by all of
+# them: line editing and the echoed prompt, ATTN (^E) handing the console back from the
+# guest, and the run loop's decision to pace -- or not to pace -- against a wall clock.
+# This test is the one that types.
+#
+# EXACT MATCHING, ALWAYS. `expect` patterns are GLOBS by default, so `expect "*"` matches
+# ANY output and `expect "  ?"` matches two spaces and ANY character. A test written that
+# way passes on a machine that is doing nothing at all -- ask me how I know. Every literal
+# below is `-ex`, and the one pattern that needs structure is `-re` and is anchored.
+#
+# Usage: expect -f tests/acceptance/cli.exp <path-to-pascal100>
+
+set timeout 30
+log_user 0
+
+set sim [lindex $argv 0]
+if {$sim eq ""} { puts "usage: cli.exp <pascal100>"; exit 2 }
+
+proc ok   {msg} { puts "ok    -- $msg" }
+proc fail {msg} { puts "FAIL  -- $msg"; puts "--- last seen ---"; puts $::expect_out(buffer); exit 1 }
+
+# `-m default` AND NOT A BARE `$sim`, which is what this was. A bare command line now
+# looks for ./pascal100.toml (src/main.cpp) -- and this test runs in the BUILD directory,
+# so the day anything drops a config there, every expectation below would be running
+# against somebody else's machine. This test is about the TTY, not about machine
+# selection; tests/acceptance/cwdconfig.cmake is the one that tests the looking.
+#
+# pascal100 2026-11-09: a NAMED machine FILE, for the same reason. Section 5 toggles in a
+# program for a 2SIO at 10h; pascal100's `default` has an Interfacer 1, so this runs the bare
+# 2SIO machine that 2sio-echo.exp uses (a Z80; the program is 8080 code and runs unchanged).
+set machine [file join [file dirname [file normalize [info script]]] .. programs 2sio 2sio.toml]
+spawn $sim $machine
+
+# ---- 1. THE BANNER REPORTS THE POLICY, NOT THE DIVISOR. ----
+# The last survivor of the `clock_hz = 0` lie. The machinery, SHOW and the docs were all
+# fixed on 2026-07-13; the banner went on printing hz()/1e6 -- and hz() is a DIVISOR that is
+# never 0 (core/clock.h), so a flat-out machine could only ever say "2 MHz". Nothing asserted
+# on this string, which is exactly how it survived. It is asserted now.
+expect {
+    -ex "z80, full speed." { ok "the banner says full speed, not 2 MHz" }
+    timeout                 { fail "the banner does not report a free-running machine" }
+}
+
+# ---- 2. It comes up, on a terminal, with a prompt. ----
+expect {
+    -ex "pascal100> " { ok "the monitor prompts on a tty" }
+    timeout           { fail "no prompt" }
+}
+
+# ---- 3. A command runs, and the machine describes itself. ----
+send "BOARDS\r"
+expect {
+    -ex "cpu0"  { ok "BOARDS lists the CPU card" }
+    timeout     { fail "BOARDS printed no cpu0" }
+}
+expect -ex "pascal100> "
+
+# ---- 3b. TAB COMPLETION and history recall -- both tty-only (DESIGN.md 10.4). ----
+# Neither exists under a pipe: getline sees no Tab and no escape sequences. Tab completes
+# a unique command prefix (BOAR -> BOARDS) and runs it; then the up-arrow recalls that same
+# line. Both are asserted by the command's own output coming back, not by the echoed line --
+# the editor repaints with escape sequences, so matching the OUTPUT is the honest check.
+send "BOAR\t\r"
+expect {
+    -ex "cpu0" { ok "Tab completed BOAR -> BOARDS and the command ran" }
+    timeout    { fail "Tab did not complete the command prefix" }
+}
+expect -ex "pascal100> "
+
+# ESC [ A is the up-arrow. It recalls the last line (BOARDS), and Enter re-runs it.
+send "\033\[A\r"
+expect {
+    -ex "cpu0" { ok "the up-arrow recalled the last command from history" }
+    timeout    { fail "history recall (up-arrow) did not re-run the command" }
+}
+expect -ex "pascal100> "
+
+# ---- 4. FLAT OUT IS THE DEFAULT (Patrick, 2026-07-13). ----
+# The crystal is a property of the CPU card, and with no crystal the run loop does not
+# sleep. This is the line that used to be a lie: `clock_hz = 0` was documented as "runs
+# flat out" while Clock::setHz coerced it back to 2 MHz and the loop paced anyway.
+send "SHOW cpu0\r"
+expect {
+    -re {clock_hz\s+0\y}  { ok "clock_hz defaults to 0 -- flat out" }
+    timeout               { fail "cpu0's clock is not 0 by default" }
+}
+expect -ex "pascal100> "
+
+# ---- 5. A guest that TALKS. ----
+# Toggled in at the front panel, exactly as a human would: initialise the 2SIO (master
+# reset, then 8N2 / divide-by-16), wait for the transmit register to empty, send 'H', halt.
+#
+#   0000  3E 03     MVI A,03      ; master reset the 6850
+#   0002  D3 10     OUT 10
+#   0004  3E 11     MVI A,11      ; /16, 8 data bits, 2 stop -- what period software writes
+#   0006  D3 10     OUT 10
+#   0008  DB 10     IN  10        ; poll status
+#   000A  E6 02     ANI 02        ; TDRE -- transmit data register empty?
+#   000C  CA 08 00  JZ  0008      ; no: keep polling
+#   000F  3E 48     MVI A,48      ; 'H'
+#   0011  D3 11     OUT 11        ; ...out the data port
+#   0013  76        HLT
+send "DEPOSIT 0 3E 03 D3 10 3E 11 D3 10 DB 10 E6 02 CA 08 00 3E 48 D3 11 76\r"
+expect -ex "pascal100> "
+send "RUN 0\r"
+expect {
+    -ex "H"  { ok "the guest wrote a character to the console through the 2SIO" }
+    timeout  { fail "nothing came out of the console" }
+}
+
+# It halts, and the monitor SAYS it halted rather than sitting there looking busy.
+expect {
+    -ex "pascal100> " { ok "HLT stopped the machine and gave the monitor back" }
+    timeout           { fail "the machine never came back from a HLT" }
+}
+
+# ---- 6. ATTN (^E) -- the guest has the keyboard, and the host takes it anyway. ----
+# This is the one the scripted harness CANNOT test: under a pipe, the console reads stdin
+# eagerly and acts on ^E the instant it appears in the buffer -- so a keystroke FILE fires
+# it before the guest has even booted. On a tty it arrives when a human presses it.
+#
+# RESET FIRST, AND IT IS NOT A RITUAL. Section 5 ended on a HLT, and a halted 8080 leaves
+# HALT for exactly two things: an interrupt, and RESET. Loading the PC is not one of them.
+# So `RUN 20` on the halted machine came straight back with "HLT at 0020" WITHOUT RUNNING,
+# and this section used to match the prompt that came back with it and declare ATTN tested.
+# It was a false pass of the exact kind this file warns about at the top: the guest was
+# never running, so ^E was never actually taken from anybody. (Found 2026-07-13, by making
+# the machine say WHY it stopped -- "HLT" where the test assumed "ATTN".)
+send "RESET\r"
+expect -ex "pascal100> "
+send "DEPOSIT 20 C3 20 00\r"
+expect -ex "pascal100> "
+send "RUN 20\r"
+expect {
+    -ex "console" { ok "the guest is spinning with the console" }
+    timeout       { fail "RUN 20 never started" }
+}
+send "\005"
+# EVERY STOP SAYS WHY, and this one's reason is ATTN. Match the WORD before the
+# prompt, not the prompt alone -- a prompt would come back whatever the machine
+# claimed had happened, which is exactly the false pass this file warns about.
+expect {
+    -re {STOP -- the machine is still at 002[0-2]\.} {
+        ok "STOP (^E) took the console back, and the machine SAID so"
+    }
+    timeout { fail "^E did not return to the monitor, or it did not say why it stopped" }
+}
+expect {
+    -ex "pascal100> " { ok "and the monitor is taking commands again" }
+    timeout           { fail "^E did not return to the monitor" }
+}
+
+# ATTN IS NOT A STOP. The machine is exactly where we left it -- still looping at 0020.
+# The status line labels each register with its SET REG name, so the program counter is PC=.
+send "REGS\r"
+expect {
+    -re {PC=002[0-2] } { ok "STOP left the machine where it was -- still in its loop" }
+    timeout           { fail "the machine was stopped by ^E, or the PC moved somewhere odd" }
+}
+expect -ex "pascal100> "
+
+# ---- 6b. THE `!` SHELL ESCAPE -- a host command runs and its output comes back. ----
+# This is a tty-only round trip. The child inherits the fd behind this pty, so what it
+# prints appears here; under a pipe it would write to the real fd and never be seen. `echo`
+# is a shell builtin on every host, and the string is unmistakable so no other line matches.
+send "!echo hello-from-shell\r"
+expect {
+    -ex "hello-from-shell" { ok "! ran a command in the host shell and the output came back" }
+    timeout               { fail "the ! shell escape produced no output" }
+}
+expect -ex "pascal100> "
+
+send "QUIT\r"
+expect eof
+
+# ---- 7. ...AND A CRYSTAL IS STILL REPORTED AS A CRYSTAL. ----
+# The other half of check 1, and the reason it is a separate spawn: the banner prints ONCE,
+# at startup, so buying the crystal on the command line is the only way to watch it take the
+# other branch. `-i` IS LOAD-BEARING -- without it `-x` runs the command and exits before the
+# banner is ever printed (src/main.cpp: `if (ran && !interactive) return rc;`), and this check
+# would then pass by matching nothing at all.
+#
+# Without this, "full speed." could be hardcoded and check 1 would still pass -- which is the
+# same shape of bug as the one this file is here to catch: a display that no longer asks.
+spawn $sim $machine -x "SET cpu0 clock_hz=2000000" -i
+expect {
+    -ex "z80, 2 MHz." { ok "a card WITH a crystal still banners its rate" }
+    timeout            { fail "SET cpu0 clock_hz=2000000 did not reach the banner" }
+}
+send "QUIT\r"
+expect eof
+
+puts "\nALL INTERACTIVE CLI CHECKS PASSED"

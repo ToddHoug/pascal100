@@ -1,0 +1,77 @@
+# CompuPro CP/M 8-16 1.1R on the CPU 8085/88 (8080 and 8086 programs), with its console in a built-in terminal WINDOW.
+#
+#     cd examples/cpm8-16 && pascal100 cpm816.toml
+#     -> a terminal window opens; the CP/M 8-16 banner and the A> prompt appear IN IT.
+#        The monitor's pascal100> prompt stays in the terminal you launched from.
+#
+# THIS FILE IS THE WHOLE MACHINE. It is the same machine and the same disk as
+# cpm816-console.toml. Only the console is different: channel A of the Interfacer 1 connects to
+# `terminal`, a window that the simulator draws. SDL only: a headless build refuses it, so use
+# cpm816-console.toml there.
+#> CompuPro CP/M 8-16 1.1R, with its console in the window that just opened.
+#> STOP (^E) pulls the keyboard back here to the monitor; RUN resumes the guest.
+#
+# HOW IT BOOTS. The Disk 1 boot ROM (routine 4, console on the Interfacer 1) runs on the 8085
+# and reads the disk's boot sector. That code does IN FD: the CPU 8085/88 hands the bus to the
+# 8088, which starts at FFFF0, loads CPM.SYS and starts CP/M 8-16: CP/M-86 plus SW!, which runs an
+# 8080 .COM on the 8085 and an 8086 .CMD on the 8088. The disk is the CompuPro CP/M 8-16 1.1R
+# master with the Manx Aztec C files removed (C86, AS86 and their headers): DRI and CompuPro
+# files only.
+
+[machine]
+name    = "cpm816"
+bus     = "ieee696"          # IEEE 696 (S-100): the 8088 uses A0-A19, the Disk 1 DMA A0-A23
+startup = ["RUN 0"]
+
+[display]
+crt   = true
+focus = true
+
+# THE CPU 8085/88: an 8085 and an 8088 on one card; the 8085 starts (docs/boards/compupro-cpu8588.md).
+[[board]]
+type = "cpu8588"
+id   = "cpu"
+
+# THE CONSOLE: channel A of an Interfacer 1 at 00-01, in a window. Channel B is not connected.
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  # The loader waits until DSR or CTS reads 1 (OFF). `open` is a 3-wire cable: nothing drives
+  # those inputs, and an open input reads OFF, as on the real board.
+  [board.unit.a]
+  rs232_inputs = "open"
+  connect = "terminal?emulation=vt100&size=80x24&width=1100"
+  title   = "CP/M 8-16 console"
+
+# THE DISK 1 at C0, boot routine 4 (console on the Interfacer 1).
+[[board]]
+type    = "disk1"
+id      = "fd0"
+port    = C0
+routine = 4
+
+  [[board.drive]]
+  unit  = 0
+  mount = "cpm816-11r.dsk"
+
+# THE HOST BRIDGE at B0, for R, W and HDIR (R.CMD, W.CMD and HDIR.CMD on the disk). hostdir ""
+# = the folder you started pascal100 in.
+[[board]]
+type    = "hostbridge"
+id      = "hb0"
+port    = B0
+hostdir = ""
+
+# 1 MB of RAM at 00000-FFFFF. `ext = true`: the board decodes A16-A23, as the 8088 needs.
+[[board]]
+type           = "memory"
+id             = "mem0"
+ext            = true
+fill           = "zero"
+honors_phantom = "read"
+
+  [[board.region]]
+  type = "ram"
+  at   = 000000
+  size = "1M"

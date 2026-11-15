@@ -1,0 +1,39 @@
+# A bare 2SIO machine for tests/acceptance/2sio-echo.exp (pascal100 2026-11-09).
+#
+# Upstream ran ECHO and ECHOINT on its `default` machine, an Altair with an 88-2SIO console.
+# pascal100's `default` is a CompuPro machine with an Interfacer 1, so the test brings this
+# machine instead: the 2SIO at 10h, where Mike Douglas's programs expect it, and RAM from 0
+# (ECHOINT's ISR is at 0038h). No startup: the test LOADs a program and RUNs it.
+#
+# A Z80, not an 8080. After a reset it is in interrupt mode 0, so with no vector board the
+# floating FFh on the acknowledge executes as RST 7 -> 0038h, as on the 8080. Paths typed at
+# the prompt resolve against this file's folder, so the test names the .HEX files bare.
+
+[machine]
+name = "2sio-echo"
+bus  = "ieee696"
+
+[[board]]
+type     = "z80"
+id       = "cpu0"
+clock_hz = 0
+
+[[board]]
+type = "2sio"
+id   = "sio0"
+port = 10
+  [board.unit.a]
+  connect = "console"
+  baud    = 9600
+  [board.unit.b]
+  connect = "null"
+  baud    = 9600
+
+[[board]]
+type = "memory"
+id   = "mem0"
+fill = "random"
+  [[board.region]]
+  type = "ram"
+  at   = 0000
+  size = "64K"

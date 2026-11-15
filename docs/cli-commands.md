@@ -1,0 +1,532 @@
+# Monitor commands and their abbreviations
+
+> **altairsim's design rationale, kept as history.** "Patrick" is Patrick Linstruth, who
+> decided this table for altairsim. The reasoning refers to the front panel, ALTMON and other
+> parts that pascal100 removed. `HELP` is the current reference.
+
+**Settled 2026-07-11 by Patrick.** The table in `src/cli/commands.cpp` is the only copy of this; HELP and everything below are generated from it.
+
+> **This is not the command reference, and it never was.** It is the argument for *why the
+> commands rank and abbreviate the way they do* — which is a design decision, and belongs in a
+> design document.
+>
+> **The reference is `docs/monitor/ref/commands.md`**: every command, its usage, its help and its
+> examples, *printed from the same `CommandDef` table the monitor resolves against* by
+> `tools/gen-reference.cpp`, with a test that fails if it goes stale. It cannot disagree with the
+> program, because it is the program's own words.
+>
+> (The README used to advertise *this* file as "Every monitor command". It was not, and there was
+> no such document until the manual was written.)
+
+## The rule
+
+**The table is in priority order, and the first command whose name starts with what you typed wins.** That is the whole algorithm — there is no minimum-abbreviation column, no priority number, and nothing that treats a one-letter word specially. One letter is just a short prefix.
+
+`D` dumps because DUMP is listed above DEPOSIT, DISASM and DISCONNECT. It follows, without anyone deciding it, that DEPOSIT needs `DE` and DISASM needs `DI`. Reorder the table and every abbreviation in the monitor re-derives itself, including the ones printed by HELP.
+
+This is why **UNMOUNT is not called DISMOUNT**: it's the plainer word, it takes `U` (which nothing else wanted), and removing it from the D-cluster is what let DISASM fall from `DISA` to `DI`. Nobody worked that out — the table did.
+
+**The one invariant:** no command name may be a strict prefix of another. If one were, its full, correctly-spelled name would resolve to whichever came first and there would be no way left to type the other. Renaming REGS to REG would break exactly this; `tests/test_cli.cpp` fails if anyone tries.
+
+## The ranking
+
+The eight that own their prefix, in Patrick's ranking (2026-07-11): **DUMP, STEP, RUN, HISTORY, MOUNT, BREAK, EDIT, CONFIG.**
+
+> **GO is gone (Patrick, 2026-07-12).** `RUN` is the switch on the front panel, and there was never a second thing for GO to be — see [RUN](#run-is-the-switch-on-the-panel) below.
+>
+> **`R` RUNS (Patrick, 2026-07-13).** It used to reset. That is the same call as `D` dumping: the shortest key on the keyboard goes to the command that cannot destroy anything, and the one that throws the machine's state away costs you letters. RUN is what you type every session, and a `RUN` you did not mean costs nothing — a bare `R` that reset the machine is a machine you have to set up again. RESET pays `RES`, and the rest of the cluster falls out of the table order below with nobody deciding it: `RE` REGS, `RES` RESET, `REST` RESTORE, `REGI` REGION.
+
+The table below is in the master table's priority order, which is what the abbreviations are
+derived from. It is here for the notes; the list itself is `HELP`'s, which prints from the source
+(`docs/monitor/ref/commands.md` is the same thing, generated).
+
+| Type | Command | Notes |
+|---|---|---|
+| `D` | DUMP | |
+| `S` | STEP | |
+| `N` | NEXT | STEP that runs *over* a CALL/RST instead of into it |
+| `R` | RUN | the panel's switch. `G` names nothing at all now |
+| `H` | HISTORY | the ring of recent bus cycles — always recording |
+| `M` | MOUNT | |
+| `B` | BREAK | |
+| `E` | EDIT | interactive DEPOSIT — a byte at a time, or a mnemonic assembled in place |
+| `C` | CONFIG | |
+| `DO` | DO | runs a file of monitor commands. Two letters is the whole word |
+| `MA` | MACHINE | `M` is MOUNT |
+| `SE` | SET | beats SEARCH — you type it far more often |
+| `SH` | SHOW | |
+| `DE` | DEPOSIT | the front panel keeps its word; it costs one letter |
+| `EX` | EXAMINE | the panel's other switch. Bare `EX` = EXAMINE NEXT |
+| `I` | IN | runs a real IN cycle |
+| `O` | OUT | runs a real OUT cycle |
+| `L` | LOAD | |
+| `SA` | SAVE | |
+| `F` | FILL | |
+| `SEA` | SEARCH | |
+| `COM` | COMPARE | |
+| `MOV` | MOVE | |
+| `W` | WHO | |
+| `BO` | BOARDS | `BOARD` works too — it is a prefix, not an alias |
+| `RE` | REGS | the first RE- word in the table, so it takes `RE` outright |
+| `REGI` | REGION | `REG` is REGS |
+| `DI` | DISASM | |
+| `SY` | SYMBOLS | |
+| `STA` | STARTUP | `ST` is still STEP, which is higher in the table |
+| `U` | UNMOUNT | not DISMOUNT — see above |
+| `DISC` | DISCONNECT | |
+| `CONS` | CONSOLE | **configures** the console. It does not start the machine — RUN does |
+| `CONN` | CONNECT | any endpoint — `HELP CONNECT` lists them |
+| `RES` | RESET | it sits with POWER, and it pays three letters — see above |
+| `P` | POWER | |
+| `PA` | PASTE | sends a host file to the guest's keyboard; `P` is still POWER |
+| `T` | TRACE | logs every bus cycle — to the console or a file |
+| `TY` | TYPE | |
+| `SN` | SNAPSHOT | writes the machine's state to a file |
+| `REST` | RESTORE | reads a snapshot back into a machine of the same shape |
+| `NO` | NOBREAK | `N` is NEXT — the step you type mid-debug wins the letter |
+| `NOP` | NOPASTE | stops a PASTE; `NO` is still NOBREAK |
+| `HE` | HELP | or `?` |
+| `Q` | QUIT | the only way out — there is no EXIT |
+
+## Two deliberate breaks with SIMH
+
+**`D` dumps.** SIMH's `D` is DEPOSIT and its `E` is EXAMINE; on the Altair itself, DEPOSIT and EXAMINE are the two front-panel switches. But `D` is dump in most ROM monitors, and SIMH's choice to make it deposit has long been a sore point for Patrick. It also puts the shortest key on the keyboard on the command that cannot destroy anything, and makes you type two letters to change memory. That is the better default regardless of heritage.
+
+**`E` edits and `EX` examines.** There is no EXIT — `QUIT` is the one word for leaving, so `E` and `EX` go to the two commands you actually type.
+
+## HELP has two forms
+
+**Bare `HELP` lists the names and a few tips** — the whole set in about ten lines:
+
+```
+pascal100> HELP
+
+  BO[ARDS]          B[REAK]           COM[PARE]         C[ONFIG]
+  CONN[ECT]         CONS[OLE]         DE[POSIT]         DI[SASM]
+  DISC[ONNECT]      DO                D[UMP]            E[DIT]
+  EX[AMINE]         F[ILL]            HE[LP]            H[ISTORY]
+  I[N]              L[OAD]            MA[CHINE]         M[OUNT]
+  MOV[E]            N[EXT]            NO[BREAK]         NOP[ASTE]
+  O[UT]             PA[STE]           P[OWER]           Q[UIT]
+  REGI[ON]          RE[GS]            RES[ET]           REST[ORE]
+  R[UN]             SA[VE]            SEA[RCH]          SE[T]
+  SH[OW]            SN[APSHOT]        STA[RTUP]         S[TEP]
+  SY[MBOLS]         T[RACE]           TY[PE]            U[NMOUNT]
+  W[HO]
+
+  Type the part before the [brackets].
+  HELP <command> for the usage and examples -- e.g. HELP DUMP.
+  . repeats your last command -- e.g. DI to disassemble, then . . . to keep going.
+  !<command> runs a command in your host shell -- e.g. !vi HELLO.PRN.
+
+  Numbers: on the wire is HEX (addresses, ports, bytes) -- or OCTAL
+  under SET CONSOLE base=octal; never on the wire is DECIMAL (counts,
+  widths, sizes). 0x/$/h force hex, 0o/q force octal, # forces decimal,
+  and a K/M suffix is always decimal.
+```
+
+The list is **alphabetical**, not ranked — you are hunting for a name, and the ranking is not something you can look a name up by. The brackets are where the ranking shows through: `R[UN]` and `RES[ET]` sit on rows next to each other and tell you the whole story without a word of explanation.
+
+When you type HELP you are almost always hunting for a name you half-remember, and a wall of usage lines is the worst possible shape for that: it doesn't fit on a screen, so the thing you were looking for scrolls off the top.
+
+**`HELP <command>`** is where the usage and the examples live:
+
+```
+pascal100> HELP D
+
+  D[UMP]
+  DUMP [<addr>|<range>] [WIDTH=16]
+
+  Hex and ASCII. A bare address runs to the END OF ITS PAGE, and a bare DUMP
+  continues from there -- so the rows and the columns both stay page-aligned
+  however you first landed. WIDTH is a count, so it is decimal.
+
+    D 100        ; 0100-01FF, a whole page
+    D 0001       ; 0001-00FF: stops on the boundary, last line full
+    D            ; the next page
+    D FF00-FF0F  ; an explicit range means exactly what it says
+    D 100/20     ; 0100-011F (LEN is part of the address expression: hex)
+    D 0 WIDTH=8  ; eight bytes per line
+```
+
+Note that `HELP D` works — the argument goes through the same prefix resolver as everything else, so you never have to spell a command out just to ask about it.
+
+**Both forms are generated from the command table.** A hand-written help text is a second list of commands, and a second list of commands is a list that is wrong.
+
+## EXAMINE and DEPOSIT are the front panel's two switches
+
+DUMP answers *"what is around here."* **EXAMINE answers *"what is AT here,"*** which is a different question and deserves its own verb — paging 256 bytes to read one is how you lose the byte in the noise.
+
+**Bare `EXAMINE` is the panel's EXAMINE NEXT**: it steps one byte. `EX 100`, then `EX`, `EX`, `EX` walks memory a byte at a time, exactly as the switch does.
+
+```
+pascal100> EX 100
+0100  C3  .  11000011
+C0Z0M0E0I0 A=00 BC=0000 DE=0000 HL=0000 SP=0000 IE=0 PC=0100  JMP F800
+pascal100> EX
+0101  00  .  00000000
+pascal100> EX
+0102  F8  .  11111000
+pascal100> EX
+0103  41  A  01000001
+```
+
+The bits are there because the panel showed them on eight LEDs, and because when you are down to one byte you are usually looking at a flag.
+
+EXAMINE keeps **its own cursor**, separate from DUMP's. They step by different amounts — a byte versus a page — and sharing one latch would mean a `D` silently threw your examine position 256 bytes down the road.
+
+### EXAMINE *is* the CPU
+
+The panel has **no address latch of its own.** EXAMINE stops the processor, jams the address switches into the **program counter**, and the CPU drives the address lines and MEMR\*. Everything else follows from that one fact.
+
+**`EX <addr>` is a `JMP <addr>` you can see the destination of.** It loads the PC, so STEP afterwards executes *there* — and `RUN <addr>` is exactly EXAMINE followed by RUN, which is the pair of switches you throw on the panel.
+
+```
+pascal100> EX F800
+F800  3E  >  00111110
+C0Z0M0E0I1 A=02 BC=0000 DE=0000 HL=F81F SP=BFFC IE=0 PC=F800  MVI A,03
+pascal100> STEP
+C0Z0M0E0I1 A=03 BC=0000 DE=0000 HL=F81F SP=BFFC IE=0 PC=F802  OUT 10
+```
+
+**The PC is the cursor** — not a copy of it. Bare `EX` (EXAMINE NEXT) steps the program counter, because that is the only counter the panel has. Keeping a private latch beside it would mean a bare `EX` after a STEP quietly dragged the PC *backwards* to wherever the latch had been left.
+
+**With no CPU card, EXAMINE is an error, not a degraded mode.** Nothing is driving the address lines. It is the CPU that drives them and the memory-read bus signals, so with no CPU none of that works (Patrick, 2026-07-11).
+
+```
+pascal100> EX 0
+no CPU in this machine.  BOARDS ADD 8080 cpu0
+```
+
+There is no exception any more. `EX 0 RAW mem0` was one — the PROM burner reaching behind the bus, needing no CPU because it ran no cycle — and it went when `RAW` did (§10.2). Reading behind the bus bought nothing: a ROM answers reads like any other chip, and a bank or a board the CPU cannot see is one you *select* (`SET mem0 bank=3`). Writing behind it is real and survives, as `LOAD … ROM`.
+
+**EXAMINE is the only memory command that needs a CPU.** DUMP, DEPOSIT, FILL, SEARCH, COMPARE and MOVE all work on an empty backplane, because you have to be able to debug the simulator without a processor in it (Patrick, 2026-07-11).
+
+## BOARDS is the backplane
+
+**The command is plural, and both spellings work.** `BOARD` is a *prefix* of `BOARDS`, and prefixes are the whole resolver — so `BOARDS`, `BOARD` and `BO` are one command, with no alias, no second table entry, and nothing to keep in sync. A bare `BOARDS` lists them; you do not have to say `LIST`.
+
+```
+pascal100> BOARDS
+  ID    TYPE        I/O       UNITS                                                               MEMORY
+  ----  ----------  --------  ------------------------------------------------------------------  --------------------------------
+  fp0   fp          FF        -                                                                   -
+  cpu0  8080        -         1 cpu: 8080                                                         -
+  sio0  2sio        10,12     2 serial: a*, b                                                     -
+  dsk0  dcdd        08,09,0A  4 disk: drive0(empty), drive1(empty), drive2(empty), drive3(empty)  -
+  hb0   hostbridge  B0,B1     -                                                                   -
+  mem0  memory      -         1 rom: rom0                                                         0000-DFFF  ram  56K
+                                                                                                  FF00-FFFF  rom  dbl  phantom:all
+
+  * holds the console
+```
+
+**Each decoded range gets its own line, and says what it is.** The old listing printed `mem:0000-DFFF,FF00-FFFF` and stopped there — which cannot answer the only question worth asking about that card: *which of those is the ROM, and which ROM is in it?* Both facts were in the map all along and were being thrown away. A card carries several regions, and squashing them into one comma list is exactly what hid the difference.
+
+**An empty socket is not in the memory column, because it decodes nothing.** It shows up in UNITS instead, as `rom1(empty)` — there is a socket, and there is no chip in it. Those pages float to `FF`, as they do on the bench.
+
+**UNITS is what you type at `MOUNT` and `CONNECT`**, which is why the designations are there and not merely the count. `*` marks the unit holding the console.
+
+## Naming a card: `<id>[:<unit>]`
+
+**A name is case-blind.** `MOUNT ACR0:TAPE tape.bin` and `mount acr0:tape tape.bin` are the same command. `ACR0` and `acr0` are not two boards that happen to match — they are *one board*, which is why `BOARDS ADD acr ACR0` is refused when `acr0` is already in a slot.
+
+**The trailing index is optional when it distinguishes nothing.** The `0` in `acr0` is not an index the simulator parses; it is a character in a string the machine file chose (`id = "acr0"`). It is there to tell two cassettes apart — and when there is only one cassette in the machine, it tells nothing apart. So `ACR` finds `acr0`, and `DSK` finds `dsk0`.
+
+This is **not** prefix matching, and deliberately so: only a run of trailing digits may be dropped. `AC` finds nothing. (Verbs *are* prefix-matched — that is the table at the top of this page — but a verb list is fixed and reviewed, and a backplane is whatever you plugged into it.)
+
+**A lone unit needs no naming.** The 88-ACR has exactly one thing you can put a tape in, and it is called `tape`; naming it adds no information. So `MOUNT ACR tape.bin` is `MOUNT acr0:tape tape.bin`. The candidates are filtered by the kind the verb can act on, so `MOUNT` looks only at media units and `CONNECT` only at serial ones — which is why an 88-SIO (one `tty`) is unambiguous to `CONNECT` and a 2SIO (`a` and `b`) is not.
+
+**Anything genuinely plural you must still say, and it tells you so.** A shorthand that quietly picked one of four drives would be worse than no shorthand:
+
+```
+pascal100> MOUNT DSK0 cpm.dsk
+dsk0 has 4 units you could mount into: drive0 drive1 drive2 drive3. Name one -- dsk0:drive0
+
+pascal100> MOUNT ACR:TAPE tape.bin          (with two cassettes in the machine)
+ACR: ambiguous -- acr0 acr1. Name the one you mean.
+```
+
+**All of this is the *prompt's* grammar, and it stops at the prompt.** A machine file is matched exactly: an `[[board]] id = "acr"` that silently reached into the base and modified `acr0` would be a config that does something other than what it says. Same line this project already draws for relative paths (`docs/config.md`) — what you *type* and what a *file* says are resolved by different rules, on purpose. The machine files shipped in `machines/` all spell their units out in full.
+
+## SHOW BUS IRQ is the only window onto the interrupt wiring
+
+`SHOW BUS` has five views: `MAP` (memory), `IO` (ports), `CONTENTION` (who collides), `IRQ`, and `DMA` (the bus masters and their TMA priority). With no view it prints `MAP`, `IO`, a short `IRQ`, and `DMA` when the machine has a DMA board. The first three describe things you could find out another way — a wrong decode collides, or reads `FF`, and either way *something happens*. **The interrupt wiring is different: it is eight wires and a pin, none of them addressable, and getting it wrong fails in total silence.**
+
+```
+pascal100> SHOW BUS IRQ
+INTERRUPTS
+  CPU     INTE on          an acknowledged interrupt will be taken
+  pINT    ASSERTED         pin 73, pulled by vi0
+  88-VI   vi0              enabled, current level 7 (live)
+
+  LINE  VECTOR             STRAPPED             NOW
+  VI0   RST 0  C7 -> 0000  --                   --
+  ...
+  VI7   RST 7  FF -> 0038  sio0:a               WINS  <-- vi0 will jam FF
+```
+
+The VECTOR column comes from the board that reads the VI lines. An 88-VI jams `RST n`. A System Support 1 gives the `CALL` address that its 8259A is set to, or `(not set up)` before the guest programs it. With no such board, the column shows `--`.
+
+On the 88-VI, **VI0 is the highest priority and VI7 the lowest**, level *n* vectors to `8n`, and `VI7 → RST 7 → 0038` is what the MITS Programming System II ReadMe means by *"the console serial port must be set to vector 7."*
+
+`MASKED` is the row worth knowing about: the line is **still being pulled**, and the 88-VI's current-level register is refusing it. That is exactly what a service routine does to itself on entry (so that its own level cannot interrupt it), and in every other view it is indistinguishable from a lost interrupt.
+
+### It tells you when your machine is wrong
+
+Like `SHOW BUS CONTENTION`, this view has opinions, because the two ways of mis-wiring interrupts both produce a machine that runs, looks right, and never interrupts:
+
+- **A `vi*` strap with no 88-VI in the machine.** Nothing watches the VI lines, so the card pulls its wire and the wire goes nowhere. *This simulator shipped that bug for months:* a `vi3` strap parsed, validated, saved, and drove nothing.
+- **An `int` strap *with* an 88-VI present.** The manual forbids it outright — *"A system designed to use the 88-VI may not have any I/O board strapped for single level interrupt"* — and it fails as a wrong vector rather than an error.
+
+Both are reported by name under `WARNINGS`, along with a pin 73 that is asserted while the CPU has interrupts disabled.
+
+**Straps are found generically.** Every interrupt jumper in the machine — the 2SIO's (one per channel), the 88-SIO's two, the disk controller's, the 88-VI's own RTC — comes from one constructor, so a board added next year appears in this view for free, with no list to maintain anywhere. A bare `SHOW BUS` prints a short `INTERRUPTS` summary of the same thing.
+
+## RUN is the switch on the panel
+
+**`RUN [addr]` is the only way to start the machine**, and `RUN <addr>` is EXAMINE + RUN — it loads the PC first, exactly as you would on the panel.
+
+**GO was deleted for it (2026-07-12).** There was never a second thing for GO to be. A *headless* run — no terminal handover, ^C to stop — is not a mode the operator picks; it is simply what happens when **nothing holds the console**, and the machine already knows that. Whether your keys reach the guest is a fact about the backplane, not a question for you:
+
+| the backplane | what RUN does |
+|---|---|
+| a unit holds the console | the guest gets the keyboard — every key, including ^C — and the machine runs at the CPU board's `clock_hz` (flat out unless you set one) |
+| nothing holds the console | there is nothing to hand over, so it just runs, flat out |
+
+Both stop on a breakpoint, on a HLT nothing can wake, and on STOP, and both say which. That is why GO had nothing left to be.
+
+### STOP (^E) is the stop key. ^C is not.
+
+**Ctrl-C belongs to the guest** — CP/M reads it, and a stop key the guest also wants is one that either breaks the guest or gets eaten by it. So the way out is **STOP (^E)** — the front panel's STOP switch — and it is the same key whatever is in the backplane: with a console, with no console, on a terminal, always.
+
+The host intercepts it before the guest is ever offered the byte, so **the guest cannot disable it** — it is a key on the *front panel*, not on the terminal. And **STOP halts the machine without disturbing it**: nothing executes while this prompt is up, but nothing is lost either — the monitor tells you the address it is sitting at, and a bare `RUN` resumes from exactly where you were.
+
+```
+pascal100> RUN F800
+[console -- ^E returns to the monitor]
+
+ALTMON 1.3
+*
+                                    ← you press ^E
+STOP -- the machine is still at F83C. RUN resumes.
+```
+
+**STOP is watched for on console input and nowhere else.** A unit on a socket, a serial port or a loopback is *not* the console, and its data passes through untouched — `05` down a socket is a byte of somebody's protocol, and scanning a modem line for a key that only exists on the operator's terminal would be corrupting the data, not a feature.
+
+## CONSOLE configures the console — it does not run the machine
+
+```
+pascal100> CONSOLE
+console  (the host keyboard and screen -- not a tty)
+
+  property         value            legal
+  stop             0x5              0x1..0x1F
+  base             hex              hex|octal
+  history          50               0..10000
+  log
+  upper            false            true|false
+  strip7in         false            true|false
+  strip7out        false            true|false
+  crlf             false            true|false
+  echo             false            true|false
+  bell             true             true|false
+  bsdel            bs               off|bs|del
+
+  held by  sio0:a
+
+  The transforms (UPPER, STRIP7OUT, CRLF, BSDEL...) are the CONSOLE's, and
+  nothing else's: SET CONSOLE UPPER=ON. A board's line is 8-bit clean whatever
+  is plugged into it -- a filter there would corrupt XMODEM, silently.
+  What a board has instead is line coding: SHOW sio0 (baud, data_bits...).
+
+pascal100> CONSOLE stop=1D          ← make it ^]
+console: stop=0x1D
+```
+
+`CONSOLE k=v` sets, bare `CONSOLE` shows. (`SET CONSOLE` and `SHOW CONSOLE` are the same thing said the long way.) It used to *enter* console mode, and that was wrong twice over: a command that starts the CPU because you asked to look at a setting is a trap, and "start the machine" already has a name.
+
+### Every property is settable
+
+There is no "runtime vs config-time" column, and no property that `SET` will refuse. **You can only type at the prompt when the machine is stopped** — by STOP, by a breakpoint, by a HLT, which is the panel's STOP switch — so there is no moment at which a `SET` could race a running CPU. And on real hardware the rule would be a fiction anyway: a board being worked on is often sitting on an extender card, getting changed with the power on (Patrick, 2026-07-12).
+
+There *was* such a gate. It never once fired, because nothing in the simulator ever set the flag it was conditioned on. A rule the code only pretends to enforce is worse than no rule at all.
+
+### The endpoints
+
+`CONNECT <id>:<unit> <endpoint>`. The **monitor** knows this grammar and no board is permitted to, which is why `CONNECT sio0:a serial:/dev/tty.usbserial-AL009KFH` needed **not one line of code in the 2SIO**.
+
+**The list of endpoints is not copied here.** It is the User Manual's (the serial chapter) and
+`HELP CONNECT`'s, and `HELP` prints it from `endpointHelp()` — the same function the resolver
+answers to. What belongs here is why a few of them are shaped the way they are:
+
+- **`null` is a DB-25 with nothing behind it**, not an error. An unconnected 6850 works fine and
+  talks to nobody.
+- **`loopback` jumpers TX to RX — and RTS→CTS, DTR→DCD/DSR**, exactly like the loopback plug in
+  the drawer. It is the one endpoint that can test modem control with no hardware.
+- **A client connecting to a listening `socket:` or `telnet:` *is* carrier appearing.** One
+  client at a time; the listener survives a disconnect, so the next caller is the phone ringing
+  again. A call out is non-blocking, and a session still being established is a phone still
+  ringing: the card correctly sees no carrier yet.
+- **`socket:` is raw and `telnet:` negotiates**, and they are two endpoints rather than an option
+  because they are for different far ends. A program, or another machine, wants the guest's
+  bytes and nothing else. A person with a `telnet` client needs the echo and line-mode
+  handshake, or every key appears twice. `telnet:` also greets its caller by default, and
+  `socket:` does not, because a banner is data to a machine on the far end.
+- **`serial:` is the one place where the pins are the pins.** The card programs its baud and
+  frame, and with `SET sio0:a cts=wired` the far end can genuinely stop your transmitter.
+
+A device that is not there does **not** silently become a `NullStream` — it is an error, and `serial:` lists the ports that *are* on the host, because a cable that enumerated under a different name is ten minutes of a person doubting the simulator.
+
+### Which unit is the console?
+
+**The one that is cabled to it** — the console is an endpoint like any other, so with three 2SIOs and six ports it is simply whichever unit you connected:
+
+```
+pascal100> CONNECT sio0:a console
+sio0:a: connected to console
+pascal100> CONNECT sio1:b console
+console taken from sio0:a
+sio1:b: connected to console
+```
+
+**Exactly one unit may hold it, because there is exactly one keyboard.** Two boards reading it would each get half your keystrokes — invisible until you are debugging why every other character vanished. Interactively, connecting a second one **steals** it and says who from: you are moving the cable, and the last port you plug in is the one you meant.
+
+**A config file that names two consoles is refused.** There is no "last" about a file — it is a typo, not a decision — so it fails the load and names both offenders.
+
+### The keyboard is buffered by the host
+
+Keys land in a buffer belonging to the *host*, and a card takes characters from it. That is what lets the STOP key be watched whether or not anybody is reading — while the guest is busy computing, and even when there is no serial card in the machine at all. It is also what lets anything *type for you*: an injected byte and a human's are indistinguishable to the board, because at the level the board sees, there is no difference. MCP's `run` tool, which types `input` and waits `until` a string appears, is built on exactly that.
+
+It does not make the UART any less real: the 6850 still holds **one** character, still sets RDRF when it does, and still takes the next only when the guest has cleared the last. The buffer is the *line*, and a line is buffered and flow-controlled. It is a real keyboard buffer, so it is finite — type past the end and the keys are dropped, and the drop is counted rather than silently swallowed.
+
+And because looking at one byte is exactly when you need to know it *is* a byte:
+
+```
+pascal100> EX 8000
+8000  FF  .  11111111   (nobody drives this -- the bus floated it)
+C0Z0M0E0I0 A=00 BC=0000 DE=0000 HL=0000 SP=0000 IE=0 PC=8000  RST 7
+```
+
+## SNAPSHOT and RESTORE: the machine's state, saved and reloaded
+
+`SNAPSHOT <file>` writes the whole machine's **state** — the CPU, the clock, and every board's
+registers, RAM and latches — to a file. `RESTORE <file>` reads it back into a machine you have
+already built.
+
+```
+pascal100> SNAPSHOT before-boot.snap
+snapshot written to before-boot.snap
+pascal100> RESTORE before-boot.snap
+restored from before-boot.snap
+```
+
+**A snapshot is state, not configuration.** It does not carry the *shape* of the machine — which
+boards, at which ports — the way a machine file does. Build the machine first, with its machine
+file or a `CONFIG LOAD`. RESTORE matches each board in the file to a board in the machine by id
+and type, and restores each match. It reads a snapshot from an earlier release too, so a
+snapshot moves to a new release. Each board it cannot restore — on only one side, a different
+type, or with state from an older format — is named in a `RESTORE:` line and starts as at
+power-on. RESTORE refuses a corrupt or truncated file (the checksum catches it), a file from a
+newer release, and a file with no board in common with the machine. A refused file leaves the
+running machine untouched.
+
+`RECORD` and `REPLAY` — a recorded session you could play back exactly — would build on this.
+They are not planned; see below.
+
+## A command that is not built yet can hold its letters
+
+The command table can list a command before it exists (`CommandDef::built` is false). It
+resolves, and says what it is waiting for, instead of being an unknown word. **That is the
+point, not an oversight.** If only the built commands were listed, `S` would have meant SHOW
+until the CPU landed and then silently started meaning STEP — and someone's fingers would keep
+typing `S` and get something else. Abbreviations are a contract with muscle memory, so a
+command that is coming takes its prefix before anyone has muscle memory to break.
+
+**No command is reserved today.** RECORD, REPLAY and STOP were, and on 2026-07-25 they were
+dropped rather than deferred, so `REC`, `REP` and `STO` are free again (`tests/test_cli.cpp`
+checks that they no longer resolve). STOP the *key* is ^E; there is no STOP command.
+
+## DUMP: a page at a time, and the columns never move
+
+**A bare address dumps to the end of its page.** `D 100` is not a request to see one byte — nobody has ever wanted that — it is *"show me what's at 0100"*, and the answer is a page.
+
+**`DUMP` with no argument at all** continues from where the last dump stopped. Type `D`, `D`, `D` and you page through memory, which is how you actually read it: you rarely know the address of the thing you're looking for, only that it's somewhere after the thing you just saw.
+
+**Everything stays page-aligned — rows as well as columns.** `D 0001` opens on the `0000` line with the `0000` column left *blank*, so the byte at `0001` sits under the `01` heading; and it **stops at `00FF`**, not 256 bytes later:
+
+```
+pascal100> D 0001
+0000     42 43 00 00 00 00 00  00 00 00 00 00 00 00 00   BC.............
+0010  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+...
+00F0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+
+pascal100> D
+0100  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+```
+
+The whole reason to print a hex address on every line is that the *column position* tells you the low nibble without counting — so if the columns shifted with the start address, every byte would be off by one and you wouldn't notice until it mattered. The same argument decides the end: counting out exactly 256 bytes from `0001` would dangle a one-byte line at `0100` and throw every subsequent `D` off the page grid. **Stopping on the boundary means the last line is always full and the next `D` opens cleanly on `0100`** — one accidental keystroke on the start address doesn't misalign the rest of the session.
+
+**An explicit range means exactly what it says.** `D 100-10F` and `D 100/20` don't expand; only the bare address form does. That distinction is deliberate: `range` is shared with `FILL`, `MOVE`, `SEARCH` and `SAVE`, and a bare address quietly meaning 256 bytes *there* would be a footgun — `FILL 100 5A` must fill one byte.
+
+Giving DUMP a range or an address moves the resume mark; nothing else does.
+
+## IN and OUT run *real* bus cycles
+
+```
+pascal100> I 10
+port 10 -> FF   (nobody answered -- the bus floated it)
+
+pascal100> O 10 41
+port 10 <- 41   (nobody decodes this port -- the byte is gone)
+```
+
+These are the same `ioRead`/`ioWrite` the CPU runs, through the same decode — so **they have real side effects**. An `IN` from a UART's data port *consumes* the byte, and the guest will never see it. That is not a wart to be papered over; poking a live port is the oldest way there is to find out whether a card is alive.
+
+If you want to look without touching, that is what **`WHO IO <port>`** is for — it reports who *would* answer without running a cycle.
+
+Both commands report **whether anybody actually answered**, which is the whole reason the bus/board boundary exists: `FF` from a board and `FF` from an empty slot are the same byte and completely different faults.
+
+## Numbers: on the wire → hex, never on the wire → decimal
+
+**Settled 2026-07-11 by Patrick** (DESIGN.md §10.0.1). The base belongs to the **operand**, not to the command line.
+
+| | |
+|---|---|
+| **HEX** — the machine sees it | addresses, ports, data bytes |
+| **DECIMAL** — only you see it | counts, widths, sizes, baud rates, unit numbers |
+
+```
+D 100            dump from 0100h
+D 100/20         0100h..011Fh    (LEN is part of the address expression: hex)
+DE 100 C3 00 F8  bytes are hex
+I 10             IN from port 10h
+D 0 WIDTH=10     ten bytes per line -- a width is a count, so it is DECIMAL
+SET sio0 baud=9600                nine thousand six hundred
+```
+
+A single global base was never really available — `baud=9600` cannot mean 38400 — so the rule had to bend somewhere. It bends where it means something. The alternative ("everything in a command is hex") buys one sentence of simplicity and pays for it with `STEP 20` stepping 32 times, silently, forever.
+
+**Overrides work everywhere, both directions**, because a rule you can't type your way out of is a trap: `0x20`, `$20` and `20h` force hex; `#32` forces decimal; `%1010` forces binary (`0b1010` is binary only where the default is not hex); `1_000` is just spacing.
+
+**A `K`/`M` suffix is always decimal** — `10K` is 10,240, never 16K, which is why nobody has ever had to ask. So `0x10K` is a contradiction and is **rejected**, not guessed at:
+
+```
+pascal100> REGION ADD mem0 type=ram at=8000 size=0x10K
+mem0: memory: [[board.region]] size: a K/M suffix is always decimal -- drop the base marker: '0x10K'
+```
+
+Note that `at=F000` needs no `0x` — it's an address, so it's already hex.
+
+## The backspace problem, and why there is a line editor
+
+`^H` was appearing in the input line. The cause is that **a terminal has exactly one erase character**: the tty driver's `VERASE` is a single byte, and whether your backspace key sends BS (`0x08`) or DEL (`0x7F`) depends on the emulator, the OS and `$TERM`. When the two disagree, the byte you send is not the byte the driver erases with — so it is just a control character, and the driver puts it in the line, where it prints as `^H`.
+
+**There is no VERASE setting that fixes this**, because there is no single right answer. So `src/cli/lineedit.cpp` takes the terminal out of canonical mode and edits the line itself, treating **both `0x08` and `0x7F` as backspace**. Then it does not matter which one your terminal chose, and it does not matter what OS you are on.
+
+It also brings history (↑/↓), cursor movement (←/→, Ctrl-A/E), Ctrl-U, Ctrl-W, and Ctrl-C to abandon a line. Anything else that arrives as a stray control byte is **dropped, not inserted** — which is how `^H` got into the line to begin with.
+
+A pipe, a script, or `--mcp` is not a terminal, and takes a plain `getline` path that never touches terminal state.
+
+It also brings **tab completion**, driven by `Board::properties()` (DESIGN.md §10.4) — the same reflection layer that already backs SET, SHOW, the TOML loader and the MCP schemas. `Tab` completes a command, then a board id or `id:unit` target, then that board or unit's property names, then a property's legal values; `MOUNT`, `CONNECT` and the board verbs complete their target the same way.

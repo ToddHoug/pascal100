@@ -1,0 +1,1991 @@
+# `pascal100` — Design Document
+
+**Status:** pascal100 0.1.0, under construction. The Z80 side runs CP/M on CompuPro boards; the
+Pascal-100 machine (`examples/pascal`) boots a UCSD Pascal III.0 system disk on the MicroEngine.
+**Started:** 2026-07-11 as altairsim's design document; a living document, revised with the code.
+
+> **Heritage note.** `pascal100` began on 2026-11-02 as a copy of `altairsim` (Patrick Linstruth,
+> MIT), a simulator of the MITS Altair 8800 and the S-100 bus, and became a separate application
+> on 2026-11-09. It keeps that project's framework. It removed the Altair bus, the front panel,
+> the cassette and tape support, the Altair machines and the boards that the Pascal-100 system
+> does not need. The bus is IEEE 696 only: **24 address lines**, **16-bit I/O addresses** and the
+> **16-bit transfer** (sSIXTRQ/SIXTN). It adds a **processor board with two live cores** and the
+> **WD MicroEngine P-machine**. Most of this document is altairsim's text. Where a section says
+> "this simulator will not", read it as altairsim's decision; the amendments are marked
+> **pascal100:**. A section about a removed board or the Altair bus describes altairsim, not
+> pascal100.
+
+---
+
+## 0. Ground rules
+
+### 0.1 Where hardware facts come from
+
+**Period manuals and first-hand artifacts only.** Register maps, bit layouts, and timings are sourced from original vendor documentation (MITS and other manufacturers' manuals), from period software's own equate blocks and disassembled PROMs, or from hardware in hand.
+
+**We do not read other emulators' source code to learn how hardware works.** That includes SIMH / AltairZ80. Second-hand facts inherit second-hand mistakes, and the whole value of this project rests on the hardware model being *right*, not on it matching somebody else's model.
+
+**One narrow exception:** MAME's HD63484 model is the structural basis of `src/chips/hd63484`, never a source of facts. It was authorized on #599, `docs/sources.md` records the terms, and they cover no other chip.
+
+**A second exception, for the x86 processors (pascal100, 2026-11-13, decided by the maintainer):** the x86 core of Clock Signal (CLK, Thomas Harte, MIT) executes the 8088's instruction set (`third_party/clk`, wrapped by `src/cpu/cpu8088.cpp`), and may do the same for the 80286 of the CompuPro CPU 286. It is admitted because a first-hand artifact checks it: the SingleStepTests suite, recorded from a real 8088, against which every result matches. MAME's i86 timing table was the starting point of `src/cpu/timing8088.h`; every number there is corrected against that suite's real cycle counts. Where CLK, MAME and the hardware disagree, the hardware wins. `docs/sources.md` records the terms.
+
+> **If a spec is missing, ask Patrick — he will source the manual.** Do not guess, do not reconstruct from memory, and do not go read another simulator. A wrong bit layout that "seems to work" is the most expensive kind of bug in a project like this, because the software will paper over it until one day it doesn't.
+
+When two sources disagree, say so in the board's `.md` and say which one won and why.
+
+Consequences already baked into this design:
+- **AltairZ80's port-0xFE "SIMH pseudo device" is not implemented**, and *its* `R.COM`/`W.COM` will not run here. See §12. *(This aged well: as of 2026-07-13 port 0xFE is the **88-VI/RTC's real control register** — 376 octal, straight out of the MITS manual. AltairZ80 put its pseudo-device on top of a port that belongs to an actual MITS card, and we would have had to evict it.)* **We ship our own `R.COM` and `W.COM`** against our own Host Bridge card at 0xB0 (§12.1) — same names, because the muscle memory is worth keeping; different code, different card, different protocol, nothing derived.
+- A board with no manual in the tree is **blocked on documentation**, not on code — and nothing is, today. The 88-ACR, the 88-VI/RTC, the 88-HDSK and the 88-PIO/4PIO were all on that list; every manual is now in `reference/`, and every one of those cards is built.
+
+### 0.2 Doc discipline
+
+Every board ships with a `docs/boards/<board>.md` on the standard template (§14). No board is merged without one. The **Limitations** and **Quirks** sections are the load-bearing ones.
+
+### 0.3 "Board" is the word, except when the sentence is about the artifact
+
+A board and a card are **the same object** — `src/core/board.h` says so outright, and that identity is not up for revision. This rule is about which of the two synonyms we write down, and it exists because the reader has to type one of them.
+
+**Default to "board."** It is the base class, the `src/boards/` directory, the `[[board]]` table in every machine file, and the `BOARDS` command. A reader who types `BOARDS` and reads "card" in the reply has to carry two words for one thing, forever, for no gain.
+
+**Write "card" only when the sentence is about the physical historical artifact** — the thing with jumpers and edge fingers that somebody bought in 1975. *"A JUMPER on the real card"*, *"the real card has no motor control"*, *"two cards, one chip, and not one line of polarity shared between them"*: these are better with "card", because "card" is what the period manuals and the people who owned these machines said. Swapping those to "board" would cost precision to gain tidiness.
+
+The test is simple: **if the sentence would still be true of the C++ object, write "board"; if it is only true of the PCB, "card" is right.** The failure this rule was written against is using both for one object in one breath — a config error that named the CPU CARD in one line and the CPU's `[[board]]` in the next.
+
+**§7.8 keeps its name.** "A chip is not a card" is an argument about physical parts and PCBs — exactly where "card" belongs — and it is cited by name from `theory.md`, three chip headers and two board headers. It is not an exception to this rule; it is an instance of it.
+
+### 0.4 Glossary — what category a word names
+
+The words below name *different kinds of thing*, and the confusion this section settles is the
+category error, not the spelling: a **tape** is a mounted medium, not a serial endpoint, even
+though both move bytes and both feel like "a connection." Read it once and the rest of the
+document stops surprising you. The authority for each is the code named in its line — this table
+tracks it, it does not define it.
+
+- **board** (= **card**) — a thing in a slot on the backplane: the C++ `Board` (`src/core/board.h`),
+  the `[[board]]` in a machine file, the row in `BOARDS`. §0.3 governs which of the two synonyms to
+  write. Everything else in this glossary hangs off a board.
+- **unit** — a **named, typed socket on one board** that holds a medium or a connection:
+  `MOUNT dj:drive0`, `CONNECT dj:tty`. **A unit is a NAME, not an index**, and one board can carry
+  several of different kinds — the Tarbell has a boot PROM *and* drives *and* a serial port (§9).
+  `Board::units()` is the list; `SHOW <id>` reads it.
+- **kind** — the *category* of a unit, `enum class UnitKind` (`src/core/board.h`): `Disk`, `Rom`,
+  `Serial`, `Tape`, `Cpu`. The kind decides the verb — `MOUNT` for a `Disk`/`Rom`/`Tape` image,
+  `CONNECT` for a `Serial` endpoint, *nothing* for a `Cpu` (a core is soldered on, §3.0.1) — and it
+  is **checked**: `MOUNT`ing a disk image onto a serial unit is an error with a sentence, not a
+  silent misfile (§9). (`kind` is overloaded on purpose in two unrelated places — `Value::Kind` is
+  the type of a *property*, and `BreakKind` is the type of a *breakpoint* — but on a unit it always
+  means `UnitKind`.)
+- **medium** — the host thing a mountable unit holds: a `DiskImage` (§7.3) or a `TapeImage`
+  (§7.3.1), buffered and written back. Named by a host path in `MOUNT`.
+- **tape** — a **mounted sequential medium** (`UnitKind::Tape`, a `TapeImage`), e.g. a cassette in
+  an 88-ACR. **It is NOT an endpoint.** Bytes flow through it, which is why it reads like a
+  connection, but you `MOUNT` a `.TAP`/`.WAV` file onto the deck's unit; you do not `CONNECT` it to
+  a `resolveEndpoint` scheme. This is the exact confusion the section was written for. (`BREAK TAPE
+  STOP`, §3.0.3, is a *device event* on such a deck — the deck reaching its auto-stop mark.)
+- **endpoint** — the **other end of a `Serial` unit's wire**, resolved by `resolveEndpoint`: `console`,
+  `socket:…`, `serial:/dev/…` or `serial:COM3`, `in:`/`out:` paper tape, `null`, `loopback` (§9,
+  §7.1). You reach one with `CONNECT`. An endpoint is a *destination*, never a medium — that is the
+  tape/endpoint line above, from the other side.
+- **line** — a **serial channel** on a card: its unit plus its *coding* (baud, data_bits, parity —
+  the frame, §10). A line is **8-bit clean** by contract; the character transforms (UPPER, STRIP7,
+  CRLF…) are the **console's**, never the line's (they were on the line once and it was reversed as
+  a corruption bug, §7.2). "Line" also appears in its plain-English senses (a status line, a line of
+  a config file) — the serial-channel sense is the one this glossary claims.
+- **device** — deliberately **not a modeled category**. There is no `Device` class, and there is
+  no "boot device" the monitor knows about (§10.0.3) — that is the whole point of §9. The word is
+  used loosely for "a thing the guest talks to" (a board, or a unit's far end), and in the one
+  formal place it appears — a **device-event** breakpoint, `BREAK <kind> <action>` (§3.0.3) — it
+  means exactly "an event a board raises that is not a bus cycle." When precision matters, prefer
+  board, unit, or endpoint; "device" is the fuzzy word and this line is its only license.
+
+---
+
+## 1. Purpose, goals, non-goals
+
+`altairsim` is a C++ simulator of the MITS Altair 8800 and the S-100 bus, running on Intel Mac, Apple Silicon Mac, Linux, and Windows, built with CMake.
+
+It is a **hardware development bench** that happens to run period software. The S-100 bus is a first-class modeled object, not an implementation detail, because the point is to develop **new hardware** as well as software. The interface is a SIMH/AltairZ80-style command monitor plus an MCP server so Claude can drive the machine efficiently.
+
+**Goals**
+- Emulate the Altair and the S-100 bus as closely as practical.
+- Make writing a *new* S-100 board straightforward, and make a new board behave the way a real card would on a real backplane.
+- Multiple instances of any board, each independently configured (e.g. two 88-2SIO *and* two 88-SIO boards at once).
+- Boards that move characters can use the console, a TCP socket, or a real host serial port — interchangeably.
+- An efficient, structured interface for Claude (MCP), not screen-scraping of a text CLI.
+
+**Non-goals (v1)**
+- Front panel **GUI**. No window, no LEDs you can look at, no switches you can click. **But the panel itself is a CARD** (`fp`, `docs/boards/mits-frontpanel.md`) — it decodes the sense switches at port `0xFF`, and it latches the address/data/status lines it sees go by, because that is what LEDs soldered to a bus *are*. A GUI is a view onto that card, and it needs no new bus concept to be written.
+  > This line used to read *"Front panel GUI (no LEDs, no toggle switches). Sense switches at port 0xFF are a **config value**."* It was wrong in a way worth keeping the scar tissue for. `sense` really was a config value — a byte on the `Machine` that **nothing put on the bus** — so the guest's `IN 0FFH` read the floating bus and got `0xFF` no matter what the operator configured, and DBL's stop-bit test was reading a wire, not a switch. Declaring the panel a non-goal is what made it plausible to fake the one part of it that software actually touches. The switches are on a card now, which is where §3 says they always were. (Patrick, 2026-07-12.)
+- Plugin ABI / dynamically loaded boards. All boards are compiled in and self-register.
+- Cycle-exact modeling *within* a bus cycle (T1…T5 signal states).
+
+---
+
+## 2. Portability and build
+
+- C++20, no compiler extensions. MSVC / clang / gcc.
+- CMake ≥ 3.20 with presets (`CMakePresets.json`) for macOS (universal `arm64;x86_64`), Linux, Windows.
+- **Dependencies: there are none, and that turned out to be achievable.** An earlier draft of this section planned to pull a TOML parser, a JSON library and **replxx** in via `FetchContent` with pinned versions. **None of that happened, and there is no `FetchContent` in the build at all.** The TOML parser (`src/config/toml.cpp`), the JSON encoder (`src/util/json.cpp`) and the line editor (`src/cli/lineedit.cpp`) are all in-tree and hand-written, so a fresh clone builds with a C++20 compiler and CMake and nothing downloaded. **The one exception is SDL3** (video, §7.4), and it is *detected* rather than required (`ALTAIRSIM_ENABLE_SDL`, default ON = "use it if it is here"): the simulator builds and every acceptance test passes with it absent, so CI runs headless. Nothing else is a dependency of the core, hard or soft.
+- Strict on warnings. `-fno-exceptions` is not required, but the hot bus path must be exception-free.
+- **Endianness and alignment:** snapshots must be byte-exact across all four targets. Serialize explicitly; never `memcpy` a struct.
+
+### 2.1 No `#ifdef`s. OS differences live in separate files.
+
+**Hard architectural rule, enforced by CI.** SIMH is riddled with conditional compilation and the result is code you cannot read without mentally executing the preprocessor. We are not doing that.
+
+> **`src/platform/` is `serial.h` + `socket.h` + `terminal.h`** — pure declarations, zero conditionals, **no OS type in any signature**: no `int fd`, no `HANDLE`, no `termios`. `posix/` is proved against two FTDI cables, a null modem and a pty; `win32/` against two real FTDI ports on a null modem, the real Winsock stack and a real console — each a leg of `ctest -L hw`, and `docs/porting-notes.md` records the traps that turned up. Windows is a required CI leg. CMake picks the directory; that `if(WIN32)` in `CMakeLists.txt` is the only place in the project that asks what OS it is on.
+>
+> **The rule earned its keep immediately.** The POSIX socket file wanted `MSG_NOSIGNAL` (Linux) / `SO_NOSIGPIPE` (macOS) to stop a hung-up client from killing the process with SIGPIPE — a genuine macOS/Linux divergence, which by this section's own rules would need its own *file*. `signal(SIGPIPE, SIG_IGN)` is plain POSIX, works on both, and needs no branch at all. **The right answer to a platform conditional is usually to stop needing it.**
+>
+> **THE LINT IS ON** (`cmake/lint_platform.cmake`, a build dependency of `altair_core` — not a test, because this section says *fails the build*). The terminal was the last thing in the tree with an OS underneath it; it is now `src/platform/terminal.h`, and `lineedit.cpp`'s `#if defined(_WIN32)` — the only conditional compilation in the project — is gone with it.
+>
+> **The lint greps for OS *headers*, not just OS *macros*, and that is the half that mattered.** Moving the terminal turned up two offenders and only one had a conditional: `src/host/console.cpp` simply `#include`d `<termios.h>` in the open, no `#ifdef` anywhere near it. A macro-only lint — the one this section originally specified — would have called that file **clean**, and it would have compiled here forever and failed on Windows the day someone tried. The `#ifdef` is the symptom. **Reaching for the OS outside the platform layer is the disease**, and the lint is aimed at the disease.
+
+OS differences are expressed as **an interface in a header with no conditionals at all**, plus **one implementation file per OS**, selected by CMake at configure time:
+
+```
+src/platform/
+├── platform.h          # the contract. Pure declarations. Zero #ifdefs.
+├── terminal.h  serial.h  socket.h  fs.h  time.h  console.h
+├── posix/
+│   ├── terminal_posix.cpp     # termios raw mode, restore-on-signal
+│   ├── serial_posix.cpp       # open / tcsetattr / cfsetspeed
+│   ├── socket_posix.cpp       # BSD sockets, poll
+│   ├── fs_posix.cpp
+│   ├── time_posix.cpp         # clock_gettime, nanosleep
+│   ├── macos/ serial_macos.cpp   # only where macOS genuinely differs from Linux
+│   └── linux/ serial_linux.cpp   #   (serial enumeration, custom baud rates)
+└── win32/
+    ├── terminal_win32.cpp     # SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_*
+    ├── serial_win32.cpp       # CreateFile, SetCommState/DCB, OVERLAPPED
+    ├── socket_win32.cpp       # Winsock, WSAStartup
+    ├── fs_win32.cpp
+    └── time_win32.cpp         # QueryPerformanceCounter, timeBeginPeriod
+```
+
+CMake selects the right directory. Nothing else in the tree ever asks what OS it is on.
+
+Rules that make this hold:
+- **Opaque handles.** Where the underlying type differs (`int fd` vs `HANDLE` vs `SOCKET`), the interface exposes an opaque handle or a pimpl, never a raw platform type. This is what usually forces people back into `#ifdef`; head it off in the interface design.
+- **macOS/Linux divergence inside POSIX** gets a `posix/macos/` or `posix/linux/` override *file*, never an `#ifdef __APPLE__` inside a shared file.
+- **The only permitted conditionals are feature toggles, not OS toggles** — e.g. `ALTAIRSIM_ENABLE_SDL`, which lives in CMake.
+
+**Enforcement:** a CI lint greps for `_WIN32`, `__APPLE__`, `__linux__`, `__unix__`, `_MSC_VER` anywhere outside `src/platform/*/` and **fails the build**. Without the lint this rule decays within a month: the first time someone needs one small thing on Windows an `#ifdef` appears "just this once," and you are SIMH again.
+
+Payoff: a board author writes against `ByteStream`, `DiskImage`, `Display`, `EventQueue` and **never sees an OS detail on any platform** — but only if the OS layer is genuinely sealed.
+
+---
+
+## 3. The CPU is a board
+
+In a real Altair the processor *is* a card: the MITS **88-CPU** (8080A), and later the Z80 cards (Ithaca, Cromemco ZPU, TDL) people swapped in. So the CPU lives in `boards/` with everything else and gets `properties()` (`SET cpu0 CLOCK=2000000`, `SHOW cpu0`), `reset(PowerOn|Bus)`, `serialize()`, a slot, and a line in `BOARDS` — no special cases.
+
+But there is a distinction to draw, and drawing it is what makes DMA clean:
+
+> **Boards *respond* to bus cycles. The CPU *originates* them.**
+
+Two concepts; a CPU card is both:
+
+```cpp
+class BusMaster {                        // drives cycles onto the bus
+    virtual StepResult step(Bus&) = 0;   // one instruction: T-states, and WHY it stopped
+};
+
+class Cpu8080Board : public Board, public BusMaster, public CpuCard { ... };  // the 88-CPU
+```
+
+*(`step()` returns a `StepResult`, never a bare T-state count — §3.1. A count alone
+cannot distinguish "this instruction legitimately took N cycles" from "something
+went wrong", and §16 records what that cost the prototype.)*
+
+**Built, 2026-07-11.** `src/isa/isa8080.cpp`, `src/cpu/cpu8080.cpp`,
+`src/boards/mits-88cpu.cpp`, and the debugger in `src/core/debug.cpp`. The card
+decodes nothing — `BOARDS` shows it with no memory and no I/O, and that is the
+truth about a processor card, not a gap in the table. It still has a *unit*
+(`1 cpu: 8080`), because the processor on the card is a unit like any other. See
+`docs/boards/mits-88cpu.md`.
+
+**The payoff is DMA.** S-100 has `pHOLD`/`pHLDA` precisely because a backplane can have more than one bus master — a disk controller or a Dazzler takes the bus away from the processor. With `BusMaster` as a first-class concept, a DMA card is simply a `Board` that *becomes* a `BusMaster` when granted the bus. DMA is not a bolted-on path in the bus; it is the same mechanism the CPU already uses. (It also leaves the door open to master/slave multiprocessor S-100 setups without designing for them now.)
+
+**The chip is not the card:**
+- `src/cpu/` — `Cpu8080`, `Cpu8085`, `CpuZ80`: pure instruction cores behind one `CpuCore` interface. No bus, no board, no config. Independently testable, which is what makes the 8080EXM/ZEXALL gate easy to run.
+- `src/cpu/cpuPmachine.cpp` — `PMachineCore`, the WD Pascal MicroEngine (built 2026-11-02, no card yet). It is word-addressed, so it reads memory through a `WordPort` that its card attaches, not through the `Bus`: on the Pascal-100 the board's Map and 16-bit transfer logic sit between the chip and the bus. See `docs/devguide/pmachine.md`.
+- `src/boards/mits-88cpu.cpp` — the **88-CPU card**: hosts a `CpuCore`, plugs into the bus, owns the clock property, handles `pINT`/`IntAck`, and honors both resets. (It does **not** serialize — nothing does; see §4.)
+
+A card's cores are **units** (§3.0.1) — a plain 88-CPU has exactly one, and a dual-processor card has two with one active. Swapping the *card* is `BOARDS REMOVE` / `BOARDS ADD`, exactly as you'd swap the physical thing.
+
+**The clock is the CPU board's property**, not the machine's: `SET cpu0 clock_hz=2000000`. It belongs to the card because that is where the crystal is, and because a backplane with no CPU card in it — which the machine was for its first week, and which `BOARDS REMOVE cpu0` still gets you — has no clock rate to speak of.
+
+### 3.0.1 A card may carry more than one processor, and they are units
+
+**Settled 2026-07-11 by Patrick.** A card with an 8080 *and* an 8085 on it — switching itself, or switching when a program does an `OUT` — is a real thing. So **cores are units** (§9), of kind `Cpu`, exactly one of them active:
+
+```
+altairsim> SHOW cpu0
+  unit   kind   holds
+    8080   cpu    active
+    8085   cpu    (idle)
+```
+
+**This needs no new bus concept whatsoever.** The card decodes the `OUT`, sets its own latch, and reports a different active core. That is structurally identical to bank switching on a memory card (§4.3) and to the Tarbell releasing PHANTOM\* on A5 (§4.2): *the board keeps its own state, and the bus arbitrates nothing.* `Machine` asks the backplane which board is the bus master and which core is live; two cards claiming it is contention and we say so; **no CPU card at all is a real machine you can build**, and it is the machine the bus was first tested in.
+
+**pascal100 amendment (Stage 3, 2026-11-03): the switch during a run.** The Pascal-100 (a Z80 and a WD MicroEngine on one board set) is the first board with two cores. Its manual (ch. II C.3, ch. IV M-O) adds two facts:
+
+- The switch is a bus HOLD. The core that loses control stops after its current bus transfer. The other core continues at the instruction where it stopped.
+- An interrupt can switch the cores with no `OUT`. NMI, and pINT when auto-transfer is on, give control to the Z80.
+
+The rules that follow from these facts:
+
+1. `CpuCard::cores()` and `coreCount()` list every core with its unit name. `CpuCard::settleSwitch()` applies a switch that no instruction made (an NMI or a pINT). A board with one core uses the defaults.
+2. The run loop asks the board for a switch at each instruction boundary. It asks after the clock advances and DMA runs, and before it records the next instruction. A switch is not a stop. The run loop asks only a board that has more than one core, so an Altair machine does not pay for it. `Machine::cpu()` also applies a pending switch. Between instructions nothing executes, so the flip-flop has already handed over the bus. Every caller that asks for the active core between runs (REGS, NEXT, `run from=`, the PC that a stop reports) gets the core that runs next.
+3. Each record in the instruction history names the core that ran it. The cycle-breakpoint unwind restores only that core. The one-shot resume and the target of `NEXT` also belong to one core.
+4. A PC breakpoint can name a core: `BREAK p100:me 1F8D` (the `board:unit` form of `MOUNT`). Without a core, it stops on the active core. A condition that names a register the core does not have does not hold. A MEM or IO breakpoint has no core, because a bus cycle belongs to the bus.
+5. REGS, STEP, HISTORY CPU and the MCP `regs`, `step` and `run` tools name the core on a board with more than one core. On a board with one core, the output does not change.
+
+The MicroEngine runs whole P-code operators, so it stops at the next operator boundary, not after its current bus transfer. This difference is a check for Stage 4.
+
+### 3.0.2 The disassembler belongs to the instruction set — not to the CPU, and certainly not to the card
+
+**Patrick, 2026-07-11:** an 8080 board with an onboard serial port and an 8080 board without one must be able to share the same 8080 CPU glue and the same disassembly.
+
+So "CPU" is three things wearing one name, and they are separated:
+
+| Layer | What it is | Lives in |
+|---|---|---|
+| **Instruction set** | a **stateless** disassembler: bytes in, text + length out. No registers, no state, no board. Named `"8080"`, `"8085"`, `"z80"` — a registry key, exactly like `"memory"` is for `makeBoard()`. | `src/isa/` — `disassemblerFor("8080")` |
+| **Core** | registers + execute. A plain object; **not** a `Board`. | `src/cpu/` — `Cpu8080`, `Cpu8085` |
+| **Card** | the thing you pull out with your hand: one or more cores, plus the serial port / boot PROM / CPU-select port that happen to be on *this* card. | `src/boards/` |
+
+Two 8080 cards that differ only in an onboard serial port share the instruction set and the core **completely**, and differ only in the card — which is the only place they differ in reality. The thing they have in common is not the chip and not the board: it is *the way bytes decode*, and that is why it needs a name of its own to be shared by.
+
+**A stateless disassembler runs with no CPU in the machine.** `DISASM FF00 CPU=8080` works against the DBL ROM in a machine with no processor in it — the same argument that made the bus testable before the CPU existed (§15), and it means the 8080 decode tables get exercised long before anything executes them.
+
+**But naming the CPU is not the normal case, and must not be** (Patrick). The active core reports which instruction set it speaks, and `DISASM` asks the machine:
+
+```
+which = the explicit CPU= argument
+      | the active core's own answer      <- THE NORMAL CASE: you never type it
+      | error: "no CPU in the machine -- say CPU=8080"
+```
+
+The fallout: on the dual-CPU card above, when the guest `OUT`s to switch from the 8080 to the 8085, **`DISASM` follows automatically** — "which instruction set" and "which core is active" are the same question, and it is already being asked.
+
+*(The word `CPU` does double duty — `DISASM ... CPU=8080` names an instruction set, while `BOARDS ADD 8080 cpu0` names a card. That is deliberate: `CPU=` is the word everyone already uses, and inventing a second one to be precise about a distinction the user does not have to care about would cost more than it buys.)*
+
+### 3.0.3 Registers are reflection, and the debugger is a bus observer
+
+**Registers use the same trick as `properties()` (§5).** A core exposes `registers()` — name, width, get, set — and *not* an `Regs8080` struct the monitor knows about:
+
+```cpp
+struct RegDef { const char* name; int bits; /* get, set */ };
+```
+
+Then `REGS`, `SET REG A=3F`, breakpoint conditions (`BREAK 100 IF A==0`) and the MCP schema **all work for a Z80 or a 6502 the day it lands, with no monitor change** — as the Z80 then did. (`SNAPSHOT` would too, if it existed; §13.) It is the same bet that already paid for `SET`/`SHOW`/TOML/MCP: one schema, no second copy to drift.
+
+#### 3.0.3.1 The status line: the core describes it, the monitor renders it
+
+**Every stop prints one line, and it is DDT's** (Patrick, 2026-07-13) — because three lines is what you read when what you wanted was to *glance*:
+
+```
+C0Z1M0E1I0 A=3F B=0000 D=00FF H=8000 S=0100 IE=1 P=0102  MOV A,B
+```
+
+That layout is **not** generic — which registers pair up, which are lamps, what each is *called*, and in what order are all real differences between an 8080 and a 6502. But it is also **not** a formatter handed to the core: that would have put a `printf` where the reflection layer is, and every new ISA would owe the monitor a second copy of its register file. So `RegDef` grew a display contract instead, and the split is:
+
+| | |
+|---|---|
+| **`name`** | **identity.** What you TYPE — `SET REG`, `BREAK … IF`, MCP. |
+| **`label`** | **presentation.** What the status line CALLS it. |
+| **`show`** | `Flag` (a lamp: label + one digit, no spaces, clustered at the front), `Field` (`LABEL=hex`, in the order the core listed it), or `Off` (reachable by name, but not on the line). |
+
+The 8080 uses that to speak DDT exactly: the sign flag is *named* `S` and *labelled* `M` (minus); parity is `P` and prints as `E` (even); the aux carry is `AC` and prints as `I` (interdigit). `IE` is one bit but it is a **`Field`**, not a lamp — DDT had no letter for it, and interrupt state is too load-bearing to omit on a machine with a VI/RTC in it. **PC is last, and nothing may come between `P=` and the instruction**: they are the pair your eye reads together.
+
+Two label collisions are real, and both are DDT's own: `S=` on the line is the *stack pointer* while the sign flag prints as `M`; `B=` on the line is the *BC pair* while `SET REG B=3F` is still the 8-bit half. Name is identity, label is only paint — so neither is ambiguous to the machine, only to a reader, and DDT taught that reader forty years ago.
+
+**The pairs are not decoration.** `BC`/`DE`/`HL` are `RegDef`s in their own right, over the same bytes as the halves — so `SET REG HL=BEEF` followed by `SET REG L=01` gives `H=BE01`, and `BREAK 100 IF HL==8000` will work with no new machinery.
+
+`bits` no longer means "flag": the renderer keys on `show`, never on width. A register narrower than a nibble prints as a number, which is what makes `IE=1` a field rather than a hex digit.
+
+**Breakpoints and tracing are NOT CPU features.** If a core owned them, every core would reimplement them and they would differ in subtle ways. They don't belong there:
+
+- **`BREAK IO`, `BREAK MEM R|W`, `TRACE`, `HISTORY`** are questions about **bus cycles**, and the bus already broadcasts every cycle to every board (`snoop()`, §4.2.2). The debugger watches that same stream. **CPU-agnostic, and the machinery already exists.**
+- **`BREAK <addr>`** is the only CPU-flavoured one, and it is just *"PC equals X after a step"* — one comparison against a register the reflection layer already exposes.
+- **`BREAK <kind> <action>`** is a third plane: a **device-event** breakpoint, first member `BREAK TAPE STOP` (halt when a cassette deck reaches its auto-stop mark, so a load can be caught without knowing the loader's end address). There is no bus cycle for *"the tape ran out"*, so it is neither a cycle observer nor a PC compare — the run loop **polls** each board's `takeAutoStop()` edge latch at the instruction boundary and stops there, exactly as `SET BUS UNCLAIMED=HALT` samples its latch (§4.6.1). One table (`kDeviceEvents` in `core/debug.h`) drives the parser, `describe()` and the poll together, so a future member (`PRINTER PAGE`, `LINE CARRIER`, `DISK SEEK`) is a single row. It is still CPU-agnostic — the CPU is never asked anything — so it inherits onto any core for free, the same as the other two.
+
+So the debugger lives in `Machine`, drives `cpu->step(bus)`, and asks only generic questions. **An 8085 card inherits the entire debugger for free.**
+
+### 3.1 Core semantics
+
+- **Dispatch:** 256-entry table of function pointers or a `switch`. *Not* a bit-pattern if/elif chain (the Python prototype's linear scan).
+- **T-states:** counted per instruction, with the conditional-branch fixups (CALL 17/11, RET 11/5). Unlike the Python prototype, the count is **load-bearing** — it drives `Board::tick()`, baud rate, disk rotation, and the clock throttle.
+- **Flags:** `S Z 0 AC 0 P 1 CY`. Get the 8080 `ANA`/`ANI` half-carry rule right: `ac = (a|b) & 0x08`. Z80 gets the full flag set including undocumented bits 3/5 (XF/YF), `WZ`/MEMPTR, and the IX/IY prefix chains.
+- **Interrupts** (absent from the Python prototype — its `EI`/`DI` set a flag nothing reads): an `INT` line raised by the bus, an `IntAck` cycle that fetches the instruction from the bus, plus Z80 IM 0/1/2 and 8085 RST 5.5/6.5/7.5 + TRAP.
+- **`step()` returns an explicit `StepResult { uint32 tStates; Status status; }` — never a sentinel value.** See §16 for why (the RLC/RRC bug).
+
+### 3.2 Validation is a gate, not a nice-to-have
+
+The CPU is not "done" until **TST8080, 8080PRE, CPUTEST, and 8080EXM** pass (and ZEXALL/ZEXDOC for Z80).
+
+**PASSED for the 8080, 2026-07-11.** All four, including all 25 CRC groups of 8080EXM. Suites and their period source in `tests/cpu/` (from altairclone.com); harness in `tests/cputest.cpp`; `ctest` runs the quick three, `ctest -L slow` runs 8080EXM (~9 minutes, 2.9 billion instructions).
+
+**The harness runs the CP/M `.COM` files with no CP/M and no console card**, via a BDOS stub at `F000` written in *real 8080 machine code*, reached through the real `JMP` at `0005`, writing to a real port on a real board. Trapping `PC == 0005` in C++ would have been less code and was rejected: it would fake the `CALL`, the `RET`, the stack and the `OUT` inside the one program whose job is to check that we implement them correctly. **A validation harness may not emulate the thing it is validating.**
+
+*The Python prototype's own notes say these were never run and that DAA is "not fully tested." That debt is not inherited: `<daa,cma,stc,cmc>` is one of the 25 groups, and it passes.*
+
+---
+
+## 4. The S-100 bus — the load-bearing spec
+
+The bus owns arbitration. Boards never see each other.
+
+```cpp
+enum class Cycle { MemRead, MemWrite, IoRead, IoWrite, IntAck };
+
+struct BusCycle {
+    Cycle    type;
+    uint16_t addr;      // memory address; for I/O the port is addr & 0xFF
+    uint8_t  data;      // valid on writes; BACK-FILLED on reads before snoop()
+    bool     phantom;   // PHANTOM* asserted this cycle
+};
+
+class Board {
+public:
+    virtual ~Board() = default;
+    virtual const char* type() const = 0;
+
+    // Decode: does this board respond to this cycle?
+    // Returns false when the board is disabled, banked away, or is honoring
+    // an asserted PHANTOM* — see §4.2. Decode is STATE, not just address math.
+    virtual bool     decodes(const BusCycle&) const = 0;
+    virtual uint8_t  read (const BusCycle&)       = 0;
+    virtual void     write(const BusCycle&)       = 0;
+
+    // NOTE there is deliberately NO tick(dt). An earlier draft had one, and a
+    // per-cycle tick on every card is the polling loop 7.5 exists to avoid: a
+    // card that wants to do work at a time schedules a DEADLINE on the Clock,
+    // and a card that must notice host input is pump()ed. On a quiet line a
+    // board schedules nothing at all. See 7.5.
+
+    // PHANTOM* (S-100 pin 67). A board may PULL it for a given cycle — that is
+    // how a boot ROM shuts off the RAM beneath it. The bus does NOT pick an
+    // overlay winner; it carries the signal and the RAM disables itself. §4.2.
+    virtual bool     assertsPhantom(const BusCycle&) const { return false; }
+
+    // Interrupts. A board PULLS pINT and holds it; the bus reads the wire and does
+    // NOT invent a vector — see §4.4 and §4.4.1.
+    //
+    // COMBINATIONAL AND PURE, exactly like decodes(). The board announces a change
+    // with intChanged(); the bus caches the wire-OR. (This was non-const, and there
+    // was a section defending that. Reversed 2026-07-12 — see §4.4.1.)
+    virtual bool     assertsInt() const { return false; }   // pINT (S-100 pin 73)
+    virtual uint8_t  assertsVi()  const { return 0; }       // VI0..VI7, as a BITMASK
+    virtual bool     watchesVi()  const { return false; }   // an 88-VI says yes
+    void             intChanged();                          // "my pin moved"
+
+    // Bus mastering (DMA): assert pHOLD; when granted pHLDA, the bus calls
+    // busMaster() and this board drives cycles itself, exactly as the CPU does.
+    virtual bool        requestsBus() const { return false; }
+    virtual BusMaster*  busMaster()         { return nullptr; }
+
+    // Configuration reflection — see §5.
+    virtual std::vector<Property> properties() = 0;   // by value, and NOT const:
+                                                     // a card may compute its list. See 5.
+
+    // Reset — see §6.
+    virtual void     reset(Reset kind) = 0;
+
+    // State (snapshot / restore) -- BUILT for SNAPSHOT/RESTORE (13). Every board,
+    // the CPU core and the Clock implement serialize()/deserialize() over
+    // StateWriter/StateReader (core/statefile.h); Machine::snapshot()/restore()
+    // drive them, and the two monitor commands drive that. A board writes its
+    // RUNTIME STATE and re-arms its own Clock deadlines on the way back in; config,
+    // host handles and derived caches do not travel (13.1). RECORD/REPLAY, which add
+    // a T-stamped event log on top, are NOT built yet and resolve at the prompt.
+    virtual void serialize(StateWriter&) const;
+    virtual void deserialize(StateReader&);
+};
+```
+
+### 4.0 This is the Altair bus, not IEEE-696 — and that is a decision, not an omission
+
+The bus modeled here is the **1975 Altair 8800 bus** — the 100-pin backplane MITS shipped, later called S-100 when other makers cloned it. It is **not IEEE-696-1983**, the belated formal standard, and this simulator will not grow toward 696. That is a position, and the reasons are real even where the conclusion is also a preference. **On principle: no IEEE-696 here.** (Patrick.)
+
+**696 was a different bus wearing the same connector.** The committee needed a 16-bit, multi-processor, 16 MB bus, and it got there by *redefining pins the Altair had left undefined, grounded, or spent on the front panel*:
+
+- **Address** went from A0–A15 (64 KB, all an 8080 can address) to A0–A23 (16 MB), by claiming previously reserved pins.
+- **Data** went from the Altair's **two separate 8-bit unidirectional buses** (DI0–7 in, DO0–7 out — a shape this simulator's `BusCycle` still mirrors) to a scheme where those same lines combine into one 16-bit path.
+- The 8080-specific **status byte** the Altair broadcast every cycle — the thing the front panel and this simulator's `Cycle` enum both read — was **generalized away**, because a 68000 has no PSYNC/8080 status to broadcast.
+
+**Mixing an Altair board and a 696 board in one backplane is not merely unsupported — it is documented to be harmful.** The clearest case is the front panel's own signals. The Altair front panel drives **memory PROTECT / UNPROTECT** (pins 70 and 20) and **sense-switch disable** `/SSW DSBL` (pin 53) so the operator can write-protect memory and read the address/sense switches at port `0xFF`. IEEE-696 dropped those functions and **grounded** the pins. So an old Altair board that pulls pin 70 to protect its RAM, dropped into a 696 machine, is now shorting a signal the new machine grounds — and can disable the host. Two boards, same pin, two incompatible meanings, decided at the connector. There is no honest way to model *both* buses in one machine, because the real hardware could not share one either.
+
+And that last point is the one that matters most for **what this project is**. §1 calls this a hardware development bench whose reason to exist is the Altair and its **front panel** — a `Board` (`fp`) that halts the processor, seizes the address and data buses, and single-steps and examines memory using exactly the 8080 status lines and the protect / sense-switch pins that 696 threw out. IEEE-696's whole design goal — a processor-agnostic bus with formal temporary/permanent-master arbitration — is a goal that treats the Altair front panel as legacy weight to shed. A simulator built around that panel does not get to adopt the standard that deprecated it. The 696 machines are their own thing, well documented elsewhere; this one is the machine with the switches on the front.
+
+None of this bars a board that *happens* to be a later S-100 design from being modeled here, as long as it behaves within the Altair bus this simulator presents. What it bars is teaching the **bus** 696 semantics — 24-bit addressing, 16-bit data folding, arbitration the front panel cannot participate in. The Tarbell footnote in §4.2.2 is the same fault line seen from the board side: a **pre-696** card with no PHANTOM\* at all, which is exactly why it is the awkward one.
+
+> The pin facts above are read off the side-by-side S-100 / IEEE-696 pin list at **[s100computers.com](https://www.s100computers.com/S100%20Bus%20Pins.htm)** — John Monahan's archive, one of the authorized web sources in `docs/sources.md` — with the front-panel PROTECT/UNPROTECT/`/SSW DSBL` roles confirmed against the MITS *Altair 8800 Theory of Operation* (`reference/`, already in the manifest for the `fp` board). This is design rationale, not a board model, so it earns no `reference/*.md` of its own.
+
+> **pascal100:** the text above is altairsim's position, for altairsim. pascal100 first added
+> IEEE 696 as a **second bus type** beside the Altair bus (Stage 2, on Patrick Linstruth's advice
+> to keep the Altair machines untouched), then, as a program of its own, **removed the Altair bus**
+> (standalone step 3b, 2026-11-09), with the front panel and the Turnkey board that needed it.
+> pascal100's bus is IEEE Std 696-1983 only: a **24-bit** memory address, a 16-bit I/O address
+> (boards decode A0-A7), and the sXTRQ\*/SIXTN\* 16-bit transfer. A board that ignores A16-A23
+> answers in every 64K segment, as on the real bus. A machine file may still say
+> `bus = "ieee696"`, so altairsim can load it; `bus = "altair"` is refused.
+>
+> **Built:** `BusCycle.ext/xtrq/dataHi`; the physical paths (`memReadX`/`memWriteX`/`peekX`)
+> with segment tables built only for a board that says `decodesExtended()`; the 16-bit
+> transfer (`memRead16`/`memWrite16`, the master's byte-serial helpers); the
+> `AddressTranslator` hook (the Pascal-100's Map); 24-bit DMA (Disk 1, Disk 1A); the `memory`
+> board with `ext = true`, one board of any size up to 16M (2026-11-12). The monitor, debugger
+> and MCP tools show physical addresses (six digits) for the commands that need no processor,
+> and the processor's 16-bit addresses for the rest.
+>
+> **Not modeled:** TMA0\*-3\* arbitration among several temporary masters (one pHOLD wire;
+> needed before a second DMA board such as the Disk 3), ERROR\*, PWRFAIL\*, CLOCK, MWRT and the
+> power and timing lines. The status word is still the 8080-style `Status` byte; IEEE 696 has no
+> sSTACK (pin 98 is ERROR\*), and the 8085 core still sets `StStack` (left for the CPU 85/88
+> board). The Developer Guide page *The IEEE 696 bus* (`docs/devguide/ieee696-bus.md`) tells a
+> board author what to do; the standard's distillation is `reference/IEEE_696_1983.md`.
+
+### 4.1 Registration and decode
+
+A board declares I/O port ranges and memory address ranges at construction (from its TOML config). The bus builds decode tables. `decodes()` is the second-level check for boards whose decode is conditional (bank-enabled, phantomed, drive-selected).
+
+### 4.2 PHANTOM* is a signal a board pulls — the bus does not arbitrate an overlay
+
+**An earlier draft got this wrong in exactly the way §4.4 warns about.** It said a memory board has a "phantom mode" of `none | read | write | both`, and that a ROM board with `phantom = "read"` *"overlays the RAM beneath it for reads while writes fall through."* That describes the **bus** looking at two boards, picking a winner, and routing reads to one and writes to the other. The bus does not do that, any more than it invents an interrupt vector.
+
+**What actually happens on the backplane:** PHANTOM\* is **S-100 pin 67**, a line any board may pull low. A boot ROM pulls it; memory boards that are strapped to honor it **disable their own drivers** while it is low. Nobody arbitrates. The overlay is *emergent* — the ROM is the only board still answering, because the RAM switched itself off.
+
+So the model is two ordinary board behaviors, and no bus special case:
+
+```cpp
+// Pull PHANTOM* for the cycles I mean to shadow. A board strap:
+//   phantom = none | read | all      (see docs/boards/s100-memory.md)
+bool MemoryBoard::assertsPhantom(const BusCycle& c) const {
+    const Region* r = owner(c.addr);
+    if (!r || r->kind != Rom) return false;          // only my ROM shadows anything
+    return phantom_ == All || (phantom_ == Read && c.type == Cycle::MemRead);
+}
+
+// If SOMEONE ELSE pulls PHANTOM* and I honor it, I am not here.
+bool MemoryBoard::decodes(const BusCycle& c) const {
+    // `!assertsPhantom(c)` is load-bearing: a ROM card pulls PHANTOM* to shadow
+    // the RAM under it, and a card must not switch itself off with a signal it is
+    // ITSELF driving -- or nobody drives the address and the ROM reads back FF.
+    if (c.phantom && honorsPhantom_ && !assertsPhantom(c)) return false;
+    const Region* r = owner(c.addr);
+    if (!r) return false;                            // unpopulated page / empty socket
+    if (c.type == Cycle::MemWrite && r->kind == Rom) return false;   // ROM never answers a write
+    return true;
+}
+```
+
+> **That `!assertsPhantom(c)` clause was missing from the first draft of this document, and it was a real bug** — caught by the acceptance test for the *default* configuration, which is the one everybody would have used. It is worth keeping the scar visible: the board still answers only questions about *itself* (its own output pin), so the rule is board-local and the bus is still not involved. The fix is one clause, in the board, where it belongs.
+
+The bus's whole job is a **three-pass cycle**: ask every board whether it pulls PHANTOM\*, set `BusCycle::phantom`, run the decode, and then **show the finished cycle to every board** (`snoop()`, §4.2.2). Carrying a signal, running a decode, and letting the cards watch. No decisions.
+
+**A ROM does not decode a write.** It does not reject the write, or ignore it, or log it — it never answers the cycle. Everything else follows from that and needs no rule of its own:
+
+| What else covers the address | ROM's `phantom` strap | The write |
+|---|---|---|
+| Nothing | any | Nobody latches it. It is gone. |
+| Another card's RAM | `read` | **Lands in that RAM.** Reads still come from ROM — shadow-RAM. This is the **Tarbell** boot PROM writing the sector it is loading into the RAM it is sitting on top of. |
+| Another card's RAM | `all` | That card honors PHANTOM\* and switches off for writes too. The write vanishes. |
+
+**PHANTOM\* is a LEVEL, and the read/write distinction lives on the *honoring* board.** A card that shadows another asserts the pin and **holds** it, like an interrupt, until something releases it — it does **not** gate it with the read strobe, and it has no opinion about writes. The memory card's jumper is therefore `honors_phantom = none | read | all`, **not a bool**: `read` means *stop answering reads, keep answering writes*, so the byte lands in the RAM under the shadow. That is what lets a Tarbell bootstrap write the sector it is loading into the very RAM its own PROM is covering.
+
+> **Corrected 2026-07-12 by Patrick, from the Tarbell schematic.** This paragraph previously said the reverse in bold — that the gate lived on the asserting card and that `honors_phantom` "must never grow a `read` mode." It was **reasoned, not sourced**, which is the exact failure §0.1 exists to prevent. And the Tarbell's own documentation, quoted in `docs/boards/s100-memory.md`, had said so all along: *"the memory boards installed in the system must allow writes to their RAM, but not reads."* **The memory boards.**
+
+Payoffs, which is how you know it is right:
+- **"Writes fall through" is no longer a special rule.** It is what happens when a ROM asserts PHANTOM\* on reads and not on writes. Shadowing *both* is equally expressible, and neither is a case in the bus.
+- **`honors_phantom` is a board strap, because on real hardware it is a jumper.** A memory board that ignores PHANTOM\* keeps driving, you get contention (§4.6), and the simulator reports the same bug the real backplane would have handed you.
+- **The operator can still write ROM, and the guest still cannot** — because `LOAD … ROM` (§10.2) reaches behind the bus into the board's store. Burning a PROM is not a bus operation on real hardware either; you pull the chip. Model it as a bus write and the bus would have to know *who originated a cycle*, which a real backplane cannot know and no board should ever have to ask.
+- **Any new board can shadow memory** without the bus learning about it.
+
+### 4.2.1 Boards enable and disable — including ROMs that vanish after boot
+
+**Decode is state, not address arithmetic.** A memory board is not merely "at 0000–1FFF"; it is at 0000–1FFF *when it is enabled*, on *the live bank*, and *when PHANTOM\* is not shutting it off.
+
+This is not a corner case — it is how S-100 machines boot. **A boot ROM commonly appears at low memory on reset, runs, and is then switched out so the RAM underneath becomes visible**, often by the boot code writing to the ROM board's own I/O port as nearly its last act. The address the ROM occupied is *supposed* to become RAM.
+
+So a memory board needs to be able to turn itself on and off, and there are exactly three honest ways it happens — all of which are ordinary board behavior:
+
+| Trigger | Mechanism |
+|---|---|
+| **The guest writes to the board's port** | An ordinary `IoOut` the board decodes, mutating its own decode state. The boot ROM disabling itself. **Not a bus special case** — same shape as bank select (§4.3). |
+| **Reset** | `reset(PowerOn)` restores the power-up state — which for a boot ROM means **enabled again**, because that is the point of a boot ROM. `reset(Bus)` may or may not, and the board's `.md` must say **concretely** which (§6). Get this wrong and you get the classic "boots from power-on but not from the reset button." |
+| **The operator** | *Planned, not built:* `SET mem1 ENABLED=OFF` as a runtime `properties()` value like any other, for debugging. The first two mechanisms are real; this third one is not. |
+
+`enabled` was therefore to be a **standard runtime property on every memory board**, with
+`SHOW BUS MAP` showing it, because a board that is present but decoding nothing is otherwise
+invisible and maddening.
+
+> **THE OPERATOR'S SWITCH DID NOT SHIP.** `Board::enabled_` exists as
+> a plain C++ field with a non-virtual setter (`src/core/board.h`), reachable from no `Property`
+> — so `SET mem0 enabled=off` is refused, and `MemoryBoard::properties()` declares
+> `honors_phantom, phantom, fill, seed, pages` and no `enabled`. The
+> guest-writes-its-own-port and reset paths above are real and are exercised; only the operator's
+> switch is missing. The argument for it still stands exactly as written.
+
+**The display half shipped differently (#658), and needs no property.** `SHOW BUS MAP` takes
+each range from the board's `memMap()` and asks the bus which of its addresses the board answers
+now (`Bus::respondersTo()`, the question `WHO` asks), for a read or for a write. A PROM the guest
+has switched out has no row, and RAM that a shadow takes off the bus for reads and writes shows
+only its live part. `memMap()` stays a fixed description of how the board is built — it is what
+`SHOW MACHINE` prints, and that must not change when the guest writes a port. So no board makes
+`memMap()` follow its latch.
+
+What `SHOW BUS MAP` prints is the range, the board, what it is, and the unmapped
+remainder — no `state` column and no `notes` column:
+
+```
+altairsim> SHOW BUS MAP
+MEMORY
+  0000-DFFF  mem0     ram
+  FF00-FFFF  mem0     rom  builtin:dbl  phantom:all
+  unmapped: E000-FEFF  (floats to FF)
+```
+
+The last line is the one that earns its keep: a hole in memory that reads `FF` forever is the
+single most confusing thing a backplane can do to you, and it is invisible unless something says
+so.
+
+Note that one board occupies **two disjoint ranges**, because a real card carries several populated regions and empty sockets between them (`docs/boards/s100-memory.md`). The map is per-*range*, not per-board.
+
+> **Open — needs a manual, per §0.1.** *Which* boards disable themselves, at *which* port, with *what* bit? That is board-specific and I will not guess it. The mechanism above is general and costs nothing; the specific straps get filled in per board as the manuals arrive. **Patrick: which board do you want first?**
+
+### 4.2.2 `snoop()` — every board sees every cycle
+
+**The address bus is not addressed to anyone.** It is simply present, and any card may watch it whether or not it answers. So `Board` has a third bus method, called **once per completed cycle, on every board**:
+
+```cpp
+virtual bool assertsPhantom(const BusCycle&) const;   // COMBINATIONAL. Pure.
+virtual bool decodes(const BusCycle&) const;          // COMBINATIONAL. Pure.
+virtual void snoop(const BusCycle&);                  // CLOCKED. Latch here, and only here.
+```
+
+The first two are called **several times per cycle** — once to resolve PHANTOM\*, again inside each board's own decode — so they must have no side effects. `snoop()` is the clocked half, and it is the **only** place a board may latch what it saw.
+
+**The card that forced this is the Tarbell** (`docs/boards/tarbell-sd.md`). Its 32-byte boot PROM shadows RAM from POC\*, and it releases PHANTOM\* permanently the first time it sees a memory read with **A5 high**. Both halves are load-bearing:
+
+- The release must be **combinational**, because the bootstrap's own first fetch out of the PROM *is* the read with A5 high. If the release waited a cycle, that fetch would happen while memory was still shadowed, read `0xFF` off the floating bus, and no Tarbell would ever have booted.
+- The release must also **latch**, or a later data read below `0x20` would re-shadow the PROM over the sector just loaded there.
+
+> **AND THE REAL CARD HAS NO PHANTOM\*.** The Tarbell is a **pre-IEEE-696, July 1977** design: what
+> it actually asserts is **STATUS DISABLE\*** (pin 18), and it drives the S-100 status lines itself.
+> Modelling that honestly would mean building status lines *in order to have something to disable*,
+> so `tarbell` and `tarbelldd` model the shadow as PHANTOM\* with `honors_phantom = "read"` instead.
+> That is a deliberate abstraction and `docs/boards/tarbell-sd.md` makes the whole case for it —
+> what it buys, what it costs, and the one behaviour it cannot reproduce.
+>
+> `snoop()`, `wantsSnoop()` and `decodeIsPageUniform()` are the hooks that shadow needs, and
+> `TarbellBoardBase` (`src/boards/tarbell.h:65-67`) is the shipping board that overrides all three —
+> `decodeIsPageUniform()` returns false because the decode is A5-gated *inside* page 0, which is
+> exactly the case a page-granular cache cannot express. `tests/test_phantom.cpp` keeps its own
+> `TarbellBoot` fixture beside it, because the combinational-release trap above cost a day to find
+> the first time and a fixture that isolates it is cheaper to read than a whole floppy controller.
+>
+> **PHANTOM\* itself is not Tarbell-only.** The memory board asserts it for an ordinary
+> ROM-shadows-RAM card, and `tests/test_memory.cpp` covers all three straps.
+
+The bus does not know any of this happened. It is one flip-flop, on one card, and that is the point: a real backplane has no "notify" mechanism, so neither does this one — `snoop()` is not a callback, it is a card looking at wires that were in front of it the whole time.
+
+**And the debugger watches the same stream from outside the backplane.** `Bus::observe()` hands a callback the very cycles the cards see, and that is the entire implementation of `BREAK IO`, `BREAK MEM`, `TRACE` and `HISTORY` (§3.0.3). They are therefore **not CPU features**, they cost the cores nothing, they work on any processor the day it lands — and they catch a **DMA** transfer or a front-panel `DEPOSIT` just as readily as a `MOV`, because a cycle is a cycle no matter who originated it.
+
+An observer is **armed only while the machine is running.** The monitor's own `DUMP` and `DEPOSIT` are real bus cycles — that is the point of them — so an always-armed `BREAK MEM W` would "fire" on the operator's own `DEPOSIT`, with no program running to stop and nothing sensible to report.
+
+### 4.3 Banking — the strongest evidence in this document that boards must own their decode
+
+Banking is its own board type, `bankmem` (`docs/boards/bankmem.md`) — the strongest possible expression of this section's conclusion, since it means a banked card cannot even *share code* with the plain `memory` board's decode. A banked card registers a bank-select I/O port; a guest write mutates the board's **own** state to decide which plane is live. This is an ordinary `IoOut` — **not** a bus special case, and the same mechanism as §4.2.1's enable/disable.
+
+**What a bank select *does* is the board's business, and this document states no rule about it.** On the cards below it swaps a 64K plane, several planes, or a page built from 16K cells. On some other card it might do something else. The bus carries the `OUT` and the board decides — that is the entire point.
+
+If you are ever tempted to hoist banking into the bus or the monitor, read this table first. These are **real** cards (`docs/boards/bankmem.md`, each sourced from its own manual — see `reference/*.md`):
+
+| Card | Port | Banks | The data written selects the bank how? |
+|---|---|---|---|
+| Vector Graphic 64K | **0x40** | 8 | **One-hot, select-one.** `0x01`→0, `0x02`→1, `0x04`→2, … `0x80`→7. Tolerates `0x41`/`0x42` (bit 6 ignored) — an OASIS quirk, not a design feature. |
+| Cromemco 64KZ/64KZ-II | **0x40** | 8 | **8-bit mask, select-many.** Bit *N* enables bank *N*, and several banks are live at once — `OUT 40,28` enables banks 3 *and* 5 together. |
+| North Star HRAM | **0xC0** | ≤6 usable | **On/off plus one-hot toggle**, not a bank number at all: bit 0 is on(0)/off(1), bits 1–7 are a one-hot address of *which* bank to toggle, and switching banks means turning the old one off and the new one on as two separate acts. |
+| SD Systems ExpandoRAM II | **0xFF** | 10, or 11 with a partition | **Low nibble = page.** The real board decodes the page through an 82S130 PROM into 16K banks spread over several boards, under a 16K or 32K common region (Fig 2-4). We keep one segment per page for the whole subsystem, which shows the guest the same pages. A page with no RAM leaves the switched window empty. `partition=none` (one board of 4164s, page = bank) is an *approximation*, flagged in `docs/boards/bankmem.md`: the manual gives no map for it. |
+| SD Systems ExpandoRAM III | **0xFF** | 5 per board, ≤10 | **Low nibble = page**, through a PROM that drives a bank enable *and* the RAM's A14–A15, so each 16K of the CPU's space comes from a different 16K cell for each page. Modelled cell by cell from the manual's Fig 2-2, with its misprinted cells fixed and named in `docs/boards/bankmem.md`. A page with no cell leaves the switched window empty. |
+
+**Different mechanisms, not parameters of one mechanism.** The sharpest example is that **Vector Graphic and Cromemco 64KZ sit on the same port, 0x40, with incompatible encodings** — one is select-one-of-eight, the other is a mask that can hold several banks live simultaneously. A generic "write a byte, get a bank" abstraction cannot express both, so the board must own its decode or the model silently corrupts whichever card isn't the one the code was written for.
+
+No generic "bank number" abstraction survives that table. Any `BANK=<n>` in the monitor (§10.2) or any bank arbitration in the bus would have to pick one card's convention and be silently wrong about the rest. **The board owns its decode, or the model is a lie.**
+
+One more thing the table gives us for free: **Vector Graphic and Cromemco 64KZ both sit on port 0x40**, so both in one machine is a genuine I/O collision — which §4.6's contention detector catches and names, exactly as a real backplane would have.
+
+### 4.4 Two interrupt models — both required
+
+**(a) Un-vectored: `pINT` alone, no VI board.** A board pulls `pINT` (S-100 pin 73). The CPU finishes the current instruction and, if interrupts are enabled, runs an **`IntAck` bus cycle** (`sINTA`). During that cycle the interrupting board may *drive the data bus*, and whatever it drives is **executed as an instruction** — conventionally an `RST n`. **If no board drives the bus, it floats high and the CPU reads `0xFF` = `RST 7` (0x38).** That is not a fallback hack; it is how the machine actually behaves, and it is why the PMMI's factory jumper (E10→E9, straight to pin 73) yields RST 7 with no vector logic at all. Model the floating bus honestly and this falls out for free.
+
+**(b) Vectored: VI0–VI7, with an 88-VI board.** Eight prioritized request lines, VI0 highest. **The bus does not arbitrate these — the 88-VI board does.** The VI board watches the eight lines, applies priority and its own mask, drives `pINT` itself, then claims the `IntAck` cycle and drives the corresponding `RST n` onto the data bus.
+
+**Consequence for the API:** the bus must *not* pick a winner and ask it for a vector. That is the VI board's job; building it into the bus would make the VI board unimplementable as a board and would fabricate vectored behavior on a machine that has no VI card in it. The bus does exactly three things:
+
+1. carry `pINT` as the wire-OR of every board asserting it,
+2. carry VI0–VI7 as eight signals boards can assert and other boards can observe,
+3. run an `IntAck` cycle that boards claim like any other bus cycle.
+
+Everything else is a board. The 88-VI is then just another board with no special privileges — and so is any *new* interrupt controller you invent, which is the point of the project.
+
+A board declares its jumpering as a property: `interrupt = none | int | vi0 … vi7`. An 88-2SIO with `interrupt = int` gives RST 7 with no VI board present; the same board with `interrupt = vi2` in a machine containing an 88-VI gives `RST 2`.
+
+**Both halves are now BUILT** — see `docs/boards/mits-88virtc.md`, `machines/ps2int.toml`, and the MITS manual in `reference/88-VI-RTC.pdf`. The design above survived contact with the hardware unchanged: the 88-VI needed no new bus concept beyond the eight wires, because `IntAck` was already a cycle any board could claim.
+
+#### 4.4.1 The board **pulls** pin 73. The bus does not go and ask.
+
+**Corrected 2026-07-12 by Patrick, and this reverses what this section used to say:**
+
+> "Does the bus poll each board for interrupt status, or does a board set interrupt flags that the bus simply checks? **In a real system, the bus doesn't poll a board for interrupt status. The board sets high/low signals on the bus that the CPU reads from the bus. The board then clears the int signal based on its design.**"
+
+He was describing the hardware. He was also describing a bug.
+
+`Bus::intPending()` used to walk the backplane and ask every card `assertsInt()`, **once per instruction** — sixty million times a second, to compute a boolean that changes perhaps a thousand times a second on a busy machine. Once the decode was cached (§4.7) it was the single largest per-instruction cost left in the simulator, and it grew with every card you added: **6.6 ns with two boards, 15.6 ns with six.**
+
+**The interface now is the exact analogue of the decode**, and the two hard-won rules turn out to be one rule:
+
+| | combinational, pure | "it moved" | the bus |
+|---|---|---|---|
+| address decode | `decodes()` | `decodeChanged()` | caches a page table |
+| interrupt | `assertsInt() const` | `intChanged()` | caches a wire-OR count |
+| NMI\* | `assertsNmi() const` | `nmiChanged()` | caches a wire-OR count |
+
+> **A board's outputs are pure functions of its state. When its state changes, it says so. The bus caches the rest.**
+
+**NMI\* is a level on the bus and an edge in the processor.** The bus carries it like pin 73 (`Bus::nmiAsserted()`, checked by `setVerify(true)` the same way). The Z80 core keeps the level it saw at the last instruction boundary and takes the NMI when the wire goes from released to pulled: a restart to `0066h` in 11 T-states, with IFF1 cleared and IFF2 kept for `RETN` (UM0080). The 8080 and 8085 cores do not read it. The wire is built for a board with its own Z80, such as the Jade Double D, whose FD1791 drives that Z80's NMI on the board's private bus. No board pulls it on the machine's bus yet, so `CpuZ80::haltCanEnd()` leaves it out.
+
+Reading pin 73 is now an integer test — **1.8 ns, flat in the number of cards in the machine.**
+
+##### What the poll was secretly doing, and where it went
+
+This section previously argued — at length, and correctly, as far as it went — that `assertsInt()` **could not be `const`**, because a board may have to *do something* to answer honestly. A 6850 has to notice that a character has finished arriving, which happens **on the chip's own clock**, with no help from the CPU and no bus cycle involved. The bug that established it is real and is still worth reading:
+
+> **An interrupt-driven driver never reads the status port. Not reading it is the entire point of being interrupt-driven.** So `RDRF` was never set, IRQ never rose, the interrupt never fired, and the operator could type forever with nothing happening.
+
+All of that is true. The mistake was the conclusion. **The card's free-running work is real; making a query do it was not.** The receiver was being advanced inside `assertsInt()` for one reason only: *being asked was the only thing that ever woke the card up.* The poll was serving as the card's clock.
+
+So the work moved to where it belongs, and `assertsInt()` became `const` and pure:
+
+- a **deadline** the card sets for itself (`Clock::at`, §7.5) — for anything emulated time can predict, such as the transmit register draining;
+- **`pump()`** — for anything it cannot, such as a human touching a key.
+
+**And that made the model *more* capable, not less.** With the poll, the card could only ever act at a moment when someone was already asking it something. A guest that jumpers the transmit interrupt, sends a character and halts — an entirely ordinary driver — was **declared finished by the run loop**, two thousand T-states before the interrupt it was waiting for. Nothing was pulling pin 73 *yet*, and the old `HLT` check could not tell "nobody is interrupting" apart from "nothing ever will." A card that owns a deadline can. See `tests/test_sio2.cpp` — *"NOBODY IS ASKING: the card acts on its own deadline."*
+
+##### The stale wire is not left to trust
+
+A board that moves its interrupt pin and forgets to call `intChanged()` hangs the guest forever, waiting for an interrupt that already happened — and presents as *"the emulator locks up sometimes"*, which is worth a week of anyone's life. So it is checked, exactly as the decode cache is: **`Bus::setVerify(true)`** re-derives the whole wire from every board's `assertsInt()` on every instruction and aborts on the first disagreement. The unit suites run with it on permanently; the CPU validation gate runs with it under `ALTAIR_VERIFY=1`, over 2.9 billion instructions.
+
+#### 4.4.2 `assertsVi()` is a **bitmask**, not a level — and that is a correction
+
+The sketch in §4.2 originally read `virtual int assertsVi() const { return -1; }` — one level, or nothing. **That is wrong, and the 88-SIO is the counterexample.** It has *two* interrupt straps, one for its input device and one for its output device, and the manual is explicit that they may sit at **different VI priorities**. Both can be asking in the same instant — a character has arrived *and* the transmitter has gone empty — so the card is pulling two of the eight wires at once. An `int` return could only ever have reported one of them, and would have dropped the other silently, and *only* in the case where both fired. That is the worst way to lose an interrupt: rare, timing-dependent, and invisible.
+
+So the wire is what the backplane says it is — **eight independent lines** — and a board reports the subset it is pulling:
+
+```cpp
+virtual uint8_t assertsVi() const { return 0; }   // bit n = pulling VIn
+virtual bool    watchesVi() const { return false; }
+```
+
+`watchesVi()` is the other half, and it is not decoration. A card that *pulls* a VI line announces it with `intChanged()`; the card *watching* those lines is a third party who was told nothing, and whose own `pINT` has just gone stale. The bus therefore calls `intChanged()` on each watcher when a VI line actually moves. It is opt-in because otherwise it is a virtual call to every board in the backplane on every keystroke.
+
+`Bus::setVerify(true)` covers all nine wires, not just pin 73: it re-derives the eight VI lines from every board's `assertsVi()` too, and aborts the same way. A stale VI line hangs the guest exactly as a stale `pINT` does, and is even harder to see.
+
+### 4.5 DMA is bus mastering
+
+A board asserts `pHOLD`; the bus grants (`pHLDA`) at the next instruction boundary; the board then acts as a `BusMaster` — the same interface the CPU uses — and drives its own cycles. Stolen T-states are charged to the clock, so the CPU genuinely loses time rather than getting DMA for free. When the board releases, the CPU resumes mastering.
+
+**Built, 2026-07-16.** `Board::requestsBus()`/`busMaster()` (the pHOLD line and who drives once granted), and `Debugger::serviceDma()` in the run loop, which offers the bus at each instruction boundary — the exact analogue of interrupt sampling, and for the same reason: the CPU never stops mid-instruction, so a grant happens *between* instructions and not inside one. The stolen T-states are charged to the clock right there, which is the whole of "the CPU genuinely loses time." First proven by a real memory-to-memory master in `tests/test_dma.cpp` — genuine RAM→RAM bus cycles, the exact 128-T-state theft read back out of `clock.now()`, and a `BREAK MEM W` that fires on the DMA's own write.
+
+**First shipping bus master, 2026-08.** The **Tarbell #2022** (§7.3, `docs/boards/tarbelldd.md`) carries an **Intel 8257** as a chip on the card (`src/chips/i8257.{h,cpp}`), and `TarbellDdBoard` *has-a* `BusMaster` (never inherits — see below) driven by it. A CP/M CBIOS assembled `DMACNTL=TRUE` programs the 8257 (address, count, mode), arms channel 0 — which pulls pHOLD — and issues an FD1791 read; the board's `Mover` then steals one byte per grant (the FD1791 is wait-synced, so each grant does one `readData`/`writeData`) until terminal count drops pHOLD. `tests/media/tarbell/TARBELLDD-CPM22-SSDD-48K-DMA.DSK` is such a disk and `acceptance-tarbelldd-dma` boots it to `A>` reading directories *through the on-card 8257*, retiring the "only a synthetic test" caveat. The board is additive exactly as predicted — the mechanism landed first and needed no bus change. (The Dazzler (§7.3) deliberately still does **not** master the bus: it reads MAIN RAM through `Bus::peek`, a spectator not a master, because a framebuffer scan-out is not a cycle-stealing transfer.)
+
+**A master that needs a second board, 2026-11-14.** The CompuPro **DISK 2** (`docs/boards/compupro-disk2.md`) arbitrates for the bus but has no address logic: on the real backplane a separate **Selector Channel** card watches the arbitration and, when the winner's priority matches the one it was programmed for, drives the address, status and strobes while the DISK 2 asks for each byte with pSYNC. The model keeps the two cards and needs no bus change: the DISK 2 is the board that pulls pHOLD and has the `BusMaster`; its mover looks in `Bus::boards()` for a `selch` that `serves()` its TMA priority and has it run each cycle. The Selector Channel never pulls pHOLD and has no `busMaster()`, so `tmaConflict()` never counts it. No match: the bytes go nowhere, as on the real pair (OVER RUN).
+
+Three decisions this baked in, each a place the obvious thing is wrong:
+
+- **The DMA board *has* a `BusMaster`; it does not *inherit* one.** The CPU card `: public Board, public BusMaster` because it is the permanent master (§3), and `Machine::master()`/`masters()` find it with a `dynamic_cast<BusMaster*>` — which is *also* how the monitor lists the machine's processors. A DMA board that inherited `BusMaster` would be counted as a CPU and stepped as one. So a transient master is reached **only** through `Board::busMaster()`, under `pHOLD`, and never shows up in the CPU walk.
+- **The card's TMA switches are the priority, not its slot (changed 2026-11-13).** Each DMA board gives its IEEE 696 priority in `Board::tmaPriority()`, 0-15. `serviceDma()` gives the bus to the highest requester first, and that board keeps it until it drops `pHOLD`. Each board gets one grant per instruction boundary. There is still no arbitration register on the bus: each card has its own priority, as each real card has its switches. `Machine::tmaConflict()` refuses two masters at one priority, or a card with no TMA lines (-1, such as the Tarbell) beside another master. The TOML loader and the run loop (`StopReason::TmaConflict`) both use it. Before this change, slot order was the priority, which is the older S-100 daisy chain, not IEEE 696.
+- **Burst vs. cycle-steal is the board's choice, and the run loop has no flag for it.** `serviceDma()` drives a granted board *while it keeps* `requestsBus()` true. A burst controller holds the line for the whole block and drains in one grant; a cycle-stealer drops it after one transfer and re-arms a `Clock` deadline, so the CPU runs an instruction before the next grant. The two fall out of one loop with no mode anywhere — and the machine's existing "does it have a future?" halt test (`clock.queued() != 0`) already keeps a halted CPU alive while a periodic DMA re-arm is pending, so a transfer runs through a `HLT` for free, through the deadline queue that was already there.
+
+### 4.6 Contention
+
+When two boards `decodes()` the same cycle, log a diagnostic naming both board `id`s and the address, and return the wire-AND of the drivers (real tri-state / open-collector contention pulls low). This is a **feature** — it is the bug you'd chase on a real backplane, surfaced immediately.
+
+`SET BUS CONTENTION=WARN|ERROR|SILENT`.
+
+**A PHANTOM\* shadow is not contention, and must not be reported as such.** Two boards *registered* at one address is normal and correct — a boot ROM over RAM is the whole point of §4.2. Contention is when two boards **both actually `decodes()`** the same cycle, and under PHANTOM\* the RAM returns `false`, so only one board answers. The distinction falls out of the model for free: contention is decided *after* the phantom pass, on who is really driving.
+
+The failure that *does* deserve a warning is a memory board strapped **not** to honor PHANTOM\* sitting under a ROM that asserts it. Then both really do drive, and you get the real bug the real backplane would have handed you.
+
+**Two boards that drive different data lines are not contention either.** A board says which lines its buffer drives on an I/O read (`Board::drivesBits`, all eight by default). The bus ORs in each driver's own lines and floats the rest to 1; only an overlap is reported. The CompuPro Interfacer 4 needs this: the two boards of one group of eight users each drive one nibble of the interrupt status ports (`docs/boards/compupro-interfacer4.md`). A port with a partial driver always takes the exact path, so the fast path is unchanged.
+
+### 4.6.1 The floating bus — one rule, three consequences
+
+> **If no board drives the bus, it floats high. Every read of an unmapped address or port returns `0xFF`. Writes go nowhere.**
+
+This is a single rule, and three things the design would otherwise need special cases for fall straight out of it:
+
+| Situation | What happens | Why it matters |
+|---|---|---|
+| **Unpopulated memory** | Reads `0xFF` | Period software **sizes memory by reading**. Return `0x00` instead and every machine looks like it has 64K, and CP/M builds itself wrong. A zero-filled hole also disassembles as a field of `NOP`s, which is a uniquely confusing thing to stare at. |
+| **Unmapped I/O port** | Reads `0xFF` | A guest probing for a board that isn't there gets the same answer real hardware gives it. |
+| **`IntAck` with no board driving** | Reads `0xFF` = **`RST 7`** | §4.4. Not a fallback hack — it is *why* the PMMI's factory jumper straight to pin 73 gives RST 7 with no vector logic anywhere. |
+
+Model the floating bus honestly once and all three are free. Fake any one of them and you will fake the other two differently.
+
+#### `0xFF` belongs to the bus, and to nothing else
+
+> **Providing `0xFF` when no board answered is the ONLY thing the bus does that a board does not.** That is the entire bus/board overlap, and it stays that size. — *Patrick, 2026-07-11*
+
+So **no board may ever manufacture `0xFF`**, and in particular **no board may seed its own store with it.** A RAM chip does not power up holding `0xFF`; it powers up holding whatever it feels like, which is what `fill = random` is for, and *what a card's chips contain is that card's business* (`docs/boards/s100-memory.md`). The bus does not initialize anyone's memory and has never heard of `fill`.
+
+The failure this prevents is a quiet one, and it was in this code until Patrick caught it. Seed a board's store with `0xFF` — it is the obvious "uninitialized" filler — and `DUMP` shows `FF` for a card whose RAM is fine, `FF` for a card whose RAM was never filled, and `FF` for a card that **isn't in the machine**. One symptom, three causes, and you chase the wrong one. The moment a board can produce `0xFF`, the single signal the bus has stops being a signal.
+
+`tests/test_boundary.cpp` enforces it. Shared *helpers* that several boards call are fine — that is code reuse, not the bus growing opinions.
+
+**But silence is how an unimplemented device becomes an unexplained hang.** The behavior above is correct and must stay; the *diagnostic* is separate. `SET BUS UNCLAIMED=WARN|HALT|SILENT` (default `SILENT`) names the port and the PC:
+
+```
+warning: OUT 0FE <- 01 at PC=0113: no board decodes port 0xFE. reads float to 0xFF.
+```
+
+`WARN` logs the line and runs on; `HALT` logs it and stops the guest at that instruction boundary — the hang caught in the act, so `SHOW REG` and a `DUMP` are looking at the machine as it wedged. It is **I/O only** — memory is never warned, because guests scan memory constantly and it is normal — and it is de-duplicated to once per port and direction per run, so a poll loop on an absent UART reports the port once rather than burying the console. The default is `SILENT`: the diagnostic is opt-in, so no machine that was quiet becomes noisy, and the hot I/O path pays a single compare when it is off. Reach for it — `SET BUS UNCLAIMED=HALT` — when a machine you assembled yourself hangs with nothing on the screen.
+
+### 4.7 Fast path
+
+Plain unbanked, non-phantom RAM resolves to a direct pointer through a page table; the full `BusCycle` dispatch runs only for pages with a non-trivial decoder. Document this so nobody "optimizes" it away later.
+
+---
+
+## 5. Board properties — one generic interface, board-specific contents
+
+`SET sio2a BAUD=9600` must work without the monitor knowing what a baud rate is. So a board **describes its own configuration**, and the monitor, TOML loader, MCP server and `CONFIG SAVE` all drive that one description. (Tab completion was to be a fifth consumer; it is designed but not built — §10.4.)
+
+```cpp
+struct Property {
+    std::string  name;         // "baud"
+    Type         type;         // Int | Enum | Bool | String | Hex | Path
+    std::string  description;  // "Serial line rate"
+    std::string  units;        // "bps"
+    Constraint   constraint;   // range, or enum value list
+    Getter       get;
+    Setter       set;          // returns an error string on reject
+};
+```
+
+Consequences, all of which must be stated in the doc:
+- `SET <id> <k>=<v>` and `SHOW <id>` are **fully generic**. `SHOW` prints every property with value, units and legal range.
+- **MCP tool schemas are generated from `properties()`** — Claude gets typed, constrained, self-documenting board config instead of guessing at free text.
+- **The TOML loader and `CONFIG SAVE` are the same code path.** A board's config keys *are* its properties, so round-tripping is automatic and cannot drift. `CONFIG SAVE` marks a key that equals a fresh `makeBoard(type)`'s value with `# default <release>` (#699): the default is read off a new board, not declared per property, so there is no second table of defaults to drift.
+- **Tab completion is generated from `properties()`** too — the line editor hands the partial line to a completer the monitor supplies (`src/cli/lineedit.cpp`), so a board's property names complete without anything being written down twice. A Tab that makes no progress arms the next one to list the candidates (§10.4).
+- **A LIST of things is a sub-unit, and it round-trips the same way** — regions on a memory card, drives on a controller. `subUnitTables()` + `addSubUnit()` read them; **`subUnits()` writes them back** (built 2026-07-12). The board renders its own text, because only the board knows that an address is hex and zero-padded (`at = 0x0400`) while a size is decimal with a suffix (`size = "48K"`) — `Value::text(16)` produces neither, and a writer that guessed would be a second, worse copy of what the board already knows. The claim "`subUnits()` is `addSubUnit()`'s inverse" is therefore one a test can simply *execute*: render, feed it straight back in, compare.
+
+  **This closed the last board-specific line in the config layer.** `CONFIG SAVE` used to reach for a `dynamic_cast<MemoryBoard*>` to write `[[board.region]]`, which meant any *other* board with a sub-unit table — a disk controller with four `[[board.drive]]` entries — would **load and silently not save**. You would configure the machine, save it, and get a controller with no drives. `src/config/toml.cpp` now includes no board header at all, and it should never include one again.
+
+- **…and a sub-unit's KEYS are declared, like everything else** — `subUnitProperties(table)` (built 2026-07-14). **This was the one place the claim above was false, and it was the worst possible place: the keys that carry the disk, the ROM and the write-protect tab.** `unit`, `mount`, `readonly`, `media`, `type`, `at`, `size` were known to nothing but a chain of string compares inside each board — so they appeared in no generated reference, no MCP schema and no `SHOW`, and each board hand-wrote its own validation and its own `else { err = "no such key"; }`. That is a **second schema**, written four times, agreeing with the documentation by luck. It was found the way such things always are: Patrick asked me to file a read-only disk mount as a *missing feature*. It was not missing. It had worked for weeks. It was **undiscoverable**, and the reason it was undiscoverable is that nothing in the program could enumerate it.
+
+  A sub-unit key is an ordinary `Property` with **no `get` and no `set`** — the half that is a *description* (kind, choices, range, radix, help) without the half that is an *accessor*, because the drive it describes **does not exist yet**. That is exactly the half a validator, a schema and a documentation generator need, which is why there is no second struct. `Board::loadSubUnit()` is the **one door** — it checks the table, the keys and the values against that declaration and only then lets the board build — and `addSubUnit()` is now **protected**, so the TOML loader, `REGION ADD` and the tests cannot go around it. What is left inside a board is *construction*, plus the one thing a schema cannot express: that `type` is **required**, that a drive needs a `unit`.
+- **THERE IS NO CONFIG-TIME-ONLY PROPERTY** (Patrick, 2026-07-12). Every property can be set, always. There was a `runtime` flag here that rejected a SET while the machine ran; it is gone, for two reasons and the second is the real one:
+  - **You can only type at the prompt when the machine is STOPPED** — by ATTN, by a breakpoint, by a HLT. That is the front panel's STOP switch. There is no moment at which a `SET` races a running CPU.
+  - **On real hardware the rule would be a fiction anyway.** A card being worked on sits on an **extender**, out where you can reach it, and its jumpers get moved with the power on. That is ordinary practice on real boards, not an abuse of them (Patrick, 2026-07-12).
+
+  It was also never enforced: nothing in the simulator ever set the flag the gate was conditioned on, so it had never once fired. A rule the code only pretends to enforce is worse than no rule.
+
+### 5.4 A card can bring a VERB with it (built 2026-07-12)
+
+**`REWIND` should exist when there is a cassette in the machine, and not otherwise.** Putting it in the static command table would mean a verb that is always spelled and never usable on most machines — and the monitor would have to know what a tape *is*, which is exactly the knowledge §7.7 keeps out of it.
+
+```cpp
+virtual std::vector<CommandDef> commands() const { return {}; }   // a static table; empty for most
+virtual bool runCommand(const std::string& name, const std::vector<std::string>& args,
+                        std::ostream& out, std::string& err);
+```
+
+`CommandDef` moved from `cli/commands.h` down to **`core/command.h`**, and that move is the whole layering argument: a board may declare a verb, and **a board must never include the CLI**. The dependency runs `cli → core`, one way. The *table* of built-in commands stays up in `cli/`, where it is the monitor's business and nothing in `core` has an opinion about it.
+
+**THE STATIC MENU ALWAYS WINS.** The monitor prefix-resolves against the built-in table first, in its existing priority order, by code that has never heard of boards. Only when *nothing* built-in matches does it ask the cards. So **no card can shorten, shadow or destabilize a built-in abbreviation by being plugged in**: `D` is DUMP and `RE` is REGS on every machine ever booted, whatever is in the slots. `REWIND` is reachable at **`REW`** precisely because the built-ins already own `R` (RUN), `RE` (REGS) and `RES` (RESET) — and `REW` is the first prefix none of them claims.
+
+That ordering has a price, and it is paid in the right place. A card *can* declare a verb **nobody can ever type** — one whose every prefix a built-in claims first. **A user cannot create that; only a board author can**, so it is caught as a **merge gate** in `tests/test_cli.cpp` (over every type in the registry), not at runtime where the error message would be about a word somebody typed rather than about the card that is wrong. This is the same shape as the older invariant it sits next to — *no command name may be a strict prefix of another* — which is also a test and not a runtime check.
+
+**A board verb's first argument names the board** (`<id>` or `<id>:<unit>`), read exactly as MOUNT and CONNECT read it. It has to: two 88-ACRs both declare `REWIND`, and the verb alone cannot say which tape to wind. The monitor enforces that convention once, so no board reimplements it.
+
+---
+
+## 6. RESET semantics
+
+The Altair bus has two distinct reset lines, and boards must honor both. Conflating them is the classic source of "works from power-on but not from the reset button" bugs.
+
+```cpp
+enum class Reset {
+    PowerOn,   // POC* (pin 76) — power-on clear. What it does is BOARD-SPECIFIC;
+               // the board just needs to know it happened. Nothing in software can
+               // assert it — only the power supply does.
+    Bus,       // RESET* — the front-panel reset button. Warm. CPU PC<-0, boards reset
+               // their logic, but memory contents SURVIVE and mounted media / connected
+               // streams stay attached.
+};
+```
+
+**Neither reset clears memory. Only removing power does.** This is not a nuance, it is the rule, and the memory array is the proof: a RAM chip has no POC\* pin. Its contents are indeterminate at power-up because *the chips just powered up*, not because a signal arrived. POC\* and power coming up coincide on real hardware — which is why they share the `POWER` command — but they are different things, and a board that clears its store in its `Reset::PowerOn` handler is modeling a machine nobody built. Model the fill as belonging to **power**, and let both resets leave the store alone.
+
+Get this backwards and it shows up as *"my program vanished when I hit reset"* — which reads like a memory-model bug rather than a reset bug, and costs you a day.
+
+### 6.1 A bus reset does what the board does — and if the board does nothing, it does nothing.
+
+The vocabulary, because two of these get called "reset" and they are not the same signal:
+
+- **Bus reset** — `RESET*`, the front-panel RESET switch. `Reset::Bus`.
+- **Power-on-clear** — POC\*, the delayed clear that comes up with the power supply. `Reset::PowerOn`. Nothing in software can assert it.
+- **Software reset** — whatever the *guest* writes to a chip to reset it. Not a bus signal at all, and not this section's business — except to say it is **modeled exactly**, because guest software can see, time and depend on every part of it. The 6850's master reset is the worked example: writing `11` into the divide field *latches*, holds the chip down, and inhibits TDRE until a second control write releases it, which is why every 6850 driver does two `OUT`s and why the card is dead after only the first. Round that corner and period software mysteriously half-works.
+
+**The rule for the two bus signals: a board does on a reset exactly what the real board does — and a board that does nothing does nothing.** It is tempting to have every card scrub itself clean on `RESET*` because it feels safe, and it is exactly backwards: a card that resets more of itself than the hardware's reset line physically reaches is inventing a machine nobody built, and the invention is *destructive*. The 88-2SIO is the case that proves it. The MC6850 **has no RESET pin** — 24 pins, and RESET is not among them — so `RESET*` reaches that card's address decoding and nothing else. This tree used to reset both ACIAs on `Bus` anyway, which threw away the guest's word format and interrupt enables *and ate a byte out of the receive register*, on a card where a real bus reset would have preserved all of it.
+
+So: **what a board does on each of the two signals is a fact about the board, it comes from the manual and the data sheet like every other fact (§0.1), and the board's `.md` must state it concretely.**
+
+**What we do *not* model is the exact timing or the internal sequencing of power-on-clear.** A real 6850 comes up held in an internal reset that is only released by the guest's first master reset; we don't reproduce that, because nothing can observe it that does not also program the chip. `Reset::PowerOn` simply leaves every card in a known good state **immediately**, so that a machine is usable the moment it is switched on. That is the one place a bus reset is allowed to be pragmatic rather than literal.
+
+**What POC\* does is board-specific**, and each board's `.md` must say **concretely** what each reset does to it. Examples:
+- **`memory`**: both resets clear the bank-select latch to 0 and touch nothing else. `POWER` re-fills RAM regions per `fill` and re-reads ROM regions from their files. See `docs/boards/s100-memory.md`.
+- **A boot ROM that disables itself** (§4.2.1): `PowerOn` **re-enables it** — otherwise the machine boots exactly once and never again. Whether `Bus` (the front-panel reset button) also re-enables it is a **board-specific strap, and the board's `.md` must say which.** This is the single most likely place to produce the classic "works from power-on, dead from the reset button" bug, because a warm reset that leaves the ROM switched out drops the CPU onto RAM at 0000 and it executes garbage.
+- **88-2SIO**: `Bus` does **nothing at all** to the two 6850s — the chip has no reset pin, so `RESET*` reaches the card's decode logic and stops there. `PowerOn` puts each chip in a known good state (`Mc6850::powerOn` — clears RDRF, zeroes the control register, asserts RTS) and **keeps the `ByteStream` connected**. Neither is the 6850's *master* reset, which is the guest's, arrives as a control byte, and does not clear the control register. See §6.1.
+- **88-DCDD**: deselects all drives, unloads the head, invalidates the sector counter on both — but **keeps images mounted**, and does *not* seek to track 0 on a warm reset (real drives don't).
+- A DMA board must release the bus.
+- CPU: PC←0, interrupts disabled; Z80 also `I`/`R`←0 and IM 0.
+
+CLI:
+```
+RESET        RESET* / pRESET — "press the reset button". Warm; memory survives.
+RESET CPU    CPU only; boards untouched (a debugging convenience, not a real signal).
+POWER        Power-cycle: RAM contents are lost, ROM images are re-read, and POC* is
+             pulsed. The only thing that clears memory.
+```
+
+`RESET` must be safe at any point — the bus asserts it at the next instruction boundary, never mid-cycle.
+
+---
+
+## 7. Host services layer
+
+Boards must **never** touch a socket, a file handle, or `termios` directly. Everything a board needs from the host goes through a small set of generic, platform-abstracted services implemented once in `platform/`. This is what keeps the four targets honest and keeps replay deterministic — if a board can read the host clock or a socket on its own, replay is dead.
+
+### 7.1 `ByteStream` — the generic serial endpoint
+
+**Built, 2026-07-11** (`src/host/stream.h`). **Sockets, real serial ports and modem control landed 2026-07-12.** Implemented: `NullStream`, `LoopbackStream`, `ScriptedStream`, `Console`, **`TcpListenStream`, `TcpConnectStream` (`src/host/tcp.cpp`), `HostSerialStream` (`src/host/hostserial.cpp`)**. **`FileStream` landed too** (`src/host/file.h`) — a **paper-tape reader and punch**, wired as `in:PATH` (a byte source), `out:PATH` (a byte sink), or the combined `in:PATH,out:PATH` (two files, two positions, on one bidirectional line). A reader may be paced — `in:tape.tap?cps=300` is the 88-HSR (issue #152) — via the same wall-clock mechanism `TapeStream` uses. The punch overwrites forward without truncating. Still to come: `ReplayStream` — which is blocked on RECORD/REPLAY, and those are unbuilt (§10.1).
+
+Every board that moves characters (88-SIO, 88-2SIO, 88-ACR, 88-LPC, paper tape, PMMI) talks only to this. `CONNECT` binds an implementation to a unit.
+
+#### The line goes BOTH WAYS (2026-07-12)
+
+`LineStatus` was carrier/CTS/DSR and **input-only**, so RTS was decoded out of the 6850's control register and dropped on the floor — there was nowhere for it to go. Now:
+
+```cpp
+struct LineStatus  { bool carrier, cts, dsr, ring; };   // INPUTS  -- the far end drives these
+struct LineControl { bool rts, dtr, brk; };              // OUTPUTS -- the CARD drives these
+struct LineParams  { long long baud; int dataBits, stopBits; LineParity parity; };
+
+virtual LineStatus status() const;
+virtual void setControl(const LineControl&);
+virtual bool setParams(const LineParams&, std::string& err);   // false -> the card says so out loud
+```
+
+**`true` is ASSERTED, everywhere, in both structs.** The pin-level inversions are real — the 6850's are `/DCD` and `/CTS`, active low — but they are a fact about *that chip's pins* and they stay inside the chip that has them. A stream that exported one chip's polarity would make the 88-SIO wrong for free.
+
+**The stream reports LEVELS; the chip latches EDGES.** The same division as PHANTOM\*: the wire carries a level, and the honoring card decides what it means. The stream says *"carrier is down"* and says it for as long as it is down; the **6850** is what latches that, interrupts on it, holds it after the pin returns, and clears it only on status-then-data. Put the latching in the stream and every stream re-implements it slightly differently.
+
+**The strap lives on the CARD** — `SET sio0:a dcd=wired`, default `ground`. See `docs/boards/mits-2sio.md`.
+
+#### There is ONE baud rate, and it is the card's (Patrick, 2026-07-12)
+
+> *"Do we need emulated character timing with a real serial port attached? The real serial port is the limiting factor."*
+
+The plan called for two — a card baud and an independent endpoint baud. **That is struck.** There is exactly one line rate in a serial card and it is the UART's clock, a jumper; the frame format is whatever the guest wrote into the control register, because those bits *are* what goes on the wire. So **`CONNECT … serial:/dev/tty…` programs the host port from the chip**, and re-programs it whenever the guest rewrites the control register. A card strapped for 300 driving a terminal set to 9600 does not give you a fast link on real hardware — it gives you garbage, and a second baud rate could only ever configure the garbage.
+
+The emulated character timing **stays**: it is the *same* duration the real port takes, not an extra one, and it must stay because the guest can **measure** it (the Mike Douglas BIOS times TDRE to infer the line speed).
+
+#### …and there is NO `baud = 0`. It is not the analogue of `clock_hz = 0` (2026-07-14)
+
+`clock_hz = 0` is free-running and is the default (§8), so `baud = 0` looks like the obvious next tidy-up. **It is not the same kind of number, and the request was declined on evidence.**
+
+- **`clock_hz` is invisible to the guest.** It changes only the mapping from emulated T-states onto wall-clock seconds. Nothing inside the machine can observe it — which is exactly what makes flat out a safe default.
+- **`baud` is a duration in T-states** — *inside* emulated time — so the guest **can and does** observe it. TDRE timing is one way (above). The **inter-character gap on receive** is the other, and it is the one that bites: the 6850 has **no handshaking**, so **the baud rate is the only flow control the card has**. In this simulator it is precisely what turns a host *paste* — ten bytes appearing in the pty at once — into a **paced serial stream**.
+
+At `baud = 0` a character occupies the line for **zero T-states**, so the next byte is already in RDRF at the same T-state the guest read the last one, and **the guest's foreground never runs at all**. MITS PS2 is the proof: its ISR hands characters to its foreground through a **one-byte mailbox** and a semaphore, and that handoff requires the foreground to run *between* characters. Give it a zero character time and nine of the ten characters of a typed line are overwritten in the mailbox, and the monitor spins on the semaphore for ever. `baud = 0` is not a 2SIO running flat out; it is an **infinitely fast serial line**, which never existed (§0.1).
+
+And the speed it was supposed to buy is mostly already there: **the baud rate never makes the run loop *sleep***. The throttle is `!clock.free()` (§8), so on a `clock_hz = 0` machine the TDRE wait is not a wall-clock delay at all — it is emulated T-states, executed at host speed. It is not free (a *very* low baud means proportionally more spin instructions for the host to grind through), but it is not the throttle it looks like, and it is not what a free-running default would have removed.
+
+The property refuses `0` (`min = 50`), `tests/test_sio2.cpp` locks it in, and this is why.
+
+And there is **no `flow = rtscts` endpoint setting**, for the same reason: hardware flow control in `termios` hands RTS/CTS to the *OS driver*, and the 6850 owns those pins. Two owners for one pin is a bug that shows up under load. **XON/XOFF was never a board option at all** — it is always software's job, never the card's (Patrick, 2026-07-12). It is bytes in the data stream, which makes it the guest's business, and a card that filtered them would be eating the guest's data.
+
+> **An unconnected line is not an error, and there is no null pointer in the stream path.** A disconnected unit is bound to a `NullStream`, because that is what an unconnected 6850 on a real card *is*: it sits there with TDRE set forever, and software that writes to it works fine and talks to nobody. So no board contains a branch for "what if nothing is plugged in" — there was never a case to handle.
+
+> **A `ByteStream` is NOT a serial line.** It is a *buffered, flow-controlled* source — a pipe, a socket, an OS keyboard queue. It will hold a byte until you take it. A board that models it as a free-running wire (and therefore synthesizes overruns from it) manufactures data loss that the host transport does not have. This cost real debugging; see `docs/boards/mits-2sio.md`.
+
+```cpp
+class ByteStream {
+public:
+    virtual size_t read (uint8_t* buf, size_t n) = 0;  // non-blocking; 0 if empty
+    virtual size_t write(const uint8_t* buf, size_t n) = 0;
+    virtual bool   readable() const = 0;               // -> drives RDRF
+    virtual bool   writable() const = 0;               // -> drives TDRE
+    virtual void   flush() = 0;
+    virtual Status status() const = 0;                 // carrier/DSR/CTS
+};
+```
+
+Implementations: `ConsoleStream`, `TcpListenStream` (`socket:2323` — accept, one client, survive disconnect/reconnect), `TcpConnectStream` (`socket:host:port`), `HostSerialStream` (termios vs `SetCommState`/DCB), `FileStream` (paper tape — `in:` reader, optionally paced, and/or `out:` punch), `NullStream`, `LoopbackStream` (testing), `ReplayStream` (recorded bytes at recorded T-state stamps).
+
+> **A CLIENT CONNECTING *IS* CARRIER APPEARING**, and everything else falls out of it: a telnet client closes its window and DCD drops (and the 6850 latches that, and interrupts); the guest drops DTR and we hang up on the client; the TCP send buffer fills and CTS falls, so TDRE stays clear and the **guest waits rather than losing a byte**. That is what every terminal server ever built did, and it is what will let a PMMI work over a socket without the board learning what TCP is.
+>
+> **The connect banner is the terminal server's, never the card's.** A listening `telnet:` greets each caller with one line (`Connected to AltairSim … (sio0:b) on port 2323`), sent only down the socket; the guest never sees it, because a real terminal server's hello never crossed the RS-232 side either. It is **on for `telnet:`, off for `socket:`** (`?banner` / `?banner=off` flip either): `telnet:` is the endpoint for a person, while a raw `socket:` is the pipe another machine dials, and there a banner would arrive as data in the far guest's input. The stream cannot name its own line, since the board resolved it and a board never tells a stream what it is plugged into. So a stream that owes a caller the banner raises `ByteStream::greetingsDue()`, and `Machine::pump()` then walks the backplane's serial units and calls `greet("sio0:b")` on each. That covers every connect path (monitor, MCP, machine file, `SET`) without touching a board, and costs one compare per slice when nobody is owed one.
+>
+> **No threads.** §7.5 permits blocking host I/O behind a `ByteStream`, and it turned out not to be needed: a socket and a serial port can both be asked, without waiting, whether they have anything. A thread would buy nothing and would cost the determinism RECORD/REPLAY is built on — the bytes would arrive at whatever T-state the host scheduler felt like. They arrive in `pump()`, at a known point in emulated time.
+>
+> **RECORD/REPLAY must capture line transitions, not just bytes.** A recording that logs only characters diverges the first time a carrier drop drives an interrupt. `ReplayStream` will replay `(tState, byte)` **and** `(tState, LineStatus)`. Impossible to retrofit; the interface is shaped for it now.
+
+**Discipline: the board asks `readable()`/`writable()`; it never blocks.** All actual I/O is drained/filled by the event loop once per time slice, so `tick()` is pure computation.
+
+### 7.2 `Console` — the host keyboard and screen
+
+**Built, 2026-07-11** (`src/host/console.cpp`, `src/host/filter.cpp`). Implemented: `upper`, `strip7in`, `strip7out`, `crlf`, `echo`, `bell`, `bsdel`, and `attn`; **`log` landed 2026-08-02**. Not yet: `tabs`, `ansi`, `rows`/`cols`, `pace`.
+
+A `ByteStream` like any other, so a board connecting to it needs no special code. But it is the only stream with a human on the far end, so it owns a configurable **transform chain**, applied inbound from the keyboard and outbound to the screen. Properties are declared through the same `Property` layer as boards, so `SET`/`SHOW`/MCP work on it for free.
+
+> **The transforms are the CONSOLE's, and the console's alone** (Patrick, 2026-07-13) — `SET CONSOLE UPPER=ON`, `[console]` in a config file. Every other endpoint — socket, serial port, tape, file, loopback — is **8-bit clean, always**.
+>
+> They were briefly moved onto the **line** instead, as a `FilterStream` inside each UART, on the strength of the paragraph below ("a real terminal on a real host serial port wants the same uppercase folding"). **That was wrong, and it was wrong in a way that corrupts data.** A card's connector goes to a modem, a socket or a real `/dev/tty.usbserial`, and the next thing down it is **XMODEM — 8-bit binary**. A `strip7out` on that line masks bit 7 of every byte of the transfer and does it *silently*. Set it once for MITS BASIC, forget, and every binary file that ever leaves the machine is quietly corrupt. The 88-ACR reached this conclusion first and refused the chain outright ("a tape is binary, not text"); every other line deserves the same protection.
+>
+> **A LINE HAS LINE CODING, NOT FILTERS.** `baud`, `data_bits`, `stop_bits`, `parity` are real, they are **hardware** — the 88-SIO's NDB/NSB/NPB/POE jumpers, the 6850's control register — and they belong to the card. They set how long a character occupies the wire, and on a **real serial port they are programmed into the real port** (`ByteStream::setParams`). A frame is not a filter: a card strapped for 7 data bits sends seven because that is what the hardware does, and it does not mask the guest's byte to do it.
+>
+> **The rule, in one sentence: the only thing that may alter a byte is the console, because the only thing with a human on the end of it is the console.**
+
+| Property | Meaning |
+|---|---|
+| `upper` | Fold keyboard input to uppercase. Essential — much period software only accepts caps. |
+| `strip7in` / `strip7out` | Mask the high bit, independently per direction. |
+| `crlf` | CR→CRLF on output; Enter→CR vs LF on input. |
+| `bsdel` | Map host Backspace to BS (0x08) or DEL (0x7F). A perennial CP/M annoyance. |
+| `tabs` | Expand outbound tabs at N columns. |
+| `echo` | Local echo (for half-duplex hardware). |
+| `ansi` | Run outbound bytes through the VT100/ANSI screen model, or pass raw. |
+| `rows`, `cols` | Screen size — **and the answer to an `ESC[6n` DSR query**, which is how a guest discovers terminal size. (Lifted from the Python prototype, but as a property rather than a hardcoded sniff.) |
+| `pace` | Throttle output to the configured baud, so a 110-baud Teletype *looks* like one. Off by default. |
+| `attn` | The escape key that drops from console back to the monitor (e.g. `Ctrl-E`). **Non-negotiable** — without it a guest that swallows all input traps you with no way out. |
+| `log` | Tee the session to a host file. |
+| `bell` | Ring the host bell on 0x07, or ignore. |
+
+**This list will grow.** That is precisely why it is a property table rather than hardcoded flags: adding one means adding a row, and the CLI, TOML and MCP pick it up automatically.
+
+~~**Implement the transforms as a reusable filter chain on `ByteStream`, not as console-specific code** — a real terminal on a real host serial port wants the same uppercase folding, so `SET sio2b UPPER=ON` on a socket-connected line works for free.~~
+
+**Struck, 2026-07-13, and left here as the record of a mistake worth not repeating.** It reads well and it is wrong: it optimises for the VT100 you *might* hang off a serial port and forgets the XMODEM you *will* run through it. The chain is still a reusable `FilterStream` (`host/filter.h`) — the console just owns the only one.
+
+**The keyboard buffer is finite; a `PASTE` waits behind it and never enters it.** The buffer holds 256 bytes, and type-ahead past that is dropped and counted, as on a real terminal. `PASTE <file>` gives the console a *source* behind the buffer: the guest's read takes a key from the buffer if there is one, and a byte from the source only when there is not. So a file of any size arrives complete and is never held whole, **and the keyboard comes first** — a key pressed during a paste reaches the guest ahead of the rest of the file. The first version moved the file *into* the buffer as room appeared; that kept the buffer full, and a full buffer is when `poll()` stops asking the OS for keys, so ATTN was dead and window keys were dropped for the whole paste. A `TYPE` after a `PASTE` joins the source queue, so the order given is the order the guest reads. This is a command on the console and not an `in:` endpoint that hands the line back at end of file, because an endpoint that changes what it is cannot be reported by `SHOW` or saved by `CONFIG SAVE`. The pasted bytes pass the transform chain like a typed key, and a `0x05` in the file is data: ATTN is looked for only in what the OS keyboard sends.
+
+**Arbitration:** exactly one unit may hold the console at a time. `CONNECT sio2a:a console` steals it, warning who had it.
+
+### 7.3 `DiskImage` — the generic mountable medium
+
+Every disk/tape board (88-DCDD, 88-HDSK, Tarbell, Disk 1A, North Star, any future controller) sees only this. `MOUNT` binds an implementation to a unit.
+
+**The interface is CHS, not LBA, and the format is per-track.** Both of those are forced by real disks, and an LBA interface with a single global geometry cannot express them:
+
+```cpp
+enum class Density { SD, DD };
+
+class DiskImage {
+public:
+    explicit DiskImage(std::unique_ptr<MediaFile>);   // the host file lives BELOW this
+
+    // The BOARD describes the medium: overall shape, then one or more TRACK RANGES.
+    void init(int tracks, int heads, bool interleaved);
+    void initFormat(int trackLo, int trackHi, int headLo, int headHi,
+                    Density, int sectors, int sectorSize, int startSector);
+
+    bool readSector (int t, int h, int s, uint8_t* buf, size_t* n);
+    bool writeSector(int t, int h, int s, const uint8_t* buf, size_t* n);
+
+    bool     readOnly() const;
+    bool     readOnlyForced() const;   // the host would not let us write it
+    void     sync();
+    uint64_t size() const;
+};
+```
+
+Why each piece is there — each corresponds to a disk that exists:
+
+- **CHS, not LBA.** Every controller in the catalog addresses track/head/sector. An LBA interface would force each board to invent a flattening the hardware never had, and then invert it.
+- **Format is declared over *track ranges*, not once for the disk.** Sector size and density genuinely vary *within* one image: a double-density soft-sector controller keeps **track 0 single-density** so the boot PROM can read it. One `Geometry` for the whole disk cannot say that; two `initFormat` calls can.
+- **`startSector`.** The 88-DCDD numbers sectors from **0**; most soft-sector controllers number from **1**. This is exactly the off-by-one that silently corrupts a disk.
+- **`interleaved`.** Whether a two-sided image stores `T0H0, T0H1, T1H0…` or all of head 0 followed by all of head 1 is a property of the *image*, and it varies by the tool that wrote it.
+
+**Hard-sector vs soft-sector needs no flag** — it falls out of `sectorSize`:
+
+| | `sectorSize` | What the image holds |
+|---|---|---|
+| **88-DCDD** (hard sector) | **137** | The *whole slot*: sync byte, track/sector header, 128-byte payload, checksum, stop byte, trailer. |
+| **Vector Graphic Dual-Mode** (hard sector) | **275** | The *whole slot*: sync byte, track, sector, 10 zeros, 256-byte payload, checksum, 4 ECC bytes, valid byte. |
+| Tarbell, Disk 1A… (soft sector) | **128** / 256 | **Payload only.** The header and checksum were in the inter-sector gaps on real media and never made it into the image. |
+| North Star MDS-A / MDS-A-D (hard sector, payload-only image) | **256** / 512 | **Payload only**, although the diskette is hard-sectored. A North Star sector has no header at all — zeros, a sync character, the data, a check character — and a `.NSI` file keeps the data. The board makes the check character on a read and drops it on a write (`docs/boards/northstar-mds.md`). |
+
+The board still owns what is *inside* the slot — for the DCDD, that the payload starts at offset 7 on a data track and 3 on a system track, and that a checksum sits at [4]. That is the controller's business, exactly as `docs/boards/mits-dcdd.md` says.
+
+> **Geometry probing belongs to the BOARD, not to this service.** An earlier draft of this section said the opposite — *"geometry probing lives here, once"* — and that was **wrong**. Geometry is a function of **controller × image size**, and the service does not know the controller. 337,568 bytes means a 77-track 8″ floppy *only because* it is a DCDD; 8,978,432 means a 2,048-track FDC+ *only because* it is a DCDD. The same byte count on a Tarbell means something else. So the **board** probes the size, picks among the formats *it* knows, and calls `init`/`initFormat`. The service does offsets and I/O and nothing else.
+
+Worked example — the board configuring the medium:
+
+```cpp
+// 88-DCDD, 8 MB FDC+ image. The board knows it is hard-sector.
+img.init(2048, 1, /*interleaved=*/false);
+img.initFormat(0, 2047, 0, 0, Density::SD, 32, 137, 0);   // whole 137-byte slot
+
+// A soft-sector DD controller whose boot track must stay single-density.
+img.init(77, 1, false);
+img.initFormat(0,  0, 0, 0, Density::SD, 26, 128, 1);     // track 0
+img.initFormat(1, 76, 0, 0, Density::DD, 26, 256, 1);     // everything after
+```
+
+**Underneath it: `MediaFile` (`src/host/media.h`) — the host file, and the only thing in the program that opens one.** Buffered, dirty write-back, a write-protect flag, a sync. This is the layer a disk and a tape genuinely *share*.
+
+**And `DiskImage` is ONE CLASS, not a base class** — every implementation this section used to name has dissolved. `ReadOnlyImage` was never a different *image*; it is a medium that says no. `MemoryDisk` was never a different image either; it is a `MemoryMedia`. And **`ImdImage`/`Td0Image` are never coming** (Patrick, 2026-07-12): raw disk images are the only kind this program will ever read, and an IMD file that has to be used here is one that gets converted to raw beforehand, outside it. Those container formats were the **entire** reason `readSector`/`writeSector` were virtual — a format that carries its own per-track sector map needs to override the arithmetic — so with them ruled out, the virtuals go. The image is sector-linear, always. A hook left in for a possibility the owner has ruled out is not extensibility; it is a hook nobody will ever pull, and the next reader has to work out why it is there.
+
+**Write-protect mounts, it does not refuse** — the read-only flag goes on by itself, and the operator is told that it did (Patrick, 2026-07-12). A file the host will not let us write is a write-protected disk, which is an ordinary disk — so it mounts read-only. What must not happen is the *silent* version: the operator typed no `RO`, so `readOnlyForced()` is true and the board **says so** through `Board::drainLog()`. Discovering it at `sync()` instead — after CP/M has spent an afternoon writing to it and the flush fails with the work gone — is the failure this prevents.
+
+`openMedia(path, readOnly, err)` is the **one seam**, installed by `setMediaResolver()` in `src/main.cpp` and `tests/main.cpp` — the exact shape of `resolveEndpoint()`/`Sio2Board::setResolver()`, and for the same reason: a board asks for a path and gets a medium, and a test swaps the filesystem out for RAM without the board noticing.
+
+**The XMODEM pad.** Both 8″ DCDD images in the tree are 337,664 bytes, not the 337,568 that 77 × 32 × 137 predicts — XMODEM padded them to a 128-byte block boundary. A strict `size == exact` probe therefore rejects **both of the only 8″ disks we have**. Every format match is `exact <= size < exact + 128` (`sizeMatches()`, in `disk.h`, because the trap is in the file format and not in any one controller). The pad is never data, and a write never reaches it: `DiskImage` bounds every access against the declared geometry, and a **soft-sector** disk never grows under a write.
+
+**Hard-sector disks carry no geometry, so they mount at any size — and FORMAT by growing.** A hard-sector image is fixed 137-byte slots addressed linearly `(track·spt + sector)·137`; its size is simply how many slots the guest has written, and `spt`/`sectorSize` are the *card's* constants, not the image's. So on a hard-sector controller the probe is **not a gate**: a size that matches a known format gets that format (so it is named and the XMODEM pad is tolerated), and a size that matches nothing — 0 bytes, an odd count, a disk about to be formatted — is not an error but an **unformatted** disk, mounted at the controller's full reach (its largest format) with `DiskImage::setExtendsOnWrite(true)`. The guest's own FORMAT program then grows the file into shape, one slot at a time, capped at that reach (the head-step clamp `d.fmt.tracks - 1` is the physical bound). Reading a slot that is not there fails, and the controller's sync-byte/checksum rejects it — exactly what unformatted media does — so nothing is invented. A blank file to start from comes from `MOUNT … CREATE` (or `create = true` in a machine file), which writes an empty file and mounts it.
+
+**Soft-sector controllers now format too, one track at a time — see §7.3.2.** The old rule here was that a short soft-sector image was *truncated, not unformatted*, because a soft-sector FORMAT writes address marks a raw `.DSK` cannot hold. That has been deliberately reversed for the WD177x `Write Track` path: the marks and gaps never land in the `.DSK`, but they do not need to — the controller *parses* them out of the streamed track to learn the geometry, then writes only the payloads. So a blank soft-sector disk is now unformattable-until-FORMAT in exactly the way a hard-sector one is, with one difference recorded below.
+
+*Modeled on `simh.mdsk/Altair8800/altair8800_dsk.c` (© 2025 Patrick A. Linstruth) — our own prior art, not another project's.*
+
+### 7.3.1 `TapeImage` — the sequential medium, and why it is not a `DiskImage`
+
+A cassette has exactly one thing a disk has not: **a position**. It is not that a tape is a worse disk — it is that the head is where it is, and the only way back to the start of the program is to **rewind**. That is the whole of the difference, and it is why `TapeImage` (`src/host/tape.h`) is its own class over the same `MediaFile`: `read`/`write`/`rewind`/`pos`/`atEnd`. The CLI gets a verb, `SHOW` gets a number, and the guest gets the bytes in the order they were recorded.
+
+**And then the adapter that makes the 88-ACR nearly free: a tape *is* a `ByteStream`.** `TapeStream` is 20 lines, and with it the shared 1602 UART needs no cassette-specific code at all — the ACR hands it a `TapeStream` where the 88-SIO hands it a socket, and the only difference left is that the unit is `UnitKind::Tape` (MOUNT) rather than `UnitKind::Serial` (CONNECT). That is §7.1's promise being cashed: the board knows it has a serial line, and does not know what is on the end of it.
+
+> **The prediction held — the card came in at ~250 lines and inherits its whole bus half from the 88-SIO, because it *is* an 88-SIO B. But "the only difference left is the unit kind" was one word short, and the missing word cost a silent data corruption.**
+>
+> A `TapeStream` also needs a **MODE**. A cassette has ONE head, so read and write share ONE position — they must; it is the same piece of tape. And a UART receives **eagerly**: it pulls a byte off its line the moment it has room, because that is how DAV and an interrupt-driven loader work. So a tape that was readable *and* writable at once had its first byte pulled away by the card **before the guest ever ran**, the head sat at 1, and **every recording began at byte one**. Playback worked perfectly the whole time, which is why no load test could ever have found it.
+>
+> The fix was the hardware's own and cost nothing: the 88-ACR has **no motor control** — a human pressed the buttons — and a recorder is in PLAY *or* in RECORD, never both. Making that exclusive makes the corruption **unrepresentable** rather than merely unlikely. `tests/test_media.cpp` had asserted the *opposite* (`CHECK(bs.writable())` on a readable stream); that is how it got in. See `docs/boards/mits-88acr.md`.
+
+`readable()` is *there is more tape*, so the byte **waits for the card** — a tape that dropped a byte because the guest was slow would be manufacturing data loss the host does not have, which §7.1 forbids. A real recorder keeps rolling and *can* drop data; we do not model that, and the board's `.md` says so under Limitations.
+
+### 7.3.2 Soft-sector FORMAT — geometry in real time
+
+A hard-sector image carries no per-track geometry, so its whole geometry is a set of card constants declared once at mount (§7.3). A **soft-sector** image is different in kind: sector size, sector count and even density can vary from track to track, and none of it is in the `.DSK` — it lived in the address marks and gaps that a raw image throws away. So the geometry cannot be a mount-time constant. **The decision (2026-07): per-track geometry is established in real time, and the WD177x `Write Track` command is the only thing that establishes or mutates it.** `DiskImage::setTrackFormat(t, h, fmt)` is that one mutator; `Write Track` streams a whole raw revolution into the drive, the drive parses the marks back out to derive `TrackFormat{density, sectors, sectorSize, startSector}`, calls `setTrackFormat`, and writes the payloads. Density comes from the controller (the WD `DDEN` pin, `Wd17xx::doubleDensity`) — the chip is the single source of truth, so it **hands its own density to the drive's `Write Track` commit** and the drive keeps no density of its own; everything else comes from the stream. The density is a value of its own and is not read from the data rate (`Wd17xx::dataRateBits`), because the rate does not give it: a 5.25″ double-density track runs at 250 kbit/s, the 8″ single-density rate. Because the density is read per track, one double-density controller formats a **mixed** disk from the guest's per-track density bit — SD track 0, DD tracks 1-76. Reads and writes never change geometry — they validate against what a track *records*, and an unformatted / out-of-range track is **Record Not Found**, exactly as bare media reads back. A track read at the wrong *density* is Record Not Found too on a board that turns on the chip's density check (`Wd17xx::setDensityChecked` — the VersaFloppy, whose DDBIOS finds the disk type by trying each density in turn, the Tarbell DD, and the Cromemco 16FDC and 64FDC).
+
+This is what makes a blank soft-sector disk formattable (`MOUNT … CREATE` → the guest's FORMAT lays down each track), an already-formatted disk usable with no FORMAT (the size probe establishes the *initial* geometry), and the double-density mixed disk — SD track 0, DD the rest — fall out of the same mechanism (the Tarbell #2022 formats one with `DFORMAT`, each track's density taken from its `OUT FC` density bit). **A track that changes size moves the tail.** The image is the tracks end to end (the running-sum offsets of `rebuild()`), so a Write Track that makes a track larger or smaller moves the start of every track after it. `setTrackFormat` moves those bytes the same distance and resizes the file to match, so every other track keeps its data in any write order: a whole-disk FORMAT, Jade's FORMAT `*` (tracks 0–1 only), or one reformatted track. A whole-disk reformat to a smaller layout (DD → SD) therefore ends at the smaller layout's size, and the next mount reads that layout from the size. A blank disk has no tail, so nothing moves. This replaced an earlier rule that FORMAT writes tracks in ascending order, which held for a blank disk and failed for a reformat to a smaller layout: the file kept its old size, and the next mount read the old layout. Growth is `setExtendsOnWrite(true)` with a **dynamic** `geometryBytes_` cap that rises as each track is formatted, the soft-sector twin of the hard-sector §7.3 rule.
+
+This deliberately reverses the old wall — `Write Track` on a raw `.DSK` used to set **WRITE FAULT** on the grounds that the marks and gaps had nowhere to go (recorded at `chips/wd17xx.h` "the whole track"). They still have nowhere to go, and that is fine: the controller reads the geometry *out of* the stream and stores only payloads. The fault now means only what it should — an empty drive, or a controller that does not implement formatting. **The mechanics — the format FSM, the wait-synced `trackImageBytes(rate)` budget, the density model, the flat-`.DSK` limitation and the deferred work — live in `docs/devguide/soft-sector-floppy.md`; this section is the decision and the reasoning, not the how-to.** Controllers: the Tarbell #1011 (single density) and #2022 (mixed SD/DD, and it reads plain SD media too), and the **SD Systems VersaFloppy**, which formats **all ten** SD Systems formats via `Write Track` — five geometries (8″/5.25″ × SD/DD, plus 8″ DD-256) × single/double sided. Its 5.25″ media spins at 300 RPM, so the revolution budget generalized from `rate/48` to `rate / (8 × rev/s)` — the one shared-code change the VersaFloppy needed; everything else was board-local, as the checklist promises. *Modeled on `simh.mdsk/.../wd_17xx.c`, our own prior art.*
+
+### 7.4 `Display` and `Audio` — SDL
+
+For boards with graphics or sound (**VDM-1**, **Cromemco Dazzler**, music boards, and whatever you build next). Backed by SDL, and **optional**: compiled in only with `ALTAIRSIM_ENABLE_SDL`. A headless build must still pass every acceptance test.
+
+**Boards never call SDL.** They see only:
+
+```cpp
+class Display {
+public:
+    using Owner = const void*;   // the drawing board's `this` — which window (§ below)
+    virtual Surface* acquire(Owner, int w, int h, PixelFormat, int targetWidthPx) = 0;
+    virtual void     present(Owner, Surface*) = 0;
+    virtual void     setPalette(Owner, std::span<const Color>) = 0;
+};
+
+class Audio {
+public:
+    using Owner = const void*;   // one voice per owner — the service mixes the voices
+    virtual int    rate() const = 0;        // samples per second it takes: mono, signed 16-bit
+    virtual bool   available() const = 0;   // is a sound device behind it? (for SHOW)
+    virtual void   push(Owner, std::span<const int16_t> samples) = 0;   // from Board::pump()
+    virtual size_t queued(Owner) const = 0;   // pushed and not yet played
+};
+```
+
+**A Surface is `Indexed8` or `Rgb32`.** `Indexed8` — one byte per pixel, resolved by the host through `setPalette()` — fits a board whose color logic has one input of at most eight bits (the Dazzler, the VDM-1), and keeps a color change a palette away. `Rgb32` is the colors themselves, for a board whose color logic has more inputs than one index: CADzilla's Bt453 takes P7..0 *and* an overlay select OL1..0, and the overlay replaces the palette entry instead of indexing it. That board runs its RAMDAC itself (`Bt453::lookup`) and hands the host colors, so the host never learns a chip's rules (`docs/devguide/video-board.md` §3).
+
+The two boards this must serve are usefully different, and the API should be hand-checked against both:
+- **VDM-1** is *memory-mapped*: a 1K text window the CPU writes into, plus a character-generator ROM; renders 16×64 characters. Its keyboard is a **separate parallel board** — so the SDL window's keystrokes must route back through a **`ByteStream`**, not a private path.
+- **Dazzler** is *DMA-driven* on the real card: it steals bus cycles to read a bitmap out of main memory, and it is the concrete reason DMA is in the bus model at all. The simulated `dazzler` does **not** use that path: it reads main RAM with `Bus::peek` once a frame, because nothing on the S-100 side can read a pixel back (`docs/boards/cromemco-dazzler.md`). The **Dazzler II** (`dazzler2`) is a bus *slave*: it watches memory writes (`wantsSnoop()`) and keeps the picture in 4 KB of its own RAM, so a guest can see what the original hides.
+
+Two constraints that are painful to retrofit:
+1. **The SDL event loop does not own the main loop.** The simulator's clock and `EventQueue` own emulated time; the display is pumped once per time slice. Letting SDL drive would put the host frame rate in charge of emulated time and wreck both throttling and replay.
+2. **On macOS, SDL requires the window and event pump on the main thread.** That is an OS constraint, not an SDL preference, and it dictates the threading model: main thread pumps SDL, emulation runs elsewhere, they communicate through queues. **Decide this now** — discovering it after the machine loop is written means restructuring the program.
+
+**Keystrokes from an SDL window are an *input*** — they go through the recorded event queue like everything else, or replay breaks the first time a Dazzler game is involved.
+
+**The `Joystick` service — built 2026-07-24.** A Dazzler game's *other* input is a joystick, and it is a host service of its own (`host/joystick.h`), the input analogue of `Display`: a board reads cached stick axes and buttons, and where those come from — a USB gamepad, the keyboard, or nothing — lives behind the seam, so the board (the **Cromemco D+7A**, which reads one or two JS-1 consoles) never touches SDL and a headless build reads every stick centered. It is polled once per slice from `pump()`, never inside a bus cycle, exactly as the `Display` is. It also sharpens the note above: a video window is a *keyboard* only when it ought to be. `[display] keyboard = none` makes a display-only window (a Dazzler) route its keystrokes to the joystick's keyboard fallback rather than the console — so a game's keys drive the stick instead of landing at the CP/M prompt — while `Ctrl-E` still stops the guest and hands back the monitor, like the close box. A Sol-20 window stays a console keyboard (`keyboard = console`, the default).
+
+**The `Audio` service — built 2026-10-01.** The sound half of the seam (`host/audio.h`), with three backends as the joystick has: `SdlAudio` in a windowed build, `NullAudio` headless (a speaker that is not plugged in), a stub in tests. Its first client is the **Cromemco D+7A**, which plays a JS-1 speaker from a D/A latch; its second is the **Newtech Model 6 Music Board**. Three decisions shape it, and each is the answer to a way it could have gone wrong:
+
+1. **Emulated time is not real time, and the seam does not pretend otherwise.** A device plays `rate()` samples each real second; a board renders `rate()` samples for each *emulated* second. The two agree only when the machine runs at a crystal. **Flat out (`Clock::free()`, the default) a board pushes nothing**, and its `SHOW` says that this is the reason — silence with a stated cause, not a tone at whatever pitch the host's speed happens to give. There is no resampling to fit. **With a crystal every run keeps real time** (issue #731), from a terminal or from a script, so the two do agree wherever a crystal is set. For one release cycle a speaker that played was itself what paced a script (issue #726, `Board::keepsRealTime()`); that hook went when the crystal became the whole rule (§11). A board that runs ahead of the device anyway (a crystal, but a host that delivers its slices in bursts) sees it in `queued()` and holds back.
+2. **A board records in the bus cycle and renders in its host turn.** `write()` stays pure: it notes `(clock.now(), level)`. `pump()` turns the notes of one slice into PCM and pushes them. The conversion is shared (`host/level_pcm.h`): each output sample is the *average* of the level over that sample's time, not a point sample, so an edge that falls between two samples does not alias; and the fractional sample position carries from one slice to the next, so slices join with no click and no drift.
+3. **No second thread touches the `Machine`.** `push()` is called on the main thread only. SDL drains its streams on a thread of its own, and that thread sees samples, never a board. `SdlAudio` opens one device on the first `push()` — a guest that makes no sound opens no device — and binds one stream per `Owner`; SDL mixes them. A host with no sound device is not an error: the open is tried once, `available()` goes false, and every later push is dropped.
+
+**`Speaker` — the part every D/A-driven speaker shares (built 2026-10-02).** The second client, the **Newtech Model 6 Music Board**, is the same case as the JS-1 speaker: a latch into a D/A that a program writes in a timed loop. So the code that was inside the D+7A moved to `host/speaker.h`, and both boards hold one `Speaker` for each voice. A board calls it in two places: `edge(t, level)` from `write()`, and `pump(clock, wired)` from `Board::pump()`. It owns the `LevelPcm`, the "has the guest driven it in the last half second" test, the cushion and the deep-queue drop, and the text `SHOW` prints. The address of a `Speaker` is its `Audio::Owner`. **The service is injected once**, `Speaker::setAudio()`, and not once for each board type: a third board with a speaker adds nothing to the composition root. One thing is new with the second client: `setAcCoupled(cornerHz)`, a one-pole high-pass for a board with a capacitor between the D/A and the amplifier (the Model 6's C7). It is off for the D+7A, whose sound is unchanged. Time that is not played counts as time for the capacitor to settle, so the next sound starts from 0 V.
+
+A chip that makes sound from its own model (a speech or music chip) is a further client of the same service: it renders its own PCM and pushes it, and none of the three rules change.
+
+**Closing the window stops the guest; it does not quit the process** (built 2026-07-18). The window is an operator's control like ATTN, and it lands you in the same place: the run loop asks the display once per slice (`Display::takeQuitRequest()`, consuming exactly like `Console::takeAttn()`), stamps `StopReason::WindowClosed`, and gives back the prompt with the machine untouched. The *display* is asked; the display does not stop the machine — a board's `pump()` must never be able to halt the backplane it sits in, so the only thing that acts on the answer is the run loop, which is the only thing that can stop a machine at all.
+
+**And the window is serviced at the prompt too, for liveness** (built 2026-07-25). The run loop is not the only place that must drain the window's event queue: a *stopped* machine sits in the monitor's line editor blocked on a console read, advancing no emulated time and pumping nothing — and a window nobody drains is one the compositor pings for liveness (`_NET_WM_PING`, the Cocoa watchdog), gets no answer from, and the OS then offers to Force-Quit. So the line editor's first-byte wait is a **timeout loop** (`platform::waitForInput`), and on each idle tick it runs an injected hook that pumps the boards once (`Machine::pump()`) and calls `Display::pollEvents()` — draining SDL's whole event queue, which answers the liveness ping and tosses any keystrokes/gamepad events that arrived while stopped. This is **not a second run loop**: it does not *render* (drawing stays the running machine's job, so `SET video=reverse` and the cursor blink still wait for `RUN`) and no emulated time advances. The one thing it acts on beyond draining is a close box clicked *while stopped* — which, unlike one clicked mid-`RUN` (that stops the guest and keeps the window), means the operator is done with the window, so the hook calls `Display::closeWindow()` and it goes.
+
+### 7.5 `Clock` — the single source of time
+
+Nothing in the simulator may call `std::chrono::now()` except this. Time is measured in **T-states**, never milliseconds, and it advances only when the CPU retires an instruction — by exactly the count the CPU reported, **plus the wait states any board held READY for** during that instruction's cycles. That is what makes replay deterministic, and it is why the UART's idea of when a character has finished going out is derived from the very instruction stream the guest is timing it against; the two cannot drift.
+
+**Wait states are pushed, never polled.** The core's T-state table cannot know that a slow board held READY (PRDY/XRDY) low and made the CPU idle in Tw; only the board knows. So a board calls `Board::holdReady(n)` from its own `read()`/`write()`, the bus adds it up (`Bus::addWaitStates()`), and the run loop takes the sum at the instruction boundary (`Bus::takeWaitStates()`) and adds it to `StepResult::tStates` before `advance()` — the same for a DMA master's cycles. A board that never holds READY costs nothing, as with pINT and pHOLD (§4.4). A bus cycle that no instruction ran — the monitor's `IN`/`OUT` — takes no time, so a run discards what is left over before it starts, and a cycle breakpoint that rolls an instruction back discards it too. The D+7A is the first board that uses it (5.5 µs on every analog cycle, issue #619).
+
+**A hold whose length depends on the board's own timeline lets the board run ahead of the clock.** The FDC boards' `timing = real` (issue #637) holds READY until the disk controller has a byte, and the controller only gets there by running its state machine forward — deadline by deadline, past `now()`. The clock cannot move inside an instruction, so the chip keeps `ahead_`, the latest time it has already lived through, and reads time as `max(clock.now(), ahead_)` (`Wd17xx::now()`; the North Star MDS keeps its own). `Wd17xx::holdUntilReady()` returns how far it ran; the board passes that to `holdReady()`, and once the run loop charges it at the instruction boundary, `clock.now()` has caught up with `ahead_`. So `ahead_` never needs saving: at an instruction boundary it is never ahead of the clock. Under the default `timing = full` the chip is wait-synced instead (every deadline is due at once), and the hold is zero.
+
+The crystal is on the **CPU card** (§3, §8), so the card publishes its `clock_hz` here. A board converting a real-world rate (a baud rate, a disk RPM) into T-states asks the clock, and never has to go hunting through the backplane for whichever card holds the oscillator — or discover there isn't one.
+
+**A board's real-time source is not the CPU's crystal** (issue #825). The crystal does not leave the CPU board. The one exception is the bus's 2 MHz CLOCK (pin 49), which every CPU board supplies at 2 MHz at any processor speed. A source that keeps real time, such as the 60 Hz mains or a divider off the bus CLOCK, therefore counts host time. The board reads host time through an injected function, and a test sets it. A board on this rule uses a `HostTicker` (`src/core/hostticker.h`), which keeps the schedule in host time. With a crystal set, the tick is a `Clock` deadline at the exact T-state, because the run loop holds T-states to real time. Flat out, the board's `pump()` sets the tick when host time says it is due. The 88-VI/RTC and the RTC-100 (issue #827) use it. `docs/boards/mits-88virtc.md` has the details.
+
+**Pin 49 has one model, `BusClock`** (`src/core/busclock.h`, issue #836). The bus owns it, and a board reads it as `bus.busClock()`. It counts 2 MHz ticks of real time. With a crystal set, it counts T-states, so a paced run is exact and repeatable. Flat out, it counts host time, one tick for each 500 ns. If the machine stops at the monitor, the next run slice moves the count forward to host time. `BusClock` also holds the host-time function for pin 49, so a test sets host time there. Only a source that the hardware wires to pin 49 uses `BusClock`. The SS-1's 8253 counts its ticks, and the 88-VI/RTC's `clock` source (CF, CLOCK ÷ 200) reads its host time. A source with its own crystal keeps its own clock. For example, the RTC-100's MSM5832 has its own 32.768 kHz crystal.
+
+```cpp
+class Clock {
+public:
+    uint64_t now() const;              // T-states since POWER. Only power resets it.
+    void     advance(uint64_t dt);     // the run loop, with StepResult::tStates
+
+    using Handle = uint64_t;           // an integer, so a stale one is merely stale
+    Handle at(uint64_t when, std::function<void()> fn);     // "call me AT T"
+    Handle after(uint64_t dt, std::function<void()> fn);
+    void   cancel(Handle h);           // cancelling a dead handle is legal
+    bool   pending(Handle h) const;
+    size_t queued() const;
+
+    long long hz() const;              // published by the CPU card
+    uint64_t tStatesPer(long long perSecond) const;   // the ONE place that division lives
+    void     power();                  // time restarts; every deadline is gone
+};
+```
+
+Two properties the boards depend on:
+
+- **Order is total and deterministic.** Events fire in `(when, scheduling order)` — the handle is a monotone counter and breaks the tie. Two boards with deadlines on the same T-state fire in the same order in every replay, on every host. Without an explicit tiebreak this is a divergence that appears once a month and can never be reproduced.
+- **Inside a callback, `now()` is when the event was *due*** — not where the instruction that carried time past it happened to end. An instruction is up to 17 T-states long; a board that re-arms with `now() + charTime` would otherwise drift a little further with every character it ever sent.
+
+#### The `EventQueue` came back, and the board cited as proving it unnecessary is the board that proved it necessary
+
+**Reversed 2026-07-12.** This section previously *deleted* the `EventQueue` and argued the case at length. The argument was:
+
+> In this architecture a board is already **polled** for everything the bus can observe about it. `decodes()` is asked on every cycle; `assertsInt()` on every instruction boundary. So a board never needs to be *woken* — it needs to answer *"what time is it?"* when someone finally asks.
+
+**That argument was circular, and the circle was hiding the bug.** The board did not need waking *because we were polling it sixty million times a second*. The poll was not evidence that the queue was unnecessary. **The poll *was* the queue**, run at enormous cost and called something else.
+
+And the poll had to go, because it was never how the machine worked (§4.4): a bus does not interrogate a card for its interrupt status. A card **pulls pin 73 and holds it**. Take the poll away and the board is left holding a deadline it has no way to be present for:
+
+> A 6850 with the transmit interrupt jumpered raises IRQ when its transmit data register empties. **Nobody touches it. No bus cycle happens.** And the guest is sitting in a `HLT` waiting for precisely that interrupt. If the only way the card can act is to *be asked*, and the only thing that would ask is the CPU that is halted waiting for it, **then nothing ever happens again.**
+
+That is not hypothetical — `tests/test_sio2.cpp` runs exactly that machine, and it is the test that fails without a queue.
+
+**What was right in the old argument, and still is:** TDRE *is* a deadline, not an event, and a board that can answer "what time is it?" when the guest finally reads the status port should do exactly that and **schedule nothing**. The 6850 still does, for the polled case — `nextEdge()` returns "never" on a quiet line with an idle transmitter, which is the commonest state in the machine, and the old model paid the full price of a poll for it. You come to the queue only for a state change that must be **visible to someone else the instant it happens**, and on this bus there is exactly one such thing: **a wire**.
+
+#### And a periodic pump, because a deadline cannot predict a keystroke
+
+Patrick asked whether boards want an event queue, a periodic timer, or both. **Both — and the second one already existed.**
+
+They are not alternatives; they answer different questions. A **deadline** is something emulated time already knows is coming (a character finishing transmission, a disk sector arriving under the head). A **keystroke from the host** is not in emulated time at all — nothing could have scheduled it — so it arrives through `Board::pump()`, once per time slice, which is the one door the outside world comes through (§7.1).
+
+The 6850 needs both, in the same function: `pump()` takes the byte off the line, and if the line has not yet had time to deliver it, sets a **deadline** for when it will.
+
+**No threads.** Board logic stays in emulated time, single-threaded, or `RECORD`/`REPLAY` is dead (§13). Host I/O may thread *behind* the `ByteStream`, where it belongs — that is what the interface is for.
+
+### 7.5.1 `Spindle` — the disk turns whether or not anyone is looking at it
+
+**Built 2026-07-12** (`src/core/spindle.h`), ahead of the two floppy boards that need it, because they need the *same* arithmetic and it should exist once.
+
+A floppy rotates on its own. So the sector under the head is **not state a controller advances — it is a reading taken off the clock**:
+
+```
+sector = (now / tPerSector) % sectorsPerTrack
+```
+
+**There is no hidden counter and no advance-on-read**, and that is the whole design. The tempting alternative — a counter the card bumps when the guest reads the sector-position port — makes the disk's rotation depend on *how often the guest polls*: a tight loop spins the platter faster than a slow one, the drive runs at the speed of the software watching it, and a recorded session stops replaying identically. Deriving it from `Clock` kills all three at once, and costs less code than the counter would have.
+
+**Two cards need it, for different reasons, which is why it is neither card's:**
+
+- the **88-DCDD** hands the sector number straight to the guest at `IN 0x09`;
+- the **Tarbell** never exposes it — but its FD1771's `Read Address` (0xC4) must answer *"which sector is under the head right now"* so the buffered CP/M BIOS can begin a track read where the head already is. A static answer spins that BIOS forever.
+
+It lives in `src/core/` (Patrick, 2026-07-12) because it is **pure time math over a `Clock` and knows nothing else** — not a board, not a `MediaFile`, not a sector's contents. It is not a chip (§7.8: nothing solders a spindle to a card), and it does not belong in `src/host/` beside `DiskImage`, which is bytes and offsets with no notion of time.
+
+**It hands back a 0-based INDEX, and stops there.** A controller that numbers sectors from 1 (the Tarbell does; the DCDD does not) adds its own `startSector`. That off-by-one is the one that **silently corrupts a disk** (§7.3), so it stays in the board where it is visible, and is deliberately *not* buried in here where a reader would have to go looking.
+
+Two invariants it enforces so no board has to:
+
+- **`nextBoundary()` is strictly future**, at every instant of a revolution — by construction, not by a hand-written guard. A deadline armed for `now()` fires inside the drain loop that is running it, re-arms, and the machine never advances again. The UART's `nextEdge()` enforces the same rule by hand (§7.5); here it falls out of the arithmetic.
+- **The sector is the unit, not the revolution.** Everything derives from `tPerSector`, so `sectorAt()` and `nextBoundary()` cannot round apart — a board that wakes on the deadline it was given always finds the sector it was promised, at that sector's first T-state. Deriving both independently from `tPerRev` would let them disagree by a T-state, occasionally, which is the worst kind of bug to own.
+
+**The motor does not care what crystal the CPU has.** Rotation comes from `Clock::hz()`, so a 4 MHz machine executes twice as fast and still turns its disks 360 times a minute. Expressing rotation in raw T-states would make overclocking the CPU spin the floppy faster, which is nonsense.
+
+### 7.6 `Log` / `Trace`
+
+**The per-source half is built** (`src/core/debuglog.{h,cpp}`, `namespace altair::dbg`, 2026-08-02). The original design was one structured diagnostic sink with per-board *and* per-category masks (`IN`, `OUT`, `READ`, `WRITE`, `IRQ`, `DMA`, `CONTENTION`), mirroring the `DEBTAB` idea in `mits_dsk.c`, emitting text for the monitor and JSON for MCP from the same call site. `dbg` builds the per-source axis of that: a named **`Channel`** for each instrumented source — a board (named by its `id`, created on `Bus::attach` when the board's `debugFlags()` is non-empty), a chip (`mc6850` owns a static `6850` channel), a host layer (the socket code owns `socket`) — each carrying its own flag list, and **one global sink** (`Stderr` default, `Stdout`, or an appended `File`). A channel caches its enabled flags as a `uint32_t`, so an emit site is a single `if (ch.on(SEEK))` when the flag is off and the formatting behind it never runs. `dbg::line()` prefixes each line with the **PC of the driving instruction** — `2C38  dsk0: sector drive=0 track=0 sector=1` — read lazily through a provider `Machine` installs (`Bus::instrPc`, published once per instruction by the run loop), or `----` at the prompt where the machine is not running. The operator drives it from the monitor: `SET CONSOLE DEBUG=<sink>`, `SET <channel> DEBUG=/NODEBUG=<flags>` (additive/subtractive, `all`/`none`, atomic on an unknown flag), `SHOW DEBUG`, and Tab completion for channel names and flag values. None of it survives `CONFIG SAVE` — a diagnostic is a session, not a property of the machine. So the one place an operator keeps their own sink is `~/altairsim.ini`, a monitor script `main.cpp` runs on a plain interactive launch, after the machine loads and before its `startup` (`Monitor::runUserInit`; `ini> ` echo, a failed line never changes the exit status). **`--mcp`, `-x` and `-s` never run it**: their stdout is the transport or the CI transcript, and a file in `$HOME` must not make the same command print differently on two hosts. A sink path is rooted like any typed path (`resolveInput`), so a relative one in that file lands in the home folder.
+
+**What is still not built is the *category* half and the JSON emitter.** `TraceCat` (`src/core/debug.h`) is `{InCycle, OutCycle, Irq, Dma, Contended}`, driven by `TRACE ... MASK=` — a separate bus-trace mechanism with no `READ`/`WRITE` memory category, **no per-board mask**, and no JSON for MCP. Folding the two together — per-board *and* per-category masks from one call site, text for the monitor and JSON for MCP — is the design that was specced; the `dbg` channels are the first half of it, and per-unit channels (`sio0:a`) plus instrumenting the remaining boards are the incremental next step.
+
+### 7.7 The two consequences worth stating explicitly
+
+- **A new board written against these services is automatically cross-platform and automatically replayable.** That is the point of the layer, and it is the acceptance test for the API.
+- **`CONNECT` and `MOUNT` are generic**, not per-board commands. The monitor resolves an endpoint string to a `ByteStream` or a file to a `DiskImage` and hands it to whichever board declared a unit of that type — so a board written next year gets `MOUNT`/`CONNECT` for free without touching the monitor. Note the division of labor: the *monitor* opens the file; the *board* decides what its bytes mean (§7.3).
+  - **This is why a network disk cost no board change.** `MediaFile` (§7.3) is *where the bytes are*, and `openHostMedia` is the one place that decides what a mount string becomes. Teaching it that `tnfs://host[:port]/path` means "slurp this image off a TNFS server, serve it from RAM, write the dirty range back on sync" is a new `MediaFile` implementation plus one branch in that resolver — no controller, no `DiskImage`, and no `MOUNT` grammar was touched, and every disk and tape board mounts over the network for free. The two protocol quirks that make it a *network* medium and not a file: a TNFS `READ` returns at most 512 data bytes so the slurp loops in chunks, and a lost UDP datagram is recovered by resending the *same* sequence number (the server idempotently replays its cached reply). Both live entirely in the medium, off the emulation path — the session talks to the server only at mount and at sync.
+
+---
+
+## 7.8 A chip is not a card (`src/chips/`)
+
+**A board is a PCB with chips on it, and the code says so** (Patrick, 2026-07-12). `src/chips/` holds the parts that get soldered to more than one card: `mc6850.h` (the 6850 ACIA, on both halves of the 88-2SIO), `uart1602.h` (the COM2502 — the 88-SIO, and the 88-ACR when it lands; the same 40-pin part that others second-sourced as the AY-5-1013 and the TR1602), and `wd17xx.h` (the **FD1771**, on the Tarbell and on the controllers after it).
+
+**What a chip talks to is an INTERFACE, never a file.** `Mc6850` has a `ByteStream`; `Wd1771` has a `FloppyDrive` — pins (STEP, DIRC, TR00, WPRT, READY, IP) with a drive on the far end. The FDC owns no image, no geometry and no host file, and it has **no drive-select and no side-select pin** — because the FD1771 hasn't got either. Which drive those pins reach is a *latch on the card*, so the board calls `attach()` and the chip is none the wiser. That absence is the chip/board seam stated in silicon.
+
+**The FD1771 is also where §0.1 earned its keep.** `reference/` contains a WD177X data sheet, and it is a *different chip*: its stepping rates are 6/12/20/30 ms where the FD1771's are **6/6/10/20**, and its record type is one bit where the FD1771's is **two** (it has four data address marks). Building the Tarbell's controller from the sheet that was to hand would have produced something plausible, clean, and wrong — a controller that seeks at the wrong speed and mis-reports deleted records, while looking entirely finished. The right sheet was sourced first (`wd17xx.h` says which), and `tests/test_wd17xx.cpp` keeps a tripwire test on the step-rate table so that nobody "fixes" it back.
+
+**The seam is not "the chip does the work and the board forwards to it."** The 88-SIO is the case that shows where it really falls. Its status word is *inverted* and the 88-2SIO's is not; a shared UART class with a `bool invert` on it is the exact bug this rule exists to prevent. So: **the chip is what the data sheet describes, at its pins, in true sense.** Everything between those pins and the S-100 bus — the inverting buffers, which bit each signal lands on, the board revision that moved them, the interrupt-enable flip-flops in a *different IC*, the port decode — is the CARD's, and it stays on the card. The COM2502 has no interrupt pin at all, so it cannot even answer "when could my interrupt move?"; it publishes its raw deadlines and the board, which owns the enables and the strap to pin 73, works that out. Two cards, one chip, and not one line of polarity shared between them.
+
+**Each chip is modeled from its DATA SHEET, and each board from its MANUAL.** That line is the whole reason the directory exists. A chip built instead from the one BIOS that happens to drive it will implement exactly the subset that BIOS touches and quietly get the rest wrong — and it will look finished while doing it. §0.1 applies to a chip's registers exactly as it applies to a card's ports.
+
+A chip knows nothing about S-100. It has a clock, some pins, and (if it moves bytes) a `ByteStream`. It never learns the endpoint *grammar* either: the monitor installs a resolver on the board, and the board hands the **function** down — which is §7.7's division of labor holding one level further in.
+
+**This does not license sharing between cards that merely resemble each other.** The 88-SIO and the 88-2SIO still share no code, on purpose: they are *different chips with opposite status polarity*, and a common helper with a `bool` flipping the sense is precisely the trap that rule was written to prevent. What licenses sharing is being **the same part**, not filling the same role.
+
+---
+
+## 8. Timing and host idling
+
+- Clock is the **CPU board's** `clock_hz` — not the machine's (§3). The crystal is on the card, and a backplane with no CPU card has no clock rate at all. **`0` = free-running, and it is the DEFAULT** (Patrick, 2026-07-13). The run loop simply does not sleep, so a cassette that took a real Altair 110 seconds comes off in about one. Emulated time is unchanged: `Clock::hz()` remains a 2 MHz **divisor** so no UART ever divides by zero, and a separate `Clock::free()` decides whether we wait. `clock_hz = 2000000` gives back the period machine *and* the period waiting. **A crystal is always kept** (issue #731): `RUN` at the prompt, `-x`, `-s`, a pipe and `--mcp` all pace to it, and a script that must be fast leaves `clock_hz` at 0. Until then the monitor's `RUN` kept a crystal only for an observer — a console on a terminal, then a socket or serial line (#6), then a speaker that played (#726) — on the reasoning that a script has no wall clock to match. The list grew one bug report at a time, a video window was the next entry, `--mcp` never used it, and the same machine file kept time from a terminal and not from a script with nothing in the file to say so. Measured cost of dropping it: no acceptance test became slower, because the tests that load a machine with a crystal run on a pty. (Before this, `0` was documented as "runs flat out" and silently did nothing — `setHz(0)` coerced the rate back to 2 MHz and the run loop paced against it.)
+- **A board's own speed switch is a different thing from `clock_hz`, and never follows it.** `clock_hz` is invisible to the guest (§7.1); a board strap that trades hardware time for speed — the serial and tape boards' `rate = full | real`, CADzilla's `draw_rate = full | real` — is *visible* to the guest, and is chosen per board. A board modeling a real-time delay does it in T-states off `Clock::hz()`, which is a 2 MHz divisor even flat out, so the delay has its correct length in guest instructions at any `clock_hz`; flat out only makes the host stop waiting.
+- Throttle by comparing accumulated T-states against a monotonic host clock in ~1 ms slices and **sleeping** the remainder — never spin.
+- **The CPU card WRITES to the Clock, and that makes re-attaching a card a publish** (issue #34, 2026-07-18). Every other card *reads* the clock and is happy to be handed a different one; this card pushes `clock_hz` and `idle` **into** it. A machine file is assembled into a scratch `Machine` so a bad file cannot damage a running one (§10), so the card announced 2 MHz to the *scratch* Clock and `Machine::replaceWith` then moved it onto the real backplane — whose Clock had never heard of it. `SHOW cpu0` read `2000000` off the card while the run loop free-ran, and **both were telling the truth about different objects**, which is the worst shape a bug can take. The invariant is *this card's clock knows what this card told it*, and it is kept where it can be broken: `Board::attachClock` calls a virtual `clockAttached()`, and the CPU cards republish there.
+  - **It survived because every test set the crystal at the monitor.** `SET cpu0 clock_hz=...` runs on a card already on the real backplane, and `CONFIG LOAD` powers the machine again afterwards and republished by luck — so the one road nothing drove was the one every operator takes: put it in the file, start the simulator. A property that can be set two ways needs a test for **each** way, and the file is the way that matters.
+- **Idle detection** — **BUILT, 2026-07-13** (Patrick), and it is the CPU card's `idle` property, on by default. It is the *second* sleeping policy and it is **orthogonal to the first**: `free()` asks "do we keep time?", `idle()` asks "do we stand down when there is nothing to do?". Both live on the Clock because that is where the run loop already goes to ask whether to sleep, and both are published by the card that carries the crystal (`boards/mits-88cpu.cpp`). `SET cpu0 idle=off` gets the spin back. **No hardware behaves differently — only the host sleeps, and the guest cannot tell.** Measured: 8 MB CP/M at `A0>` went from **100% of a core to ~3.5%**.
+  - **The signals are three, and all must hold**: the guest **said** nothing (`Console::written()`), **received** nothing (`Console::consumed()`), and came to the keyboard and found it **empty** at least once every 32 instructions (`Console::hungry()`). Then, and only then, once it has been that way for an unbroken **20 ms**, the loop naps 4 ms per slice.
+  - **"Any data read resets the counter" is the load-bearing clause, exactly as this section always said.** A guest receiving XMODEM *down the console line* is the counter-example that breaks every simpler rule: at 76,800 bps it waits 130 µs for each byte, polling an empty keyboard hundreds of times per slice, and it prints nothing for a whole 128-byte block. By "is it polling?" alone it **is** a prompt — and a first draft that judged it on the poll ratio alone napped straight through a fed console at 4.3% of a core, which would have dragged 7.7 kB/s down to 250 B/s. The difference between a parked machine and a working one is not how it polls; it is that **bytes are arriving**. So a byte crossing into the guest resets everything.
+  - The 20 ms **warmup** is the belt to that braces: sub-millisecond gaps inside a transfer can never accumulate into a nap, while a human's gap before finding a key is effectively infinite. It costs a prompt nothing anyone can perceive (measured `DIR` round trip: 13 ms, nap and all).
+  - **A paced run never naps** (issue #606). The two policies ask different questions, but the run loop takes only one sleep per slice. With a crystal set, the throttle already sleeps for most of every slice, and it is the sleep that keeps the time. The nap used to be taken *in place of* the throttle: at 2 MHz a 2,000-instruction slice is about 8 ms of guest time and it got a 4 ms nap, so a guest at a prompt ran **1.3 times its crystal** and counted a timeout short. The rule is one pure function, `mayNap` (`cli/monitor.h`), and the `--mcp` free run follows the same rule. `tests/acceptance/clock-idle-pace.exp` measures it on a pty.
+  - It applies **only when a unit holds the console and stdin is a terminal**. That is the nap's gate alone; the throttle asks only for a crystal (#731). Under `-s` or a pipe the keyboard is a script, and the run loop's existing end-of-input logic (`starved()`, §7.2) is what ends the run there. `hungry()` and `starved()` are **deliberately different counters**: empty, versus empty *and ended*. Merging them re-introduces the bug that killed a cassette load three slices in.
+
+---
+
+## 9. Devices, `MOUNT`, and `CONNECT`
+
+- A board declares typed **units**, and **a unit is a NAME, not an index** (Patrick, 2026-07-11). A disk unit accepts `MOUNT id:unit <hostfile>` (`UNMOUNT` to release); a serial unit accepts `CONNECT id:unit <endpoint>` (`DISCONNECT`).
+
+  **ONE CARD IS NOT ONE KIND OF THING.** A card may carry drives *and* ROM sockets *and* a serial port — the Tarbell carries a boot PROM and a floppy controller on one board (§4.2.1), and the 16FDC carries a console UART as well, and a controller with its own PROM, scratch RAM and a serial port was a completely ordinary 1977 product. Nothing in the bus model ever assumed otherwise: `decodes()` is asked about every cycle and `BusCycle::type` distinguishes memory from I/O, so one card answers both. `tests/test_units.cpp` builds exactly such a card and proves it.
+
+  So units are named and typed — `MOUNT dj:drive0`, `MOUNT dj:rom0`, `CONNECT dj:tty` — and **the kind is checked**: mounting a disk image onto a serial port is an error with a sentence explaining it. The integer scheme could not be made safe, which is why it is gone: with a flat namespace, `MOUNT dj:4` on a serial unit can only *fail*, never *explain*, because the board has nothing left to distinguish 4-the-drive from 4-the-port. `SHOW <id>` lists the units, and it reads `Board::units()` — the same list MOUNT reads, so they cannot disagree.
+- Endpoints: `console` | `socket:PORT` (listening) | `socket:HOST:PORT` (outbound) | `serial:/dev/tty.usbserial-X` or `serial:COM3` | `in:path` (reader) | `out:path` (punch) | `null`. **All of them are built** — `console`, `null`, `loopback`, `scripted`, `socket:`, `serial:` and `in:`/`out:`. (This line read "Built so far: `console`, `null`, `loopback`" long after that stopped being true, which is why the monitor's help text for CONNECT is now *generated* from the resolver's own `endpointHelp()` rather than written out here or in `commands.cpp`.) The resolver **names the legal forms when you ask for one it does not know**, rather than failing as though you had mistyped it.
+- Exactly one unit may hold `console` at a time; the monitor arbitrates. **Connecting a second STEALS it and says who from** — two boards reading one keyboard would each get half the characters, which is not hypothetical: it is what happens the first time a machine has two 2SIOs and you forget.
+
+  One routine takes the console, `takeConsole()` in `cli/monitor.cpp`. It asks a test which units hold the console. The CLI's test is "the unit is connected to `console`". Under `--mcp` the holder shows `scripted`, so the MCP server gives the monitor a second test as well: "the unit's line is the session's console line". `CONNECT` and `SHOW CONSOLE` use the same test, and `CONNECT` takes the console during the command (issue #779).
+- Disk images are buffered and written back. **The board** probes the image size against the formats *it* knows and declares the layout to `DiskImage` (§7.3); `media = ...` forces the choice when the size is ambiguous, and **the choices belong to the card**: an 88-DCDD takes `8in` and `fdc8mb`, an 88-MDS takes `minidisk`. Naming another card's medium is an error, not a probe — the two controllers are register-compatible (`docs/boards/mits-88mds.md`), so nothing else would have caught it. `readonly` supported (the real board's write-protect).
+
+---
+
+## 10. Monitor CLI
+
+SIMH/AltairZ80-flavored, stable and greppable.
+
+```
+CONFIGURATION
+  CONFIG LOAD <file.toml>          CONFIG SAVE <file.toml>
+                                   (bare LOAD/SAVE mean *memory* — see below)
+  BOARDS                           the backplane: id, type, i/o, units, memory
+                                   (BOARD too: it is a prefix of BOARDS, not an alias)
+  BOARDS TYPES                     every board type compiled in, with its properties
+  BOARDS ADD <type> <id> [k=v ...] BOARDS REMOVE <id>
+  SHOW <id>                        every property: value, units, legal range
+  SET <id> <k>=<v>                 generic; e.g. SET sio2a BAUD=9600, SET mem0 PHANTOM=read
+  SHOW ROMS                        every ROM compiled in: name, size, CRC32, description
+                                   (use as mount = "builtin:<name>" — see §10.3.1)
+
+INTROSPECTION
+  SHOW BUS                         MAP + IO + INTERRUPTS, one after the other. (It was
+                                   specified as CPU/clock/T-states/pending IRQ/DMA state
+                                   and is NOT that: the clock and the T-state count are
+                                   the CPU CARD's, so they are SHOW cpu0.)
+  SHOW BUS MAP                     memory decode map: range -> board, type, phantom, bank
+  SHOW BUS IO                      I/O decode map: port -> board, direction
+  SHOW BUS IRQ                     VI0-VI7: who is strapped where, who is pulling,
+                                   who WINS -- and the two silent mis-wirings (a vi*
+                                   strap with no 88-VI; an `int` strap with one)
+  SHOW BUS CONTENTION              every address/port claimed by more than one board
+  WHO <addr> | WHO IO <port>       reverse lookup: who responds here, and why
+
+MEDIA AND CONNECTIONS
+  MOUNT <id>:<u> <file> [RO]       UNMOUNT <id>:<u>
+  CONNECT <id>:<u> <endpoint>      DISCONNECT <id>:<u>
+
+CONSOLE  -- it CONFIGURES the console; it does not start the machine (RUN does).
+  CONSOLE                          show it: properties, and WHICH UNIT HOLDS IT
+  CONSOLE <k>=<v>                  set it.  SHOW/SET CONSOLE are the same, said long
+  ATTN                             the key that takes the keyboard BACK from a running
+                                   guest (default ^E). Tracked on CONSOLE INPUT ONLY:
+                                   a unit on a socket or a serial port is not the
+                                   console, and its data passes through UNALTERED.
+  The transforms -- UPPER, STRIP7IN, STRIP7OUT, CRLF, BSDEL, ECHO, BELL -- are
+  properties of the CONSOLE and of nothing else: SET CONSOLE UPPER=ON. They were
+  once on the LINE (SET sio0:a UPPER=ON), and that was REVERSED 2026-07-13 as a
+  data-corruption bug -- see 7.2. A card's line must stay 8-BIT CLEAN, because a
+  line carries XMODEM and a filter on it corrupts a transfer silently. What a card
+  has instead is line CODING (baud, data_bits, parity): a frame, never a mask.
+  SET sio0:a UPPER=ON is an error today, and says so.
+  TABS, ANSI, ROWS, COLS and PACE are NOT BUILT -- see 7.2. LOG tees the session
+  to a host file (SET CONSOLE LOG=path; empty/off closes it). DEBUG aims the
+  runtime diagnostic sink (SET CONSOLE DEBUG=stderr|stdout|path); the per-source
+  channels are SET <name> DEBUG=<flags> / SHOW DEBUG -- see 7.6.
+
+  WHICH UNIT IS THE CONSOLE? The one CONNECTed to it. Exactly one may hold it (there
+  is one keyboard); connecting a second STEALS it and says who from. A config file
+  that names two is REFUSED -- interactively the last cable you plug in is the one
+  you meant, but in a file there is no "last": it is a typo.
+
+  THE KEYBOARD IS BUFFERED BY THE HOST. Keys land in a buffer here and a card takes
+  characters from it. That is what lets ATTN be watched whether or not anybody is
+  reading -- including with no serial card in the machine at all -- and what lets
+  MCP inject input that no board can tell from a human's.
+
+MEMORY
+  LOAD <file> [AT <addr>] [FORMAT=BIN|HEX] [ROM]
+                                    HEX carries its own addresses; a flat binary does
+                                    not, so it REQUIRES AT. The file's CONTENTS decide
+                                    which it is; FORMAT= overrides and always wins. AT
+                                    means PUT IT HERE for both: on a HEX file it moves
+                                    the image so its FIRST DATA RECORD lands there,
+                                    wrapping modulo 64K. ROM is the burner (10.2).
+  SAVE <file> <range> [FORMAT=BIN|HEX]
+                                    The NAME decides -- .HEX writes Intel HEX, anything
+                                    else writes a flat binary -- because SAVE cannot
+                                    sniff a file that does not exist yet. FORMAT=
+                                    overrides.
+  DUMP [<addr>|<range>] [WIDTH=16]  hex + ASCII. A bare <addr> runs to the END OF ITS
+                                    PAGE (D 0001 -> 0001-00FF); bare DUMP continues
+                                    from there. Page-aligned in and out, so the rows
+                                    and the columns both stay put.
+  DISASM <range>|<addr> [n] [CPU=8080]
+                                    Mnemonics follow the ACTIVE CPU -- you never type
+                                    CPU=. It is the override for a machine with no CPU
+                                    card in it, or for looking at foreign code (§3.0.2).
+  EDIT <addr> [ROM]                 Interactive DEPOSIT: the prompt shows an address and
+                                    the byte there; a value writes it and drops to the next,
+                                    a bare Enter leaves it and drops to the next, '.' stops.
+                                    A REAL bus write (says so if nobody decodes it; ROM
+                                    burns). Reads the new bytes from the monitor's own input.
+  EXAMINE [<addr>]                  ONE byte: hex, ASCII, bits. Bare = EXAMINE NEXT.
+                                    THE PANEL'S SWITCH IS THE CPU: it jams the address
+                                    into the PROGRAM COUNTER and the CPU drives the
+                                    address lines and MEMR*. So EX LOADS THE PC (`EX
+                                    F800` + RUN starts a ROM), the PC *is* the cursor, and
+                                    with NO CPU CARD IT IS AN ERROR -- nothing is driving
+                                    the bus. (Look at a CPU-less machine with DUMP: it
+                                    runs no cycle, so it needs nobody to drive one.)
+  DEPOSIT <byte>                    The panel's other two switches, and the PC is their
+  DEPOSIT NEXT <bytes...>           address (#772). <byte> writes at the PC; NEXT adds 1
+  DEPOSIT <addr> <bytes...>         to the PC, then writes, per byte; <addr> is EXAMINE
+                                    <addr>, DEPOSIT, then DEPOSIT NEXT for the rest. The PC
+                                    ends on the last byte written. Like EXAMINE, it needs
+                                    a CPU (EDIT, FILL and LOAD write a CPU-less machine).
+  FILL <range> <byte>
+  SEARCH <range> <bytes...>|"str"
+  COMPARE <range> <addr>            memory to memory. There is no <file> form.
+  MOVE <range> <dest>
+  LOAD, DEPOSIT, FILL and MOVE take an optional ROM: program a ROM, by going behind the
+  bus into whichever chip answers reads there (§10.2). The read side needs no such word
+  -- a ROM answers reads like anything else. EVERY ADDRESS HERE IS A BUS ADDRESS.
+
+I/O
+  IN <port>                         run a real IN cycle -- with real side effects
+  OUT <port> <byte>                 run a real OUT cycle
+  WHO IO <port>                     who WOULD answer -- looks without touching
+
+EXECUTION
+  RUN [addr] | STEP [n] | STOP      STOP is NOT BUILT (10.1): it needs a monitor that
+                                    runs alongside the machine. ATTN is how you get out.
+  RUN is the switch on the panel, and the ONLY way to start the machine. `RUN <addr>`
+  is EXAMINE + RUN: it loads the PC first, exactly as the panel does.
+    - A unit holds the console -> the GUEST GETS THE KEYBOARD (every key, including
+      ^C, which CP/M is entitled to read), and it runs at the CPU card's real clock.
+    - Nothing holds it       -> there is nothing to hand over, so it just runs.
+  That is not a mode the operator picks. It is a fact about the backplane, and the
+  machine already knows it -- which is why GO was DELETED (Patrick, 2026-07-12):
+  a "headless run" was never a second thing to be. Both paths stop on a breakpoint,
+  on a HLT nothing can wake, and on ATTN, and both say which.
+
+  ATTN (^E) IS THE STOP KEY, NOT ^C. Ctrl-C belongs to the guest. ATTN does not stop
+  the machine -- it takes the keyboard back, and a bare RUN resumes where you were.
+  RESET | RESET CPU | POWER
+  There is NO `SET CPU`. The CPU is a CARD (§3): BOARDS ADD 8080 cpu0, and the clock
+  is that board's property -- SET cpu0 clock_hz=2000000. A card carrying both an
+  8080 and an 8085 exposes them as UNITS and switches between them itself (§3.0.1).
+
+DEBUG
+  BREAK [<addr> [IF <expr>] | MEM R|W <addr> | IO R|W <port>] [TRACE ON|OFF] | NOBREAK
+                                    The DIRECTION is required on both watch forms, and
+                                    they take an address, not a range.
+  REGS | SET REG <r>=<v>            Generic: registers are reflection (§3.0.3), so a
+                                    Z80 works the day it lands with no monitor change.
+
+  EVERY STOP PRINTS WHY, AND THEN ONE LINE (§3.0.3.1). STEP traces in the same line,
+  DDT-style: the machine as it stands, WITH the instruction it is about to run.
+
+    ATTN -- the machine is still at 0020. RUN resumes.
+    C0Z0M0E0I0 A=00 B=0000 D=0000 H=0000 S=0000 IE=0 P=0020  JMP 0020
+
+  The reasons are ATTN (you took the keyboard back), a breakpoint (which one, and of
+  what kind), HLT that nothing can interrupt, ^C, a SCRIPT'S INPUT ENDING, and no CPU
+  in the machine. Six different things, and they get six different words -- the monitor
+  used to GUESS at two of them from whether a console happened to be attached, and a
+  guess is what you write when the reason was never carried in the first place.
+
+  A HALTED PROCESSOR DOES NOT RUN. It leaves HALT for an interrupt it will take, or for
+  RESET. It fetches nothing in between, so on a real panel RUN, EXAMINE, EXAMINE NEXT,
+  DEPOSIT and DEPOSIT NEXT all do nothing (tested on hardware, #770). The monitor
+  says so instead: `RUN <addr>`, EXAMINE and every DEPOSIT refuse any halt, and a bare
+  RUN, STEP or NEXT refuses a halt that nothing can end ("processor halted at PC=0101 --
+  RESET ends the halt."). The registers and flags are unaffected (Intel). The fix is
+  the RESET a human would throw. (This is what the honest stop reason caught first, in
+  our OWN test: tests/acceptance/cli.exp had been "testing" ATTN against a machine that
+  was halted the whole time, and matching the prompt that came back with the HLT.)
+  TRACE ON|OFF [file] [MASK=IN,OUT,IRQ,DMA,CONTENTION]   HISTORY [n]
+  SYMBOLS LOAD <file> [REPLACE] | SYMBOLS CLEAR          SHOW SYMBOLS [<name>|<glob>]
+                                    A .PRN/.LST listing or a CP/M .SYM, so a name works
+                                    wherever an address is typed (§10.3.2). HOST-SIDE like a
+                                    breakpoint: survives RESET/POWER/CONFIG LOAD.
+  SNAPSHOT <file> | RESTORE <file>  BUILT (13): the machine's STATE to a file, and back
+                                    into a machine of the same shape. Board::serialize()
+                                    on every board, the CPU core and the Clock (4, 13.1).
+  RECORD <file> | REPLAY <file>     NOT BUILT (10.1, 13). They resolve and say so; they add
+                                    a T-stamped event log on top of SNAPSHOT -- the next phase.
+  SET BUS CONTENTION=WARN|ERROR|SILENT
+  SET BUS UNCLAIMED=WARN|HALT|SILENT   floating-bus diagnostic, default SILENT (4.6.1). HALT
+                                       stops the guest at an I/O port no board decodes.
+```
+
+### 10.0.0 The command line, and the built-in machines
+
+**Settled 2026-07-11 by Patrick**, the command-line grammar having been undefined until then.
+
+```
+altairsim [options] [<machine>]
+
+  <machine>            a BUILT-IN name, or a FILE if it has a '/' in it or ends .toml.
+                       Omitted: `./altairsim.toml` if the working directory has
+                       one, else `default`.
+  -m, --machine <n>    ALWAYS a built-in name -- never a file.
+  -f, --file <path>    ALWAYS a file -- never a built-in name.
+  -n, --none           empty backplane. No boards at all.
+  -l, --list           list the built-in machines and exit.
+
+  -s, --script <file>  run a command script, then exit with its status.  (was `-c`)
+  -x, --exec <cmd>     run one monitor command (repeatable), then exit.
+  -i, --interactive    after --script/--exec, stay in the monitor.
+      --mcp            MCP server on stdio.
+  -v, --version        -h, --help
+```
+
+`-s script.cmd` is the CI/regression entry point: a script that fails exits non-zero. `-x` is the same thing for one-liners, which is what makes a bug report reproducible in a single pasteable line.
+
+**`--set "<id> <key>=<value>"` is a `SET` that runs before `startup`** (issue #736). `startup` runs before `-x` and `-s`, so on a machine whose file says `startup = ["RUN FF00"]` a `-x "SET cpu0 clock_hz=2000000"` arrives after the guest has booted. `--set` is the same command, given to the same `Monitor::exec`, at the one point where it is still in time: immediately before `startup`. The order on a plain launch is banner, `~/altairsim.ini`, `--set`, `startup`: the banner reports the machine as the file or the built-in made it, and the operator's ini file and then the command line change that, each on a line of its own, with the command line last so that it wins. It takes the text of a `SET` and nothing else, so there is no second grammar and no key that works in one place and not the other. Each one is echoed behind `set>`, as `startup>` and `ini>` echo theirs. One that fails stops the program with exit 2 before `startup` -- a wrong key must not boot the machine with the setting the operator meant to change. The machine file is not written.
+
+**`-s`, `-x`, `-i` and `--set` are refused with `--mcp`** (exit 2, issue #737). They belong to the monitor, and `--mcp` hands the machine to the server without reaching it: stdout is the JSON-RPC transport, so there is nowhere for a transcript to go. Until #737 they were accepted and dropped with exit status 0, which is the worse answer -- a `-x "SET ..."` that changes nothing looks like one that worked. A client sends the same commands through the `monitor` tool.
+
+**pascal100 has ONE built-in machine, `default` (decided 2026-11-14 by the pascal100 maintainer).**
+Every other machine is a complete TOML file in `examples/`, with every board written out and no
+`base`: a user reads one file and sees how the whole machine is built. `disk1`, `disk1a`,
+`pascal100` and `tarbell` were built in until then; they are now test fixtures (`machines/README.md`).
+This differs from altairsim, which ships several built-ins and builds examples on `base`. The
+rest of this section is the altairsim design, and it still holds for `default`.
+
+**A built-in machine is a TOML file that lives in `.rodata`.** `machines/*.toml` are build-time inputs — CMake embeds them byte-for-byte, exactly as it does the ROM images, and `loadTomlText()` parses them at runtime with the *same* parser that reads a config off disk.
+
+Two things follow, and both are requirements rather than conveniences:
+
+- **The shipped binary is self-contained.** altairsim is delivered as **one executable plus documentation**. It must never go looking for a `machines/` directory, an install prefix, or anything relative to `argv[0]` — a simulator that cannot find its own default machine when copied to a USB stick is a simulator that does not start. `tests/test_machines.cpp` passes with the source tree deleted.
+- **There is exactly one machine language.** Building the default machine in C++ (`m.add("memory", "mem0")`) would have been fewer lines and a quiet second dialect that nobody could copy, edit, or diff. Instead the machines we ship are written in the format users write, so they double as worked examples and *cannot drift from it* — if the config format changes under them, they stop loading and a test goes red.
+
+**File or built-in is decided by SPELLING, never by probing the filesystem.** If the answer depended on the working directory, `altairsim default` would mean one thing today and something else the day somebody saves a file called `default` next to it. A command line whose meaning changes with its surroundings is a trap, and it is the kind that gets sprung at 2am. `-f ./default` and `-m default` never guess.
+
+**The one filesystem probe is the EMPTY command line, and it does not weaken that.** With no machine argument at all, altairsim looks for `./altairsim.toml` and boots it, falling back to `default`. There is no spelling to honor in that case — nothing was named — so the invariant above is untouched: it governs how a name you *typed* is resolved, and `altairsim basic4k` means `basic4k` in every directory on earth. What the probe buys is a project directory that boots its own machine when you type nothing, which is worth one well-known filename. It is the only file the simulator *finds* rather than is *given*.
+
+The first two built-ins were honest about having **no CPU card**, because there was no 8080 yet.
+`SHOW MACHINES` lists what is compiled in now; the two that carry the argument are:
+
+| | |
+|---|---|
+| `default` | 56K RAM at `0000-DFFF`, **and the real DBL 4.1 boot PROM at `FF00`**. What you get with no arguments. |
+| `original` | 256 bytes of RAM and no ROM at all — the Altair as it actually left Albuquerque. |
+
+**`default` carries the boot PROM, and `original` carries the period accuracy.** A bare Altair 8800 had no ROM at all — you toggled the bootstrap in from the front panel, and the DBL PROM only existed if you had bought the disk system. Having `original` frees `default` to be a different thing: *the machine you actually want when you type `altairsim` and nothing else.* On a real disk Altair the PROM was there, and a default with an empty `FF00` is a machine you must repair before it is any use — which is the opposite of what a default is for. So `altairsim` followed by `D FF00` shows you the boot loader, as it should.
+
+### 10.0.1 The number base: on the wire → hex, never on the wire → decimal
+
+**Settled 2026-07-11 by Patrick.**
+
+> **The base is a property of the OPERAND, not of the command line.**
+
+| | |
+|---|---|
+| **HEX** — the machine sees it | addresses, ports, data bytes, register values, opcodes |
+| **DECIMAL** — only you see it | step counts, dump widths, history depth, sizes, baud rates, unit numbers |
+
+`DUMP 100` starts at `0100h`. `STEP 20` steps twenty times. `SET sio0 baud=9600` is nine thousand six hundred. The 8080 never holds a step count or a baud rate, so those are not hex; it holds an address on sixteen pins, so that is.
+
+**A single global base was never actually on the table.** `baud=9600` cannot mean 38400, so the rule was always going to bend somewhere — and given that, it bends where it *means* something instead of where it happened to fall. This is also why the alternative ("everything in a command is hex") was rejected: it buys one sentence of simplicity and pays for it with `STEP 20` stepping 32 times, silently, forever.
+
+**Overrides work everywhere, in both directions**, because a rule you cannot type your way out of is a trap: `0x20` / `$20` / `20h` force hex, `#32` forces decimal, `%1010` forces binary, `1_000` is spacing.
+
+**`0b` is binary only where it cannot be hex** (issue #730). `B` is a hex digit, so under a hex default `0B10` is the address `0B10` and `0B` is the opcode of `DCX B`, as every listing prints it. The parser used to take the marker first, whatever the default: `DE 0B10 AA` wrote to `0002` and said nothing, and `DE 100 0B` had no digits. The first is exactly the silent failure this section exists to prevent. So a hex default reads `0B…` as hex, `0b1010` keeps its meaning under a decimal or an octal default, where nothing else can claim it, and `%` is the binary marker that works everywhere, as `$` does for hex. The cost is accepted: `0b1` in a hex field is now `B1`, and a sense-switch value is written `%10001110`.
+
+**A `K`/`M` suffix is always behind a decimal number** (Patrick) — `10K` is 10,240, never 16K, which is why in fifty years nobody has had to ask. The suffix therefore carries its own base and overrides the caller's default. `0x10K` demands hex *and* a suffix that is decimal by definition; there is no right answer, so **it is rejected rather than guessed at**.
+
+**There is exactly one parser** — `parseNumber(text, out, err, base)` in `core/value.cpp` — and the caller passes the default base, because the caller is the only one who knows what kind of quantity it is. Properties carry theirs as `radix` (§10.4), which is the same rule reaching the same answer through the reflection layer. **No call site may pre-chew its input to get the base it wanted**; three of them used to (the CLI prepended `"0x"` to `at=`, the property layer prepended `"0x"` to any radix-16 value, and the region parser stripped its own `K`), and all three were quietly wrong in a different way.
+
+Pinned by `tests/test_numbers.cpp`. The failures this catches are all silent: every one of these tokens parses fine under the wrong base, so nothing crashes — you just size a card at 16K when you wrote 10K, and find out much later.
+
+### 10.0 There is no `BOOT` command. The config file runs commands instead.
+
+An earlier draft listed `BOOT <id>[:u]`. **It is removed, because it has no honest meaning.**
+
+The 8080 begins at `0000`; a boot PROM lives at `FF00`. Something must bridge that, and a simulator has only two ways to do it:
+
+1. **Synthesize a bootstrap internally** and jam it into memory (what SIMH's `BOOT` does). **Forbidden by §0.1** — it is fabricated hardware, and it means the machine boots in a way no real Altair ever booted.
+2. **Do what the operator does: start execution at the PROM.** `RUN FF00`.
+
+The real hardware does it with a **power-on jump**: a turnkey/PROM board that forces the processor to the PROM address after a reset. That is a genuine S-100 feature, and a board that has it models it as a **board property**. Two do: `turnkey` (the 88-TURNKEY's Auto-Start jams `JMP <start>` on the first three fetches) and `sbc` (the SBC-200's auto-start reads the PROM at the `start` page until the PROM reads port `7F`). Neither needed a new `Cycle`: each answers ordinary `MemRead`s and asserts PHANTOM\*. A machine with such a board needs only `RUN`. For a board that has no such circuit, or whose circuit is not modeled yet, `RUN <addr>` is the honest answer, and no simulator convenience stands in for it.
+
+So the monitor keeps only the honest verb — **`RUN <addr>`; `GO` was deleted 2026-07-12, because `RUN` is the switch on the panel and there was never a second thing for `GO` to be** — and to spare you typing it every session, **a machine config can carry a list of monitor commands to run once the backplane is built**:
+
+```toml
+[machine]
+name = "cpm-dev"
+
+startup = [                     # monitor commands, run in order after boards are created
+  "RUN FF00",                   # the DBL PROM. This is the operator's keystroke, not fake hardware.
+]
+
+# NOTHING ELSE IS A [machine] KEY, and the two that used to be are the argument for
+# why. `clock_hz` was here (the crystal is on the CPU CARD) and so was `sense` (the
+# switches are on the FRONT PANEL, which is also a card). Both are board properties
+# now, and both were REFUSALS, not silent migrations -- a config that looks like it
+# set something and did not is worse than one that will not load.
+[[board]]
+type     = "8080"
+id       = "cpu0"
+clock_hz = 2_000_000
+
+[[board]]
+type  = "fp"
+id    = "fp0"
+sense = 0x00                    # SA8..SA15, read at port 0xFF
+```
+
+Three things fall out of this, and they are the reason it is the right shape:
+
+- **The config language and the script language become one language.** A `startup` entry is an ordinary monitor command, so anything you can type, a config can do — and `altairsim -s script.cmd` and `CONFIG LOAD` stop being two different worlds.
+- **`BOOT`'s special-casing disappears.** No verb needs to know what a "boot device" is, and a new disk controller written next year needs no monitor change to be bootable.
+- **It is transparent.** `SHOW MACHINE` prints the startup commands; `CONFIG SAVE` round-trips them verbatim. Nothing happens that the user cannot see written down.
+
+**"Anything you can type" has to be literally true, or it is a slogan.** A `startup` entry is a command line, and a command line **quotes its filenames** — the monitor's tokenizer requires it, because every period artifact in the tree has a space in its name (`4K BASIC Ver 3-1.tap`). For a long time the array parser toggled on every `"` with no escape handling, so `MOUNT acr0:tape \"...\"` was silently cut at the backslash and the machine came up with an empty recorder. The one thing `startup` exists for could not be expressed. `\"` and `\\` are now understood on both sides — and **any other escape is refused rather than quietly eaten**, so a Windows path written with single separators fails here instead of somewhere else, later, as a shorter and wrong path.
+
+### 10.0.2 `base` — a config file may be a DELTA on another machine
+
+A CP/M machine is *the default Altair with a floppy in drive 0*. Before `base`, saying that took a five-card backplane restated by hand — and **hand-copying a backplane is a defect class, not a chore**: the two CP/M files that motivated this shipped with the 2SIO left out, booted CP/M into a terminal that was not there, and looked fine doing it.
+
+```toml
+[machine]
+name = "cpm22-8mb"
+base = "default"          # fp0, cpu0, sio0, dsk0 (88-DCDD), mem0 (56K + DBL PROM)
+
+startup = ["RUN FF00"]
+
+[[board]]                 # no `type` -> the card ALREADY in the machine with this id
+id = "dsk0"
+
+  [[board.drive]]
+  unit  = 0
+  mount = "disks/mits-88dcdd/cpm22/8mb/CPM22-8MB-56K.DSK"
+```
+
+**The base is named, never assumed** (Patrick, 2026-07-13). An implicit default was the other option and it is the wrong one: `original` is a machine **defined by what it does not have**, so it would have to *remove* a floppy controller, a 2SIO and nearly all of `default`'s RAM to describe a bare 1975 Altair, and **silence would stop meaning "nothing"**. A file with no `base` is a complete machine, exactly as before; one line at the top tells you what a delta starts from, and without that line the file *is* the backplane.
+
+The four `[[board]]` forms — **add** (`type` + a new id), **replace** (`type` + an id from the base), **modify in place** (no `type`), and **remove** (`remove = true`) — are documented in `docs/config.md`. Two of them are load-bearing:
+
+- **Replace exists because a list cannot be amended into a smaller one.** Regions are a *list*, so adding a 24K region to a base's 56K memory board would **overlap** it — two boards driving `0000–5FFF`, which is contention — not shrink it. Naming a card's `type` means *"this is the whole card now."*
+- **A duplicate id within one file is still an error**, and replace is scoped around that check on purpose. A second `[[board]]` with a copy-pasted id is a **typo**; the same thing against a base is **intent**. Conflating them would discard the one diagnostic that catches the commonest mistake in a hand-written machine file.
+
+**`CONFIG SAVE` never saves a `base`.** It writes the backplane it can see — every card, inherited or not — so a saved machine stands on its own. That is the only honest thing it can do, because a base may be a *file*, and a file can change under you.
+
+**This is what makes `default` a contract.** The machine `base = "default"` starts from is a front panel, an 8080, an 88-2SIO console, an **88-DCDD**, 56K, and the DBL PROM. Adding a card to it is no longer free — other files now depend on what is in it.
+
+> **Caution, and it must be in the docs:** `CONFIG LOAD` on a machine file now *executes commands*. Loading a `.toml` from an untrusted source runs whatever is in its `startup` list. Keep `startup` to monitor commands only, and say so out loud.
+
+### 10.1 `SET`/`SHOW` are generic
+
+Implemented once against `Board::properties()`; they know nothing about baud rates, phantom modes, or disk geometry. Adding a board adds its settings to the CLI for free. **Every property is settable** — see §5: you can only type at the prompt when the machine is already stopped, and a real card on an extender has its jumpers moved with the power on.
+
+### 10.2 Memory access: through the bus, or behind it?
+
+- **Default: through the bus.** `DUMP`, `DEPOSIT`, `IN`, `OUT` see exactly what the CPU sees — live bank, PHANTOM overlays applied, ROM not decoding writes, contention reported. Addresses are **bus addresses**, 0x0000–0xFFFF. This is the only view that tells the truth about a misbehaving decode, and it is why `IN 10` really does consume a UART's character: that is what an `IN` *is*.
+- **`peek`: through the decode, but *without a cycle*.** Same PHANTOM\* resolution, same bank, same board — but no strobe, no side effect, no `snoop()`. **`DISASM`, `WHO` and the debugger's display use this, and they must.** *(Corrected 2026-07-11: §10.2 originally put `DISASM` in the first group. That was wrong, and quietly so — a disassembler built on real reads works perfectly against RAM and then, the first time someone disassembles a page with a UART mapped into it, **eats the console's input**. The bug would only appear when the memory map was unlucky.)* A board that cannot answer without side effects returns false, and the byte reads `FF` — which is honest, because on real hardware the data bus is only defined *during* a cycle.
+- **`ROM`: behind the bus**, into whichever chip answers reads at that address. A **write-side** qualifier on `LOAD`, `DEPOSIT`, `FILL` and `MOVE`, and nothing else. Addresses are bus addresses like everywhere else.
+
+**EVERY ADDRESS IN THIS MONITOR IS A BUS ADDRESS, 0x0000–0xFFFF.** There is exactly one address space the operator can type, and it is the one the CPU sees. *(Patrick, 2026-07-17: board-local offsets are out as too confusing — every address refers to the 64K address space.)*
+
+**`ROM` is the PROM burner, and that is not a metaphor.** A ROM region does not decode a write cycle (§4.2), so `DEPOSIT FF00 41` cannot possibly reach it — nor should it, because on real hardware a bus write can't program a PROM either. You pull the chip and put it in a programmer, which is *not a bus operation*. `LOAD dbl.hex ROM` is exactly that, and it is why **the operator can write ROM while the guest cannot**, with no `writable` flag to leak and no originator tag on the bus.
+
+It finds the chip by asking who answers a **read** there, which is the whole trick: a ROM does not decode a write, so asking who would take a write is asking the wrong question on precisely the chip you are trying to program. `Bus::respondersTo()` runs the real decode, PHANTOM\* and all — so a shadowed board does not answer, and you cannot burn a chip the machine cannot currently see, any more than the CPU could read it. Nobody home and contention are reported, never guessed at: `Machine::burn()` is the one implementation, and the monitor and MCP are two front ends onto it.
+
+*(Superseded 2026-07-17. This was **`RAW <id>`**: it named a board, addressed that board's store by a **board-local offset**, and worked for reads as well as writes. All three are gone. **The board id** carried no information — through the bus you never name a board, the address picks it, so naming one was a second way to say a thing the address already said. **The offsets** were a second address space, and the same digits meaning two things depending on a qualifier is a trap laid for the operator. **The read side** existed only to reach a store the bus could not see — a bank that is not selected, or a phantomed-out board — and both of those are reachable by selecting the thing you want to look at — `OUT` a bankmem card's bank port, or `SET mem0 phantom=…` — exactly as the guest has to. What was left was the one thing a bus cycle genuinely cannot do, and that is this.)*
+
+The alternative — giving `BusCycle` an `origin = Cpu | Monitor | Dma` field so ROM could accept "monitor" writes — was rejected. A real backplane cycle carries no such tag; that is *why* a front-panel DEPOSIT is indistinguishable from a CPU write, and why a real ROM ignores both. Add the tag and every board built hereafter has to reason about it.
+
+**There is no `BANK=` qualifier, and there must not be one.** Bank *count*, bank *size*, and the bank-select *port* are all board-specific: Cromemco, CompuPro, and Alpha Micro memory boards bank in incompatible ways. A `BANK=<n>` argument in the monitor would hardcode one banking model into a CLI that is supposed to know nothing board-specific — the same error as a bus that invents interrupt vectors (§4.4).
+
+Instead, **banking is reached through the board**: **the live bank is a `properties()` value like any other**, reported, not set. `SHOW bram0` reports `banks` and `active` — `active` is **read-only**, because the guest sets it by writing the card's select port and nothing else may. There is no operator override, on any of the four cards: reading it back is the only thing the monitor gets to do, exactly as if you were peeking at a plane the guest itself cannot see any other way.
+
+*(This used to have a second answer: `RAW <id>` addressed the store linearly, so bank 3 simply **was** offset `0x30000` and `DUMP 30000-300FF RAW bram0` needed no new syntax. That answer went with `RAW`, above, and the argument does not miss it — the objection to `BANK=` was never that a workaround existed, it was that the monitor must not learn one card's banking model. Internally `bankmem` keeps each bank as its own segment and its per-card decoder decides which is live; a test reads a plane back through the bus (`peek`) or asks `activeMask()`. That is the card's business now, not a thing anybody types.)*
+
+**Planned, not built:** `DUMP`/`DISASM` were to annotate output when bytes came from a phantom overlay or from a bank that is not currently live, so a confusing read explains itself. Neither handler does. `SHOW BUS MAP` carries the only overlay annotation there is, which means the confusing read is still confusing at the point you actually meet it.
+
+### 10.3 Intel HEX
+
+Loader accepts record types **00** (data), **01** (EOF), **03**/**05** (start address — captured, optionally sets PC). **Validate every record's checksum and fail loudly with the record number** — a silently truncated load is a miserable bug to chase. Types 02/04 are accepted if they resolve within 64K, else error. `AT <addr>` biases the record addresses.
+
+Writer emits 00/01 with a configurable record length (default 16) and an **`05`** (start *linear* address) record if an entry point is given; the loader accepts `03` and `05` both. **Round-trip is a test case:** `SAVE x.hex 0-FFFF` then `LOAD x.hex` must reproduce memory byte-for-byte.
+
+Binary is a flat image: `LOAD` needs `AT <addr>`, `SAVE` needs an explicit range. Autodetection sniffs for a leading `:` and printable HEX records; `FORMAT=` forces it.
+
+The same engine backs the MCP tools (`mem_load`, `mem_save`, `mem_dump`, `disasm`) — one implementation, two front ends.
+
+### 10.3.1 Built-in ROMs
+
+**The common ROMs are compiled into the binary.** There is no portable place to keep ROM images across the four targets — `/usr/share`, `~/Library`, `%APPDATA%`, and "next to the executable" are four different answers, each of which becomes a support question and a platform special case in exactly the code §2.1 exists to keep clean. ROMs are small (a boot PROM is 256 bytes), so embedding them makes the problem vanish: a fresh checkout boots on any OS with nothing to download.
+
+Source images live in **`roms/`** in the repo. At build time CMake turns each into a byte array in a generated translation unit, and a registry maps `builtin:<name>` → `{span<const uint8_t>, crc32, description}`.
+
+```toml
+  [[board.region]]
+  type  = "rom"
+  at    = 0xFF00
+  mount = "builtin:dbl"      # compiled in
+# mount = "roms/mine.bin"    # a bare path is a host file, and it always wins
+```
+
+`builtin:` reuses the scheme idiom already established for `connect` (`socket:`, `serial:`, `in:`/`out:`), so it adds no grammar. Consequences worth stating:
+
+- **The board never knows the difference.** A region takes a `span<const uint8_t>`; whether it came from `.rodata` or from a file the host service read is not the board's business (§7). `builtin:` is resolved by the config loader, above the board.
+- **No filesystem access at runtime** for a built-in.
+- **`CONFIG SAVE` round-trips the name, not the bytes.**
+- **Built-ins are a convenience, never a lock-in** — a path overrides, so anyone with a different dump of the same part uses it without patching the simulator.
+
+**Every built-in ROM has a provenance row in `docs/roms.md`** — source, exact size, CRC32 — and a unit test verifies the CRC at build time. This is §0.1 applied to binaries: **a ROM image is a hardware fact**, and an embedded blob of unknown lineage is the worst kind of second-hand fact, because every piece of software above it would then be debugged against the wrong ground truth and it would look like a software bug for a very long time. Nothing is embedded without a source.
+
+### 10.3.2 Symbol files — `.PRN` and `.SYM`
+
+**A symbol table is NOT `LOAD`, and the wrong answer is silent.** `LOAD` is memory all the
+way down: every format it accepts becomes bytes in the 64K address space, and its sniffer is
+a two-way branch — a leading `:` is Intel HEX, everything else is a flat binary. So
+`LOAD prog.SYM AT 100` does not error; it deposits the symbol file's ASCII into RAM. A symbol
+table has no address space to land in — it is the debugger's *names* for one — so it is its
+own top-level verb, `SYMBOLS`, the way `CONFIG` is a separate verb precisely because what it
+loads is not memory. `core/symbols.h` mirrors `core/hex.h`: one implementation, and the
+`SYMBOLS` command, the `startup` re-load, and the MCP tool are its front ends.
+
+**Host-side, like a breakpoint.** The table belongs to no card — it is a view *of* the address
+space, not a property *in* it — so it lives on `Machine`, not a board, and the "no
+machine-level board state" rule (`machine.h`) does not reach it. It survives `RESET`, `POWER`
+and `CONFIG LOAD` exactly as breakpoints do, and `SYMBOLS CLEAR` is its `NOBREAK`. A machine
+file may name a symbol file in `startup`; `CONFIG SAVE` round-trips the **filename, not the
+parsed table**, the same bargain `builtin:` makes for a ROM (§10.3.1).
+
+**Reference first, display later.** A loaded symbol resolves anywhere a *true address* is
+typed (`BREAK`, `DUMP`, `EXAMINE`, a `BREAK … IF` operand) — not where a port or a byte is,
+which is why the resolution is gated per call-site and not folded into the one overloaded
+address parser. A symbol wins over a bare hex literal, with the same leading-zero escape that
+tells the register `A` from the number `0A`. **Annotating disassembly (`JMP 0100` → `JMP START`,
+`CALL 0005` → `CALL BDOS`) is built** — and it needs no operand-kind split across the opcode
+tables, because an `Insn` melts its operand into text and that text is enough: a run of exactly
+four uppercase hex digits is, in both the 8080 and Z80 emitters, only ever a 16-bit operand or a
+relative-jump target (a byte immediate is two digits, an index displacement carries a sign). So
+`Monitor::annotateOperands` names any four-hex token that *resolves* to a symbol and leaves the
+rest alone — which does mean a 16-bit constant (`LXI B,%W`) reads as a symbol when its value
+happens to match one, the accepted price of not modelling operand kind. Two maps, two rules: a
+leading `NAME:` line comes from the label-only reverse map (`byAddr`), so an `EQU` never heads a
+line; an operand is named by `operandName`, which prefers a label but falls back to any symbol
+with the value, so an `EQU` that is really an address (`BDOS`) still names its target.
+
+**Two formats, and absolute addresses only.** A **`.PRN`/`.LST`** is an assembler listing (CP/M
+`ASM`, Microsoft `M80`, DR `MAC` — one column geometry: address in columns 2–5, `=` in column
+7 marks an `EQU`, source at column 17). Because it marks an `EQU`, it tells a constant from a
+program label, and **only labels feed the reverse map** — otherwise a `BDOS EQU 5` makes
+address `0005` render as `BDOS`. A **`.SYM`** is the flat `HHHH NAME` symbol file DR `MAC`/`RMAC`
+write and `SID` reads; it has no label/constant distinction, so it feeds name→value only.
+(Microsoft **`L80` writes no `.SYM`** — it prints its map to the console. The `.SYM` is an
+assembler product, not the linker's.) A relocatable `M80` listing marks its addresses with a
+trailing apostrophe and is **refused, by the line** — a module-relative address referenced as
+if absolute is a silent wrong answer. A `.SYM` is post-link and absolute already.
+
+### 10.4 Line editing and history
+
+The monitor is a REPL you will spend hours in, so it gets a line editor.
+
+**What is built** (`src/cli/lineedit.cpp`, 167 lines over `platform/terminal.h`):
+
+- **History** with Up/Down, **in memory for the session**.
+- **Editing**: Left/Right, Ctrl-A/Ctrl-E, Ctrl-W, Ctrl-U, Delete (`ESC[3~`), and Ctrl-D as EOF
+  on an empty line.
+
+**What is NOT built, and was planned here:** history persisted to `~/.altairsim_history`,
+Ctrl-R search, word motion, Ctrl-K, Home/End — and **tab completion**. The completion design
+was the interesting part and it is worth keeping on the page, because it is *free* if it is ever
+written: driven by the same `Board::properties()` reflection, it would complete command names,
+then board `id`s, then that board's property names, then that property's legal enum values —
+`SET sio2a BA<Tab>` → `BAUD=`, and `BAUD=<Tab>` offering the valid rates, with **no completion
+tables to maintain** and a board added later completable the day it lands. **But there is no Tab
+handling in the editor today**, so §5 must not be read as claiming completion among the things
+reflection already buys. It buys `SET`, `SHOW`, the TOML loader, `CONFIG SAVE` and the MCP
+schemas; not this.
+
+**Implementation: hand-rolled, not `replxx`.** This section used to specify vendoring replxx as a
+deliberate exception to "no third-party deps in the core," on the grounds that a cross-platform
+line editor is weeks of work. **The exception was never taken** — the subset above turned out to
+be small, and it sits behind `platform/terminal.h` like every other OS difference (§2.1), so
+Win32 costs no `#ifdef` here. The cost of that choice is exactly the missing features listed
+above; the benefit is that `altairsim` still has no third-party dependency at all (§2).
+
+**Terminal-mode handoff.** The line editor and the emulated console both want raw mode and must trade it cleanly: `CONSOLE` hands the terminal to the guest, the `ATTN` key hands it back. **The terminal must be restored on every exit path, including a crash or a signal** — a simulator that leaves your shell in raw mode after a segfault is its own kind of bug. Windows console mode flags need the same care.
+
+---
+
+## 11. MCP server
+
+`altairsim --mcp` — **stdio only**. (A `--mcp-port N` TCP form, to attach to a long-lived
+machine, was specified here and is **not built**; there is no such flag.) Tools mirror the
+monitor but are **structured** — every result is JSON, no screen-scraping.
+
+The high-value tools are borrowed from the Python prototype's agent API, which is the right
+shape. **The list below is the DESIGN, and nearly all of it is built.** The tools that
+exist today are `run`, `start`, `stop`, `status`, `send`, `recv`, `regs`, `monitor`, `reset`, `roms`, `mem_dump`,
+`mem_deposit`, `mem_load`, `mem_save`, `mem_search`, `mem_fill`, `disasm`, `step`, `breakpoints`,
+`snapshot`, `restore`, `bus_trace`, `mount`, `connect`, `board_types`, `board_list`, `board_get`,
+`board_add`, `board_set`, `who`, `bus_map`, `bus_io`, `bus_contention` and `bus_irq`. The two
+still unbuilt are marked:
+
+- `run(max_steps, idle_threshold) -> {reason: halt|breakpoint|idle|max_steps, steps, t_states}`
+- `send(text)` — queue keystrokes to the console unit
+- `recv()` — take what the guest has printed since last time. **This is what shipped instead of
+  `expect`:** the pattern-matching and the retry policy belong to the caller, who is a language
+  model and is better at both than a fixed matcher would be.
+- *(not built, and won't be)* `expect(pattern, max_steps, idle_threshold)` — run until the
+  pattern appears. Superseded on both ends: `recv` above puts the matching where it belongs, and
+  `run`'s `until` argument already stops the instant a substring appears, which is the useful 90%
+  of `expect` without a fixed matcher baked in.
+- *(not built)* `screen() -> {rows, cols, grid}` — a VT100/ANSI screen emulator, so a test could
+  assert on a **screen grid** rather than a byte stream. The one genuinely missing capability
+  here: full-screen guest apps are still asserted against a byte stream. The engine now exists
+  (`src/host/terminal/`, issue #244); the remaining work is feeding the MCP session's console
+  stream through it.
+- `regs`, `monitor` (run one monitor command and get its text back — the escape hatch, and the
+  way to reach the corners the typed tools don't cover: a conditional `BREAK ... IF`, an octal
+  listing, the trailing `key=value` options on `MOUNT`)
+- `step`, `breakpoints`, `snapshot`, `restore`, `bus_trace` — the debugger, structured. `step`
+  advances N instructions and returns the register file; `breakpoints` lists/adds/removes the
+  same CPU-agnostic breakpoints the monitor sets; `bus_trace` returns the always-on flight
+  recorder's last N cycles; `snapshot`/`restore` drive `Machine::snapshot()`/`restore()`.
+- `mem_dump`, `mem_deposit`, `mem_load`, `mem_save`, `mem_search`, `mem_fill`, `disasm` — the
+  same `rom` qualifier as the monitor, the same engine. `disasm` is the stateless disassembler
+  over a non-invasive peek, so it runs with no CPU and reads a ROM.
+- `mount`, `connect` — a host file into a board's unit, a serial unit onto an endpoint; typed
+  `id`/`unit` rather than the monitor's `id:unit` string.
+- `reset(kind: bus|cpu|power)`, `roms`
+- `board_list`, `board_types`, `board_get(id)`, `board_add`, `board_set(id, key, value)` — **schemas generated from `Board::properties()`**
+- `bus_map()`, `bus_io()`, `bus_contention()`, `who(addr)`, `bus_irq()` — structured, not the
+  ASCII table. `bus_irq()` is the interrupt bus: pin 73 and who pulls it, the eight VI wires, and
+  which level an 88-VI would acknowledge.
+
+**Free run (`start`/`stop`, issue #602) — still one thread on the `Machine`.** A `run` is bounded,
+so between calls the guest stands still. `start` leaves it running: runMcp's worker thread — the one
+that serves every request — runs a 2,000-instruction slice whenever no request is waiting, and
+serves a request between two slices, with the guest paused. No second thread ever steps the
+`Machine`, which is the line #489 was declined on, and no tool needs a lock it did not have. The
+wait between slices is the pacing gap (`clock_hz`) or, flat out, the monitor RUN's idle nap, and it
+is a wait on the request queue, never a sleep — a request is served at once. `run` and `step` are
+refused while it runs; a free run ends on `stop`, the StopReasons `run` stops on, or a `^C`, never
+on idle or a timeout.
+
+**MCP is a first-class interface, not a wrapper.** The monitor and MCP both sit on one `Machine` API and one `properties()` reflection layer, so they cannot drift. Any board added later is fully drivable from both without touching either.
+
+---
+
+## 12. Host file transfer
+
+Two complementary mechanisms, serving different needs.
+
+> **We do not implement AltairZ80's port-0xFE "SIMH pseudo device", and *AltairZ80's* `R.COM`/`W.COM` will not run here.** That device is not real Altair hardware — it is another simulator's invention, and its only purpose is compatibility with that simulator's own guest utilities. Reimplementing it would mean deriving from AltairZ80's source, which this project does not do (§0.1). Instead we design our own host bridge as if it were a real S-100 card — which is, after all, what this project is *for*.
+>
+> **Our own `R.COM` and `W.COM` do exist, and they are ours** (§12.1). We reuse the *names*, because the muscle memory is worth keeping and there is no reason to make people learn a second pair. Nothing else is shared: theirs talk to a pseudo-device at 0xFE and were written in SPL; ours talk to a card of our own at 0xB0 and are 8080 assembler. Neither will run in the other simulator, and that is the honest outcome — not an accident, and not a compatibility goal we quietly dropped.
+
+### 12.1 The Host Bridge board (guest-initiated) — **BUILT**
+
+A board of our own design (`docs/boards/hostbridge.md`), documented to the same standard as any period card. It is an ordinary `Board` — it decodes two I/O ports, has `properties()`, and honors both resets. No bus special cases. (It does **not** serialize: `Board::serialize()` is designed and unbuilt, and no card implements it — see §4.)
+
+It is also **the project's first genuinely new piece of hardware**, which makes it a real test of the board API rather than a rehash of a known card. The API held: it needed nothing.
+
+**Sandboxing is a hard requirement**, not a nicety: guest-supplied filenames resolve against a configured `hostdir` root and **cannot escape it** — no `..` component, no absolute path, no drive letter, and no symlink that resolves out. A guest program must never be able to write anywhere on the host disk. The card itself touches no file handle (§7): all of it lives in `src/host/hostdir.{h,cpp}`, where it is tested against a **real** filesystem with **real** symlinks, because a symlink escape cannot be tested against a fake one.
+
+The card sits at **0xB0**, and that number took a census. `0x30` was the obvious pick and it is wrong — the WD179X floppy controller defaults there and the Cromemco 64FDC sits on top of it, which is exactly the mistake AltairZ80 made with 0xFE. `B0–BF` and `D0–DF` are the only empty 16-port holes left in either catalog.
+
+Guest-side utilities (`R.COM`, `W.COM`, `HDIR.COM`) are ours, written in 8080 assembly and assembled **inside the machine** with the period toolchain — `ASM.COM` and `LOAD.COM`, off the CP/M disk. No cross-assembler, no host tooling: `cpm/hostbridge/*.ASM` reaches the disk by `PIP R.ASM=CON:` and is built from there, which is what the acceptance test does on every run.
+
+**Every disk operation in them is a BDOS call** — no BIOS entries, no `IN`/`OUT` to a controller, no assumption about a DPB, a sector size or a skew table. That is what makes one `R.COM` work on an 8″ 88-DCDD, an 8 MB image, an 88-MDS minidisk, and any BIOS anybody writes later. It is proved, not asserted: the acceptance test builds the utilities on an 8 MB 88-DCDD image and then `LOAD`s the same hex on a minidisk behind a **different controller**, and round-trips the same 256 bytes.
+
+### 12.2 Host-side filesystem access to an image — **deferred, and here is the hard part**
+
+The intent is real: read and write files in a mounted image **with the guest not running at all** — no boot, no console driving. For Claude that is far more efficient than typing at a CP/M prompt, and it is the right way to stage a test fixture or pull out a build artifact.
+
+**But `DISK LS` cannot be a generic monitor command, and an earlier draft of this design had it as one. That was wrong.** Reading a file out of an image requires *two* independent facts, and the simulator holds neither in a place a generic command can reach:
+
+1. **The sector layout** — which is a property of the **controller**. The 88-DCDD is **hard-sector**: its images contain the entire 137-byte slot, headers and checksum included, so the payload lives at offset 7 of each slot (3 on a system track). Tarbell and Disk 1A are **soft-sector**: their images hold the payload *only*, because the headers lived in the inter-sector gaps and never reached the file. (North Star's diskettes are hard-sector, but its `.NSI` images are also payload only: the sector has no header, and the sync and check characters are not in the file.) A reader that does not know which kind it is holding reads garbage.
+2. **The CP/M filesystem parameters** — the DPB, the reserved-track offset, and the BIOS *software* skew. These belong to the **image's CP/M**, not to the controller, and two images on the same controller can legitimately differ.
+
+So a naive `DISK LS` needs a wrapper per controller **×** per image format. Its apparent genericity would be a lie, and the failure mode is the worst kind: it produces a plausible-looking directory listing off a misparsed image.
+
+**Therefore: no `DISK` verbs in the monitor and no `disk_*` tools over MCP, for now.** The capability is deferred, not cancelled; §7.3's `DiskImage` gives it a foundation (the *controller* declares the layout, so half the problem is already solved in the right place), and the remaining half — a named CP/M filesystem descriptor supplying DPB and skew — is a later design task. `cpmtools`' `diskdefs` is the precedent, and it exists precisely because this cannot be inferred.
+
+Until then, **§12.1's Host Bridge is the supported path**, and host-side image surgery is what `cpmtools` is for.
+
+---
+
+## 13. Snapshots and deterministic replay
+
+> **HALF BUILT.** `SNAPSHOT` and `RESTORE` are done — `Board::serialize()`/`deserialize()`
+> exist on every board, the CPU core and the `Clock`; `StateWriter`/`StateReader`
+> (`src/core/statefile.h`) are the byte-exact, little-endian, CRC-checked primitive; and
+> `Machine::snapshot()`/`restore()` write and read a file the two monitor commands drive. A
+> snapshot is machine **state**, restored into a machine built from a config; RESTORE imports
+> what it can and names the rest (§13.2). **`RECORD`/`REPLAY` and `ReplayStream` are
+> NOT built** — the deterministic-replay half below still resolves at the prompt and says so
+> (§10.1). It builds directly on the snapshot foundation and is the next phase.
+
+- **Snapshot** = versioned, explicitly-serialized CPU + `Clock` time + every board's `serialize()`. Byte-identical across platforms. **Done.**
+- **Replay** = snapshot + an event log (keystrokes, socket input, SDL keystrokes, DMA completions) stamped with **T-state timestamps**, so a session replays exactly. **Not built.**
+
+This is the bug-reproduction and regression-test foundation, and it is why **every source of nondeterminism (host time, socket arrival, RNG, window events) must funnel through one clocked event queue.**
+
+### 13.1 What travels, what is rebuilt (the serialize contract)
+
+The line every `Board::serialize()` draws, and why the snapshot is small and portable:
+
+- **Serialize (runtime state):** the CPU register file *and its hidden micro-state* (the
+  EI-after-next latch, the mid-INTA fetch, and on a Z80 WZ/MEMPTR, IFF2, the interrupt mode);
+  every board's registers, latches, RAM, in-flight buffers and `enabled_`; absolute-T-state
+  deadlines as plain integers; the `Clock`'s `t_` and handle counter.
+- **Rebuilt, never serialized:** the bus decode cache and the interrupt/hold wire-OR counts
+  (re-derived from each board's latched pins after restore); the `Clock` event queue, whose
+  entries are `std::function` closures that cannot travel — so **each board re-arms its own
+  deadlines** in `deserialize()` from the state it just read, into a queue `Clock::deserialize`
+  has emptied. A `Clock::Handle` is never written.
+- **Skipped:** TOML straps/config (already correct in a matching machine); host resources — a
+  `ByteStream`/socket, a `DiskImage`, the `Display`, a `HostDir` — re-opened from their
+  unchanged config. **In-flight bytes that are not yet on the host DO travel**: an uncommitted
+  disk-write buffer, a half-typed hostbridge transfer, a tape head position. Host-side operator
+  views (`syms`, breakpoints) and diagnostics are not machine state and stay put.
+
+There are **no free-floating counters** to serialize — rotation, TDRE/TBMT, the RTC and the
+minidisk motor are all absolute deadlines or pure functions of `Clock::now()`, which is exactly
+what lets a deadline survive as one integer once `t_` travels with it.
+
+### 13.2 An older snapshot, or another machine: import what fits
+
+A snapshot outlives the release that wrote it, so RESTORE reads every format from 1 to
+`kFormatVersion` and imports **board by board** — each board's state is its own length-prefixed
+section, so one board that cannot be read costs only that board. Boards are matched by id
+(case-insensitive) and type, not by position, because a built-in machine gains and loses boards
+between releases. A board is **not** restored when it is on only one side, its type differs, its
+type's row in `stateSince()` (`machine.cpp`) is newer than the file, or it does not read its
+section to the exact byte. Each one gets a note, which the monitor and MCP print, and starts at
+power-on (`power()` + `reset(PowerOn)`): it cannot keep its old state, because restoring the
+clock emptied the event queue its deadlines were in.
+
+The exact-length check catches a layout that grew or shrank, even one that never bumped the
+version (several did while format 2 was current). It cannot catch a field that kept its size
+and changed its **meaning** — the SS-1 8253 phase in format 4 — which is why the table exists.
+**A change to a board's state bumps `kFormatVersion` and adds or raises that board's row.**
+
+Still refused whole, with the machine untouched: a bad checksum or magic, a truncated file, a
+format **newer** than this build (its layouts are unknown), and a file that shares no board with
+the machine.
+
+---
+
+## 14. Every board ships with a `.md` — a gate, not a nicety
+
+**No board is merged without `docs/boards/<board>.md`.** The board and its documentation are one deliverable. Template: `docs/boards/_TEMPLATE.md`.
+
+The **Limitations** and **Quirks** sections are load-bearing. They are what you will want in two years when something doesn't boot, and what makes it possible for someone else — or Claude — to work on a board without rediscovering everything. Writing them *forces* the honest question "what did I not actually implement?", which is exactly the question a simulator author most wants to avoid.
+
+---
+
+## 15. Testing
+
+- **CPU:** 8080EXM / CPUTEST / TST8080 / 8080PRE for the 8080; 8085EXM / TST8080 / 8080PRE for the 8085 (its own real-silicon CRCs, since ANA's AC diverges); ZEXALL / ZEXDOC for Z80. A hard CI gate.
+- **Bus:** unit tests for PHANTOM overlay, bank switching, contention detection, VI priority, DMA cycle stealing, floating-bus RST 7.
+- **Boards:** golden-image tests — boot CP/M 2.2 from `CPM22-8MB-56K-SIM.DSK`, run `M80`/`L80`, compare output.
+- **End-to-end:** headless acceptance scripts in CI on all three platforms (Linux, a universal macOS binary, Windows). Note these drive the monitor via `-s`/`-x` and `expect(1)`, not an MCP `expect` tool — there is no such tool (§11).
+- **Lint:** the no-`#ifdef` check (§2.1).
+
+---
+
+## 16. Lessons from the prior work — read before writing code
+
+See `docs/porting-notes.md` for the full list. The ones that will bite:
+
+1. **Idle detection** is what makes automation work (§8). Steal it.
+2. **The BIOS track-buffer flush requires CONIN.** The 8 MB Altair CP/M BIOS does *not* write to the DCDD when a file is closed — BIOS WRITE only fills an in-memory `trkBuf` and marks it dirty. The real port-0x0A write happens in `invFlush`, **called from the BIOS CONIN entry**. Consequence: *never* flush the disk right after a CP/M file op — the directory update from BDOS Close sits in `trkBuf` until the next BDOS function 1. Run back to the `A0>` prompt first.
+3. **The RLC/RRC sentinel bug.** In the Python core, a carry-bit local named `cy` shadowed the cycle-count variable `cy`, so `step()` returned 0, which the run loop read as "breakpoint hit" — silently killing M80/L80 after ~2.8M steps. **This is why `step()` returns an explicit `StepResult`, never a sentinel.**
+4. **BDOS clobbers every register** (A,B,C,D,E,H,L; only SP preserved). Always call BDOS at 0005H, never BIOS directly.
+5. **Delay physical drive select until READ/WRITE** — don't seek on select alone.
+6. **The DCDD's dirty-buffer write-back ordering** (`out08` select, `in09` sector read, `out09` step all flush first, in that specific order relative to invalidating sector/byte position). Getting it wrong silently corrupts disks.
+7. **M80 symbols are only 6 characters significant** — the #1 guest-toolchain gotcha.
+
+---
+
+## 17. Open hardware questions
+
+Per §0.1, a fact we do not have is **blocked on a manual, not on code**. **Ask Patrick and he will
+source it** — do not reconstruct it, guess it, or read another simulator. Two questions are open;
+every other card named here over the project's life was answered from a period manual in
+`reference/`, and `docs/sources.md` records which document settled what.
+
+| Board | What's missing |
+|---|---|
+| **PMMI MM-103** | The **E1–E7 pad → VI0–VI7 correspondence**; the manual says only to consult your CPU/VI card manual. Everything else about the card is recovered and built, and this is precisely why its interrupt enable and mask staging are shadowed but inert (`docs/boards/pmmi-mm103.md`). |
+
+**Two questions that were on this list were answered by an artifact, not a document**, and both are
+worth remembering. The 88-ACR's manual said nothing about motor control because **there is none** —
+no transport register, nothing the guest can write that reaches the recorder, an operator who pressed
+the buttons with a finger; the row had guessed wrong about *what* was unknown. The 88-VI/RTC's manual
+**contradicted itself**, and the tie was broken by disassembling the only real client we have, the PS2
+monitor's own service routine, which proved bits 0–2 are the *ones-complement* of the level and that
+bit 3 gates the compare. **When the document and the artifact disagree, disassemble the artifact.**
+
+> **🔴 THIS SECTION USED TO NAME `mits_dsk.c` AS AUTHORITATIVE FOR THE 88-DCDD, AND IT WAS FLATLY WRONG.**
+> `mits_dsk.c` is **SIMH**, and §0.1 — the first rule in this document — says we do not learn hardware
+> from another emulator's source. The line sat here contradicting the rule it shares a document with,
+> and it cost real time: the DCDD's rotation was modeled on SIMH's advance-on-read counter, which makes
+> the platter spin at the speed of whatever loop is polling it. **Both the "inconsistency to settle"
+> and its recommended arbiter are struck.** The `I`/`Z` status bits were settled from the 88-DCDD
+> manual and the in-tree `BOOT.ASM`/`BIOS.ASM`, and `docs/boards/mits-dcdd.md` records which source won
+> and why.

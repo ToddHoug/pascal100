@@ -1,0 +1,193 @@
+# THE PACKAGE -- what we hand people, and the ONLY thing the User Manual may name.
+#
+# A user gets a zip: the `altairsim` binary, `pascal100-manual.pdf`, `DRIVING-WITH-AI.md`, and
+# the examples/ tree -- each example a self-contained folder holding a machine file and the
+# media it mounts. The DIR table below is the list of them, and this sentence deliberately
+# does not repeat it: naming them twice in one file is how the previous wording ("some disks
+# and tapes") outlived the layout it described.
+#
+# They do NOT get this repository -- no src/, no CMakeLists, no tests, no DESIGN.md, no
+# docs/boards/. So the manual may not reference any of it, and every path it prints must be
+# a path that exists INSIDE THE ZIP.
+#
+# TWO documents ship, not one. The manual (a PDF) is for the human. DRIVING-WITH-AI.md is for
+# an AI assistant driving the machine over MCP -- it is dropped, verbatim, into a working
+# directory so a user can start an assistant there and say "Using altairsim, do ...". It is a
+# FILE below (token-expanded on the way in, exactly like the manual), NOT a chapter of the manual.
+#
+# This file is how that is enforced rather than merely intended. It is the single source
+# of truth for three things that would otherwise drift apart:
+#
+#   1. TOKENS. The manual's Markdown writes {{MACHINE_CPM}}, never a literal path. The doc
+#      build substitutes from here and FAILS on any token it cannot resolve, so a path
+#      cannot reach the PDF unexpanded and a path cannot be invented in prose.
+#   2. CONTENTS. tools/build-package.sh assembles the zip from the DIRS and FILES below.
+#   3. THE TESTS, and read what they actually do rather than what you would like them to.
+#      tests/acceptance/docs-manual.cmake greps the chapters for anything pointing outside
+#      the package (src/, ctest, a bare header) and checks every chapter is in ORDER.
+#      tests/acceptance/docs-package.cmake reads THIS file and docs/manual/package.md and
+#      fails unless they name the same set -- every FILE/DIR here appears in the manual, and
+#      nothing in the manual's manifest is missing here. tests/acceptance/examples.cmake
+#      copies the examples to a scratch directory with no repository in sight and boots them.
+#
+#      WHAT NOTHING DOES is assemble this package and run the manual's own commands against
+#      it. docs-package.cmake compares the two manifests as TEXT -- the cheap half -- but
+#      tools/build-package.sh is run by no workflow and no test, only by hand, so nobody types
+#      the manual's commands at the actual zip. A chapter can still tell you to type something
+#      that does not work in the package and the suite stays green, which is not a
+#      hypothetical: the manual promised "CP/M in one command" while the published archive
+#      carried no media at all. (An earlier version of this comment claimed a manual.cmake
+#      that never existed, and a claimed test is worse than a missing one -- it is the missing
+#      test plus the belief that you have it.)
+#
+# THE PACKAGE LAYOUT MIRRORS THE REPOSITORY'S examples/ TREE, and that is the point of that
+# tree (2026-07-19): the shipped set has ONE home, the tests boot it there, and assembling
+# the package is a copy rather than a rearrangement. A path that works in a clone works in
+# the zip, which is the only way the manual can be true in both.
+#
+# ---------------------------------------------------------------------------
+# DIRS -- <package path>  <=  <path in this repo>
+#
+# Each example ships as a DIRECTORY, because a machine file names the disk lying beside
+# it ("cpm22k-64k.dsk", no directory at all) and paths inside a machine file resolve
+# against THAT FILE. Keep the .toml and its image together and the folder boots wherever
+# it is copied to -- which is the whole point of the rule.
+#
+# AND NOT EVERY EXAMPLE'S MEDIA IS AN IMAGE. examples/debugger's is a 46-byte program: a
+# .HEX to LOAD and the .PRN listing that SYMBOLS LOAD reads, which is the first line of its
+# own walkthrough. So build-package.sh strips a .ASM/.PRN pair only from an example that
+# ships a disk or a tape -- there it is how the image was made, and it stays in the tree.
+# Where there is no image, the listing IS the product and it ships.
+# ---------------------------------------------------------------------------
+
+DIR  examples/cpm22      <=  examples/cpm22
+DIR  examples/cpm86      <=  examples/cpm86
+DIR  examples/cpm8-16    <=  examples/cpm8-16
+DIR  examples/mpm8-16    <=  examples/mpm8-16
+DIR  examples/pascal     <=  examples/pascal
+DIR  examples/debugger   <=  examples/debugger
+DIR  examples/ai-mcp     <=  examples/ai-mcp
+
+# NOT AN EXAMPLE, and the one DIR here not under examples/. hostbridge/ is the SOURCE of the
+# file-transfer utilities the file-transfer chapter sends across the host bridge -- R/W/HDIR as
+# 8080 source, the assembled .HEX, and the .COM. It ships because a package holder moving files
+# in and out should not have to clone the repository to get them (issue #380): the disk in
+# examples/cpm22 already carries the .COM, but the loose source and .HEX -- what you paste into a
+# fresh disk to bootstrap the utilities onto it -- lived only in the repo. A DIR, not FILEs: the
+# FILE loop runs token-substitution sed over each file and would corrupt a binary .COM; the DIR
+# copy is a plain cp -R. build-package.sh strips README.md from it, and keeps the .ASM/.PRN
+# because this DIR ships no disk or tape image (that strip is conditional on one).
+#
+# IT SHIPS AT THE ROOT, not under cpm/. A new user opening the archive reads `cpm/` as "CP/M
+# lives here" and goes looking for the operating system; the utilities are their own thing, so
+# they get their own top-level folder. The repo path is unchanged -- cpm/hostbridge/ in the
+# tree, hostbridge/ in the zip.
+DIR  hostbridge          <=  cpm/hostbridge
+# ALSO NOT AN EXAMPLE: the tools a package holder runs. tools/user/ is the ONE part of the
+# repository's tools/ that ships -- everything else there builds the documents, the package and
+# the media, and is no use to someone holding a release. Keeping the shipped tools in their own
+# subfolder is what lets this be a plain DIR line and not a list of FILEs to keep in step.
+#
+# THE PACKAGE PATH IS tools/, not tools/user/: in the zip there are no build tools to tell them
+# apart from, so the extra level would only be a puzzle. The clone path and the package path
+# differ, as they do for hostbridge/ above. build-package.sh strips the README.md and ships its
+# rendered README.pdf, as it does for an example.
+#
+# TODAY IT HOLDS the two mirror-watch scripts (issue #664): a viewer for `--mirror socket:PORT`
+# that waits for the mirror and connects again after the simulator restarts. Windows installs
+# neither telnet nor nc, so without mirror-watch.ps1 a Windows user has no viewer at all.
+# And the three LBR tools, lbr-extract.py, uncrunch.py and unsqueeze.py: they open the CP/M
+# libraries and the crunched and squeezed files that period software is found in. Python 3, so one file serves all three
+# platforms.
+DIR  tools               <=  tools/user
+
+# ALSO NOT AN EXAMPLE. skills/pascal100/ is DRIVING-WITH-AI.md's front door for an assistant
+# that reads Agent Skills: a short SKILL.md whose frontmatter `description` is what makes a
+# client load the briefing WITHOUT the user remembering to say "read DRIVING-WITH-AI.md".
+# Copy the folder to your client's skills directory and asking for a machine is enough.
+#
+# THE SOURCE IS .claude/skills/, WHICH IS WHERE CLAUDE CODE LOOKS. A clone gets a working
+# skill with no setup, which is the case that matters most -- the repository is where a guest
+# actually gets driven. A root-level skills/ would have been the PLUGIN layout, scanned only
+# for a repo installed as a plugin, so a plain clone would have seen nothing. The package path
+# stays `skills/` regardless: a zip has no .claude/ and its reader copies the folder wherever
+# their own client keeps skills.
+#
+# THE BRIEFING IS NOT DUPLICATED IN THE TREE. The skill directory holds SKILL.md and nothing
+# else; build-package.sh copies docs/DRIVING-WITH-AI.md into skills/pascal100/references/ on
+# the way into the zip, so there is ONE master and the shipped skill is still self-contained --
+# it keeps working when a user drags it into their own skills directory, which a relative path
+# back up to the package root would not. In a CLONE that references/ file does not exist, and
+# SKILL.md's closing line names docs/DRIVING-WITH-AI.md for a reader standing in the tree.
+#
+# PROSE, NOT A SYMLINK, and that was a near miss. A committed symlink would checkout on
+# Windows as a text file containing the path (git core.symlinks is off in many installs), and
+# on Unix the DIR copy below preserves the link, so the expand() that follows would write
+# THROUGH it back into docs/DRIVING-WITH-AI.md -- source and destination the same file, cp
+# refuses, and the release build dies under set -eu. One sentence in SKILL.md costs nothing.
+#
+# A DIR, not a FILE, and deliberately: a FILE line's package path is the literal string
+# tests/acceptance/docs-package.cmake makes the manual contain, and the reader's manifest
+# should say `skills/`, not `skills/pascal100/references/driving-with-ai.md`.
+#
+# EACH SHIPPED SKILL, NAMED, NOT THE WHOLE FOLDER. .claude/skills/ also holds the release skills
+# (release-worker, release-coordinator, release-verify) and the developer skills (add-a-board,
+# check-doc-samples, pdf-to-reference), which are for whoever BUILDS or CHANGES this package and mean
+# nothing to someone holding it. The map has no exclude, so a DIR of the whole
+# folder would ship every skill added there. Name each shipped skill on its own line instead.
+DIR  skills/pascal100    <=  .claude/skills/pascal100
+
+# THE GUEST-PROGRAM SKILLS (#630). skills/pascal100 is about the simulator; the rules of a
+# program that runs IN the guest each get a skill of their own, so a client loads only the one
+# the task needs and the pascal100 skill does not grow a section per program. Each is a single
+# SKILL.md with no references/ -- build-package.sh adds the briefing copy to skills/pascal100
+# only. A new guest skill is one more DIR line here and one more row in the two lists that
+# name them (.claude/skills/pascal100/SKILL.md and docs/DRIVING-WITH-AI.md).
+DIR  skills/pascal100-cpm-build   <=  .claude/skills/pascal100-cpm-build
+DIR  skills/pascal100-cpm-text    <=  .claude/skills/pascal100-cpm-text
+DIR  skills/pascal100-hostbridge  <=  .claude/skills/pascal100-hostbridge
+
+# ---------------------------------------------------------------------------
+# FILES -- <package path>  <=  <path in this repo>
+#
+# A single file copied to the zip, TOKEN-EXPANDED on the way in (the {{MACHINE_CPM}} in
+# DRIVING-WITH-AI.md becomes the real package path, same as in the manual). Use this for a
+# loose top-level file; use DIR for a self-contained example folder.
+# ---------------------------------------------------------------------------
+
+FILE  DRIVING-WITH-AI.md   <=  docs/DRIVING-WITH-AI.md
+FILE  cheatsheet.md        <=  docs/manual/ref/cheatsheet.md
+FILE  LICENSE              <=  LICENSE
+FILE  LICENSE-SDL3         <=  LICENSE-SDL3
+
+# The cheatsheet ALSO ships as a rendered PDF, pascal100-cheatsheet.pdf -- the same content a
+# person can open in a file manager. It is NOT a FILE line: like pascal100-manual.pdf and
+# pascal100-changelog.pdf it is a BUILD ARTIFACT, produced by docs.yml from the .md above and
+# copied straight from the tree by build-package.sh (a FILE line would run the token sed over a
+# binary PDF and corrupt it). The .md above stays: it is the AI's plain-text crib.
+
+# LICENSE-SDL3 is SDL3's zlib licence, and it ships because SDL3 is LINKED STATICALLY INTO
+# THE BINARY (DISTRIBUTION.md 3.2) -- the code is in there, so its licence belongs in here.
+# There is no library beside the program to point at; this file is the only notice the
+# package carries. It was harmless to omit while every shipped binary was headless, and it
+# stopped being harmless the moment one was not.
+
+# ---------------------------------------------------------------------------
+# TOKENS -- a machine/media reference, no longer written into prose.
+#
+# THE MANUAL AND DRIVING-WITH-AI.md NOW WRITE LITERAL PATHS, not {{TOKENS}} (2026-09-05).
+# A reader looking at the raw .md -- on GitHub, or in the tree -- sees the real command, because
+# an unrendered {{MACHINE_CPM}} is not a command anyone can type. The .md files stand on their own.
+#
+# These definitions are RETAINED and the substitution machinery still runs (build-docs.sh and
+# build-package.sh expand() over every doc, then fail on any leftover {{...}}), so a future doc
+# MAY reintroduce a token and it will resolve here -- but nothing does today. They double as the
+# canonical list of which machine/media each shorthand names. If you change a path below, grep the
+# docs for the literal and change it there too: the build no longer does that for you.
+# ---------------------------------------------------------------------------
+
+# The CP/M machine. CompuPro CP/M 2.2K on the default machine: it carries `startup = ["RUN 0"]`,
+# so naming it IS booting it, and it is the quick start.
+MACHINE_CPM   = examples/cpm22/cpm22-buffered.toml
+DISK_CPM      = examples/cpm22/cpm22k-64k.dsk
+

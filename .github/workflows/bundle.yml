@@ -1,0 +1,116 @@
+name: Bundle
+# Build the linux-x86_64 and windows-x86_64 packages for a private bundle, on GitHub's x64
+# runners, as tools/release-worker.sh builds them on a build machine: a static SDL3, a Release
+# build (static C runtime on Windows), then tools/build-package.sh with the committed manual.
+# The macOS arm64 package is built by hand on the maintainer's Mac.
+#
+# NOT A RELEASE. No tag, no signing, no upload anywhere but this run's artifacts. Started by
+# hand only (the repository is private, so the minutes count). tools/verify-package.sh is not
+# run: it still carries altairsim's checks for removed examples. In its place, each job boots
+# CP/M from the unpacked package over --mcp and checks the banner and DIR.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+          - target: windows-x86_64
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # build-package.sh stamps the version from `git describe`
+
+      - name: SDL3 build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
+            libxss-dev libxtst-dev libwayland-dev libxkbcommon-dev wayland-protocols \
+            libdecor-0-dev libasound2-dev libpulse-dev
+
+      - name: Restore the static SDL3
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/sdl3-static
+          key: sdl3-static-${{ matrix.target }}-${{ hashFiles('tools/build-sdl3-static.sh', 'tools/build-sdl3-static.bat') }}
+
+      - name: Build the static SDL3 (Linux)
+        if: runner.os == 'Linux'
+        run: tools/build-sdl3-static.sh "$HOME/opt/sdl3-static"
+
+      - name: Build the static SDL3 (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: tools\build-sdl3-static.bat "%USERPROFILE%\opt\sdl3-static"
+
+      - name: Configure
+        run: |
+          prefix="$HOME/opt/sdl3-static"
+          if [ "$RUNNER_OS" = Windows ]; then
+            prefix="$(cygpath -m "$USERPROFILE")/opt/sdl3-static"
+            cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_PREFIX_PATH=$prefix" \
+                  -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded | tee configure.log
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_PREFIX_PATH=$prefix" | tee configure.log
+          fi
+          grep -F -- '-- SDL3 found -- video boards enabled (windowed)' configure.log
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package
+        run: tools/build-package.sh --pdf docs/pascal100-manual.pdf --target ${{ matrix.target }} dist-out
+
+      - name: Smoke test the package
+        run: |
+          mkdir smoke
+          archive=$(ls dist-out/pascal100-*-${{ matrix.target }}.* | head -n 1)
+          echo "archive: $archive"
+          case $archive in
+            *.zip)    (cd smoke && unzip -q "../$archive") ;;
+            *.tar.gz) tar -xzf "$archive" -C smoke ;;
+          esac
+          pkg=$(ls -d smoke/pascal100-*)
+          exe=pascal100; [ "$RUNNER_OS" = Windows ] && exe=pascal100.exe
+          "$pkg/$exe" --version
+          "$pkg/$exe" -n -x "SHOW VERSION" -x QUIT </dev/null | grep -F "SDL3 -- windowed"
+          py=$(command -v python3 || command -v python)
+          "$py" - "$pkg/$exe" "$pkg/examples/cpm22" <<'EOF'
+          import json, os, subprocess, sys
+          exe, cwd = os.path.abspath(sys.argv[1]), sys.argv[2]   # absolute: Popen runs it from cwd
+          p = subprocess.Popen([exe, "cpm22-buffered.toml", "--mcp"], cwd=cwd, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+          n = 0
+          def rpc(method, params):
+              global n; n += 1
+              p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": n, "method": method, "params": params}) + "\n"); p.stdin.flush()
+              return json.loads(p.stdout.readline())
+          def run(args):
+              r = rpc("tools/call", {"name": "run", "arguments": args})
+              return "".join(c.get("text", "") for c in r.get("result", {}).get("content", []))
+          rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "bundle", "version": "1"}})
+          boot = run({"from": 0, "until": "A>", "timeout_ms": 30000}); print(boot)
+          d = run({"input": "DIR\r", "until": "\nA>", "timeout_ms": 30000}); print(d)
+          p.stdin.close(); p.terminate()
+          ok = "64K CP/M 2.2K" in boot and "HDIR" in d
+          print("SMOKE", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pascal100-${{ matrix.target }}
+          path: dist-out/pascal100-*-${{ matrix.target }}.*
+          retention-days: 14

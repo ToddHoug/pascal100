@@ -1,0 +1,46 @@
+# CompuPro CP/M 8-16 1.1R on the CPU 8085/88, with a host bridge: the machine of
+# acceptance-hostbridge86 (tests/acceptance/hostbridge86.cmake). CPM816.DSK is the image of
+# examples/cpm8-16/cpm816-11r.dsk before R.CMD, W.CMD and HDIR.CMD were added (DRI and CompuPro
+# files only), so the test builds the utilities on a disk that has none; a test may not read examples/,
+# so it has its own copy. The test MOUNTs a scratch copy in drive 0 and starts it with RUN 0.
+
+[machine]
+name = "cpm816-hb"
+bus  = "ieee696"
+
+[[board]]
+type = "cpu8588"
+id   = "cpu"
+
+# The console. The CP/M 8-16 loader waits until DSR or CTS reads OFF: a 3-wire cable.
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  rs232_inputs = "open"
+  connect      = "console"
+
+[[board]]
+type    = "disk1"
+id      = "fd0"
+port    = C0
+routine = 4
+
+[[board]]
+type    = "hostbridge"
+id      = "hb0"
+port    = B0
+hostdir = ""
+
+[[board]]
+type           = "memory"
+id             = "mem0"
+ext            = true
+fill           = "zero"
+honors_phantom = "read"
+
+  [[board.region]]
+  type = "ram"
+  at   = 000000
+  size = "1M"

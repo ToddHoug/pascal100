@@ -1,0 +1,66 @@
+# The machine for the ai-mcp walkthrough (README.md): CompuPro CP/M 2.2K on a Z80, an
+# Interfacer 1 console, a Disk 1, the host bridge and 64K of RAM.
+#
+#     cd examples/ai-mcp && pascal100 cpm-ai.toml --mcp
+#
+# THIS FILE IS THE WHOLE MACHINE. It is the machine of examples/cpm22/cpm22-buffered.toml.
+#
+# THE DISK is cpm22k-64k.dsk: the same disk as examples/cpm22, plus HELLO.ASM with its planted bug.
+#
+# THE BOOT. Under --mcp the startup line does not run. The assistant boots the disk itself with
+# `run {from: 0}`: the Disk 1 boot EPROM answers at 0000.
+
+[machine]
+name    = "cpm-ai"
+bus     = "ieee696"          # IEEE 696 (S-100), the only bus pascal100 has
+startup = ["RUN 0"]
+
+# THE CPU: a generic Z80 card, flat out (clock_hz = 0).
+[[board]]
+type     = "z80"
+id       = "cpu0"
+clock_hz = 0
+
+# THE CONSOLE: channel A of a CompuPro Interfacer 1 at 00-01. Under --mcp the assistant types
+# at it with the send tool and reads it with recv. Channel B at 02-03 is not connected.
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "console"
+
+[console]
+bsdel = "bs"
+
+# THE DISK 1 at C0, boot routine 4.
+[[board]]
+type = "disk1"
+id   = "fd0"
+port = C0
+
+  [[board.drive]]
+  unit  = 0
+  mount = "cpm22k-64k.dsk"
+
+# THE HOST BRIDGE at B0. hostdir "" = the folder you start pascal100 in, so R and W reach the
+# files here.
+[[board]]
+type    = "hostbridge"
+id      = "hb0"
+port    = B0
+hostdir = ""
+
+# THE MEMORY: 64K of RAM in segment 00, 16-bit capable, filled at random as real static RAM is.
+[[board]]
+type           = "memory"
+id             = "mem0"
+fill           = "random"
+honors_phantom = "read"
+ext            = true
+sixteen_bit    = true
+
+  [[board.region]]
+  type = "ram"
+  at   = 0000
+  size = "64K"

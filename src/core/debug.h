@@ -1,0 +1,501 @@
+#pragma once
+//
+// The debugger (DESIGN.md 3.0.3).
+//
+// IT IS NOT A CPU FEATURE, AND THAT IS THE WHOLE DESIGN. If a core owned
+// breakpoints, every core would reimplement them and they would differ in small
+// maddening ways. They do not belong there:
+//
+//   BREAK IO / BREAK MEM / TRACE / HISTORY  are questions about BUS CYCLES, and
+//     the bus already shows every cycle to everyone watching (Bus::observe).
+//     They are CPU-agnostic, they work against a DMA transfer as readily as
+//     against the processor, and the machinery already existed.
+//
+//   BREAK <addr>  is the one CPU-flavoured one, and it is just "PC equals X after
+//     a step" -- one comparison against a register the reflection layer already
+//     exposes. It does not know what an 8080 is.
+//
+// So an 8085 card, or a Z80, inherits the ENTIRE debugger on the day it lands
+// without a line being written here.
+
+#include "core/bus.h"
+#include "core/expr.h"
+
+#include <array>
+#include <csignal>
+#include <cstdint>
+#include <fstream>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <vector>
+
+namespace altair {
+
+class Machine;
+class CpuCore;
+
+enum class BreakKind {
+    Pc,        // PC lands here
+    MemRead,   // ANY master read this address -- CPU, DMA, or the front panel
+    MemWrite,
+    IoRead,    // an IN from this port
+    IoWrite,   // an OUT to this port
+};
+
+const char* breakKindName(BreakKind k);
+
+// What a match DOES. Stopping is only the default, not the definition: a breakpoint
+// is a place the debugger recognises, and stopping is one thing it can do there.
+//
+// The trace actions do NOT stop -- they flip TRACE's active flag and the machine
+// runs on -- which is how you trace a REGION of a program instead of all of it.
+// And unlike IF, a trace toggle is safe on the CYCLE kinds too, because it reads no
+// registers: there is nothing to be boundary-inconsistent about.
+enum class BreakAction {
+    Stop,      // the breakpoint everyone knows
+    TraceOn,   // start tracing here, keep running
+    TraceOff,  // stop tracing here, keep running
+};
+
+const char* breakActionName(BreakAction a);
+
+// WHEN a CYCLE breakpoint's condition is judged -- because a MEM/IO breakpoint straddles
+// an instruction, and "what is A?" has two honest answers. `Before` is the IF gate: the
+// registers as the instruction BEGAN (its inputs) -- the same pristine state an
+// unconditional cycle stop rolls back to. `After` is the LOADS test: the registers once
+// the instruction RETIRED (its outputs), the one place the value an IN just read is
+// visible. A conditional cycle breakpoint therefore stops AT THE BOUNDARY (after the
+// access), not before it like an unconditional one -- it has to, to have a
+// boundary-consistent register set to judge. Meaningless for a PC breakpoint, whose
+// condition is always the PC-arrival boundary; it stays `Before` there and is ignored.
+enum class CondWhen { Before, After };
+
+struct Breakpoint {
+    int id = 0;
+    BreakKind kind = BreakKind::Pc;
+    uint32_t lo = 0, hi = 0;  // inclusive. A single address has lo == hi.
+    bool enabled = true;
+    BreakAction action = BreakAction::Stop;
+
+    // Times it ACTED -- stopped you, or flipped the trace. Not times it matched: a
+    // conditional breakpoint whose condition does not hold did nothing, and saying
+    // it "hit" would be a lie the hits column tells every time you look at it.
+    uint64_t hits = 0;
+
+    // BREAK <addr> IF <expr>. A PC breakpoint that only stops when the condition is
+    // true -- one comparison against reflected registers, so it is CPU-agnostic like
+    // everything else here (DESIGN.md 3.0.3). Null on an unconditional breakpoint;
+    // it applies to the PC kind only, since the cycle kinds fire mid-instruction
+    // where a register read is not a boundary-consistent question. The Expr carries
+    // its own source text, so describe() needs no second copy of it.
+    //
+    // On a CYCLE breakpoint (MEM/IO) the same field carries a BREAK ... IF or BREAK IO R
+    // ... LOADS condition; condWhen (below) says which and WHEN it is judged. There it is
+    // NOT restricted to the PC kind: a cycle breakpoint's condition is evaluated at the
+    // instruction boundary, where the registers have a consistent answer -- see CondWhen.
+    std::shared_ptr<const Expr> cond;
+
+    // For a CYCLE breakpoint, WHEN `cond` is judged -- see CondWhen. IF sets Before, LOADS
+    // sets After. Null-cond and PC breakpoints leave it Before, where it is ignored.
+    CondWhen condWhen = CondWhen::Before;
+
+    // A PC breakpoint ON ONE CORE: "<board>:<unit>" as the machine spells it (BREAK
+    // p100:me 1F8D), or empty for "whichever core is active" -- the only kind there was
+    // before a board could carry two (DESIGN.md 3.0.1). Kept by NAME, not by pointer, so it
+    // survives a machine load and can never dangle: the run loop resolves it into `coreAt`
+    // when each run starts, and one whose core is not in the machine simply never fires.
+    // MEM and IO breakpoints have no core -- a bus cycle belongs to the bus.
+    std::string core;
+    CpuCore* coreAt = nullptr;   // resolved by Debugger::run; not state
+
+    std::string describe() const;
+};
+
+// WHY IT CAME BACK. A run that just... returns, with no reason given, is a debugger
+// you cannot trust -- so every one of these has words, and the monitor says them.
+enum class StopReason {
+    Steps,        // ran the count it was asked for
+    Breakpoint,
+    Halted,       // HLT, and nothing is going to interrupt it
+    Attn,         // the operator took the keyboard back (^E). NOT a fault, and not
+                  // a stop the guest can tell happened -- a bare RUN resumes it.
+    InputEnded,   // a SCRIPT's input ran out and the guest went quiet asking for
+                  // more. Nobody stopped it; there is just nobody left to type.
+    StopRequested,  // the operator pressed ^C, or an --mcp client cancelled the run
+    WindowClosed, // the operator closed the display window. Like Attn, not a fault
+                  // and invisible to the guest -- a bare RUN resumes it, into the
+                  // same window (host/display.h takeQuitRequest).
+    NoCpu,        // there is no processor in this machine, which is a real machine
+    StepTarget,   // NEXT ran to the return address of a stepped-over CALL/RST. Not a
+                  // user breakpoint -- an internal one-shot the monitor set and cleared.
+    Unclaimed,    // SET BUS UNCLAIMED=HALT and the guest reached an I/O port no board
+                  // decodes. Stopped at the boundary, like a cycle breakpoint (4.6.1).
+    TmaConflict,  // the run did not start: two DMA boards cannot be arbitrated (same TMA
+                  // priority, or one with no TMA lines). Machine::tmaConflict() says why.
+};
+
+struct RunResult {
+    StopReason why = StopReason::Steps;
+    uint64_t steps = 0;
+    uint64_t tStates = 0;
+    uint32_t pc = 0;
+    int bp = 0;   // which breakpoint, when why == Breakpoint
+    uint8_t port = 0;    // which port, when why == Unclaimed
+    bool write = false;  // OUT (true) or IN, when why == Unclaimed
+};
+
+class Debugger {
+public:
+    explicit Debugger(Machine& m) : m_(m) {}
+
+    int add(BreakKind k, uint32_t lo, uint32_t hi, std::shared_ptr<const Expr> cond = nullptr,
+            BreakAction action = BreakAction::Stop, CondWhen condWhen = CondWhen::Before);
+    bool remove(int id, std::string& err);
+
+    // Bind PC breakpoint `id` to one core ("<board>:<unit>", as Machine::coreByRef takes
+    // it). The caller has checked the name resolves. False if there is no such breakpoint
+    // or it is not a PC breakpoint.
+    bool setCore(int id, const std::string& core);
+    void clear();
+    const std::vector<Breakpoint>& breakpoints() const { return bps_; }
+
+    // Why the last run() came back StopReason::TmaConflict, in words: which two bus
+    // masters cannot be arbitrated, and the fix (Machine::tmaConflict).
+    const std::string& tmaConflictWhy() const { return tmaWhy_; }
+
+    // ---- TRACE and HISTORY: bus-observer facilities (DESIGN.md 3.0.3) ----
+    //
+    // Both watch the SAME cycle stream every board already sees, from outside the
+    // backplane -- so they are NOT CPU features, they catch a DMA transfer as
+    // readily as the processor, and a Z80 inherits them the day it lands. They are
+    // fed by the run loop's observer, which is live only WHILE the machine runs.
+
+    // The mask on TRACE. A cycle is shown if ANY of its categories is selected; an
+    // empty mask (0) shows everything. IN/OUT/IRQ come straight off the cycle type;
+    // Dma is set while a granted bus master is driving; Contention is a bus fact.
+    enum TraceCat {
+        InCycle   = 1 << 0,  // an IN  (I/O read)
+        OutCycle  = 1 << 1,  // an OUT (I/O write)
+        Irq       = 1 << 2,  // an interrupt-acknowledge cycle
+        Dma       = 1 << 3,  // any cycle a granted bus master drove
+        Contended = 1 << 4,  // more than one board answered
+    };
+    // WHERE trace goes is one question; WHETHER it is running is another. They used
+    // to be one boolean, and a tracepoint is exactly the thing that pulls them apart:
+    // BREAK 100 TRACE ON has to turn tracing on WITHOUT being told a sink, which
+    // means the sink outlives the off state. So TRACE OFF keeps the file open and
+    // the mask set, ready to be turned back on -- by TRACE ON, or by a tracepoint.
+    //
+    // WHO OWNS THE STREAM depends on what it is. A FILE is ours (traceToFile): it has to
+    // live as long as the machine, and a Monitor does not -- `--mcp` makes a new one for
+    // every `monitor` call, and a sink that died with it is a write through a dangling
+    // pointer on the next cycle (issue #613). The CONSOLE is the monitor's, and core must
+    // not know it, so traceTo() only borrows the stream: whoever passes one keeps it alive
+    // for as long as the machine can run.
+    void traceTo(std::ostream* sink, unsigned mask) {   // configure AND start: TRACE ON
+        // Away from the file: it is no longer the sink, so close it rather than leave a
+        // half-written trace open on a stream nobody writes.
+        if (traceFile_.is_open()) traceFile_.close();
+        traceSink_ = sink;
+        traceMask_ = mask;
+        traceActive_ = true;
+    }
+    // TRACE ON <file>: open it (truncating), and configure AND start. False when the file
+    // cannot be opened, and then nothing has changed -- the earlier sink still stands.
+    bool traceToFile(const std::string& path, unsigned mask) {
+        // The new file may BE the old one. Flush first, so that closing the old stream
+        // below has nothing left to write into the file we just truncated.
+        if (traceFile_.is_open()) traceFile_.flush();
+        std::ofstream f(path, std::ios::out | std::ios::trunc);
+        if (!f) return false;
+        traceFile_ = std::move(f);
+        traceSink_ = &traceFile_;
+        traceMask_ = mask;
+        traceActive_ = true;
+        return true;
+    }
+    void traceOn() { traceActive_ = true; }    // start with whatever is configured
+    // Stop, but KEEP the sink and the mask. FLUSH a file: it has to be complete on disk
+    // for someone reading it now, even though we will write to it again.
+    void traceOff() {
+        traceActive_ = false;
+        if (traceFile_.is_open()) traceFile_.flush();
+    }
+    bool tracing() const { return traceActive_ && traceSink_; }
+    bool traceConfigured() const { return traceSink_ != nullptr; }
+
+    // A recorded cycle, for HISTORY and for formatting a trace line. Small by
+    // design -- a ring of these records is cheap enough to keep always, so the
+    // flight recorder has already caught what led up to a stop before you ask.
+    struct CycleRec {
+        Cycle type = Cycle::MemRead;
+        uint16_t addr = 0;
+        uint8_t data = 0;
+        bool dma = false;
+        bool contended = false;
+        // IEEE 696: A16-A23, and the 16-bit transfer (sXTRQ* answered by SIXTN*) and its
+        // odd byte. formatCycle prints a 6-digit memory address.
+        uint8_t ext = 0;
+        uint8_t dataHi = 0;
+        bool xtrq = false;
+        uint32_t phys() const { return ((uint32_t)ext << 16) | addr; }
+        uint64_t t = 0;   // clock T-state at the cycle
+        // WHO drove it and WHO answered, as INTERNED HANDLES -- indices into the
+        // debugger's board-name table, NOT pointers and NOT strings. A pointer would
+        // dangle once a board left the backplane; a string would allocate on every one
+        // of the 8192 records in an always-on ring. A small int does neither: the name
+        // is looked up once, at record time, and stored by number. -1 is "nobody" --
+        // the floating bus for `responder`, and the processor itself for `master`
+        // (a normal cycle originates at the CPU; only a DMA grant names a board here).
+        int16_t master = -1;     // who ORIGINATED the cycle: -1 = the CPU, else a DMA board
+        int16_t responder = -1;  // who ANSWERED it: -1 = nobody drove (floating bus)
+    };
+
+    // The last `n` cycles, OLDEST FIRST. n past what is held returns all of it.
+    std::vector<CycleRec> history(size_t n) const;
+    void clearHistory();
+
+    // The board-name table the CycleRec handles index into. Its slot i is the id of
+    // the board interned as handle i; -1 handles resolve to a literal ("cpu" for the
+    // master, "--" for the responder) and never touch this. The monitor reads it to
+    // render HISTORY BUS; the observer passes it to formatCycle for a live TRACE line.
+    const std::vector<std::string>& boardHandles() const { return boardHandles_; }
+
+    // Render one recorded cycle the way TRACE and HISTORY both print it. `handles` is
+    // boardHandles() -- passed in because this is static (a trace line and a HISTORY
+    // line format identically, and neither should carry a Debugger to say so).
+    static std::string formatCycle(const CycleRec&, const std::vector<std::string>& handles);
+
+    // A recorded INSTRUCTION, for CPU HISTORY -- the sibling of CycleRec. It holds the
+    // machine as it stood at the instruction boundary: the register VALUES in the active
+    // core's registers() order, the PC, and the opcode bytes that ran there. That is
+    // enough for the monitor to render the exact DDT-style line STEP prints -- faithfully,
+    // because the stored bytes are what EXECUTED, not whatever the address holds by the
+    // time you look (self-modifying code stays honest). The core said which registers are
+    // lamps and what they are called; this only carries their numbers, so it never learns
+    // what an 8080 is. Formatting lives in the monitor (it needs the disassembler, the
+    // symbol table and the operator's number base), so there is no formatInsn() here.
+    // The most code bytes one history record holds (InsnRec::bytes).
+    static constexpr size_t kInsnBytes = 16;
+
+    struct InsnRec {
+        // THE CORE THAT RAN IT. On a board with two processors (DESIGN.md 3.0.1; the
+        // Pascal-100) the active core changes during a run, so the record must say whose
+        // registers `regs` holds and whose instruction set decodes `bytes` -- the core that
+        // is active when you LOOK may not be the one that ran it. Never dangling: the ring
+        // is cleared whenever a CPU board leaves the machine (Machine::remove/clear/replaceWith).
+        CpuCore* core = nullptr;
+        uint32_t pc = 0;
+        std::vector<uint32_t> regs;      // one value per RegDef, in registers() order
+        // The opcode and its operands at pc: the core's maxInsnLen() bytes (3 for the
+        // 8080/8085, 4 for the Z80 and P-code), so a 4-byte Z80 instruction shows its last
+        // byte (altairsim records 3 for every core). The array is sized for the cores on
+        // the roadmap: the 8088 (6 bytes plus prefixes) and maybe the 68000 (10 bytes).
+        // Its size costs ring memory only; the time cost is nbytes peeks per instruction.
+        std::array<uint8_t, kInsnBytes> bytes{};
+        uint8_t nbytes = 0;
+    };
+
+    // The last `n` instructions, OLDEST FIRST -- the CPU counterpart of history().
+    std::vector<InsnRec> insnHistory(size_t n) const;
+    void clearInsnHistory();
+
+    // A CPU board left the machine (BOARDS REMOVE, a machine load, MACHINE none): forget
+    // everything that points at its cores -- the instruction history (InsnRec::core), the
+    // cycle-breakpoint one-shot and NEXT's target -- so nothing is left holding a pointer
+    // to a core that no longer exists.
+    void forgetCores();
+
+    // Run. `maxSteps == 0` means until something stops us -- a breakpoint, a HLT,
+    // or ^C. Returns WHY it stopped, always: there is no "it just came back".
+    //
+    // `clearPending` (default true) clears a pending stop request on entry, so a ^C
+    // left over from before this run does not stop it at once. A caller that drives
+    // run() in SLICES, and clears the flag itself once at the start of its own
+    // command, passes false: otherwise a stop request landing between its own check
+    // and the next slice is erased unseen (the --mcp run tool, the monitor's RUN).
+    RunResult run(uint64_t maxSteps, bool clearPending = true);
+
+    // STEP-OVER's temporary breakpoint (NEXT). A run-scoped, one-shot PC target
+    // the run loop stops at -- NOT a Breakpoint: no id, no hits, invisible to
+    // BREAK, and it cannot collide with a user breakpoint's id. `pc == -1` clears
+    // it. The monitor sets it before running the callee and clears it after, so it
+    // survives across the slices runMachine drives run() in.
+    //
+    // The target belongs to the core that is active when this is called: on a two-core
+    // board the other core reaching the same address is not the CALL returning. With
+    // `anyCore` (the MCP `run` tool's `stop_at`) any core reaching it stops the run.
+    void setStepTarget(int pc, bool anyCore = false);
+
+    // ^C, from the signal handler. The ONLY thing the handler does is set this,
+    // because that is the only thing it is safe to do.
+    static void requestStop();
+    static void clearStopRequest();
+
+    // Is one pending RIGHT NOW? By default run() clears the flag on entry, so a
+    // caller that drives run() in SLICES cannot learn from the slice alone that an
+    // interrupt arrived between two of them -- the next slice wipes it first. Such a
+    // caller asks here at the top of its own loop, AND passes clearPending=false to
+    // run(), since a stop request can also land between that check and the slice. See
+    // the --mcp run tool and the monitor's RUN, both of which sleep between slices to
+    // pace a clock.
+    static bool stopRequested();
+
+    // HALTED FOR GOOD: the processor executed a HLT and nothing but RESET can end it --
+    // no interrupt it would take is pending, and none can arrive (interrupts are off, or
+    // no board is pulling pINT and the clock has nothing scheduled). The run loop stops
+    // here once the clock queue has drained, and the monitor's RUN, NEXT and STEP refuse:
+    // a run would only count idle T-states. False when there is no CPU or it is not halted.
+    bool haltIsFinal();
+
+    // The one line every panel command prints when it refuses a halted processor (#770):
+    // the front panel's RUN, EXAMINE and DEPOSIT all do nothing while it is halted. `at`
+    // is the PC, already formatted by the caller.
+    static std::string haltedRefusal(const std::string& at);
+
+private:
+    bool armObserver();
+    void disarmObserver();
+
+    // Match one bus cycle against the CYCLE-kind breakpoints (MEM/IO, read/write) --
+    // count the hit, flip trace for a tracepoint, and set cycleHit_ for a Stop. Called
+    // from TWO places so the bookkeeping lives once: the pre-access veto (for a CPU
+    // cycle, so the machine stops BEFORE the access) and the post-access observer (for
+    // a DMA-driven cycle, which has no CPU instruction to roll back). PC and device-event
+    // kinds are not its business and are skipped.
+    void matchCycleBreak(const BusCycle& c);
+
+    // Grant pHLDA to the boards pulling pHOLD (DESIGN.md 4.5), highest TMA priority
+    // first (IEEE 696 2.8.3), each at most once per boundary. Drives each granted
+    // board's BusMaster while it keeps requesting, charging the stolen T-states to the
+    // clock. Called at every instruction boundary; inert (one integer test) when
+    // nobody wants the bus, which is every machine that has no DMA card in it.
+    void serviceDma();
+
+    std::string tmaWhy_;  // the last TmaConflict refusal, in words (tmaConflictWhy())
+
+    Machine& m_;
+    std::vector<Breakpoint> bps_;
+    int nextId_ = 1;
+
+    // Set by matchCycleBreak when a Stop-action cycle breakpoint matches, from either
+    // of its two callers. For a CPU cycle it is set by the PRE-access veto, which then
+    // throws CycleBreakBefore -- the instruction unwinds untouched and the machine stops
+    // with the PC on it, nothing executed. For a DMA-driven cycle it is set by the
+    // POST-access observer and the run loop stops at the next boundary: a board's own
+    // transfer has no CPU instruction to roll back, so pre/post makes no difference there.
+    int cycleHit_ = 0;
+    int observer_ = 0;
+
+    // ONE-SHOT RESUME past a pre-access cycle breakpoint. Stopping BEFORE the access
+    // restores the PC onto the very instruction that tripped, so a bare RUN/STEP would
+    // re-issue the identical cycle and the veto would fire again, forever -- the operator
+    // could never get past the line. So on such a stop we remember the PC and arm a
+    // one-shot: the next run lets a matching cycle at that SAME PC through exactly once
+    // (no hit counted, no stop), then disarms -- so a later pass over the same instruction
+    // in a loop traps normally. Guarded on the PC so moving the PC between stops (a jump,
+    // a DEPOSIT) never swallows an unrelated hit.
+    bool skipArmed_ = false;
+    uint32_t resumeCyclePc_ = 0;
+    CpuCore* resumeCycleCore_ = nullptr;  // ...and on the same CORE (a two-core board)
+
+    // CONDITIONAL cycle breakpoints (BREAK MEM/IO ... IF|LOADS) that matched during the
+    // instruction now running, awaiting judgement at its boundary. matchCycleBreak records
+    // the matching ids here INSTEAD of stopping before the access: a cycle condition cannot
+    // be evaluated mid-instruction (debug.h CondWhen), and LOADS needs the value the cycle
+    // produced. The run loop evaluates them once the instruction retires -- IF against the
+    // pre-instruction snapshot, LOADS against the live registers -- and counts a hit only
+    // for one that acts. Cleared each iteration. Only CPU cycles record here; a DMA cycle
+    // has no CPU registers to judge against, so a conditional breakpoint does not apply.
+    std::vector<int> pendingCond_;
+
+    // One observer folds three jobs into a single call per cycle: record HISTORY,
+    // emit a TRACE line, and match cycle breakpoints. This decides whether a cycle
+    // passes the current TRACE mask (empty mask -> everything).
+    bool traceShows(const CycleRec&) const;
+
+    // TRACE's configuration (where, and what it keeps) and, separately, whether it is
+    // currently emitting -- see traceTo/traceOn/traceOff.
+    std::ostream* traceSink_ = nullptr;
+    std::ofstream traceFile_;  // the sink, when TRACE ON named a file -- see traceToFile()
+    unsigned traceMask_ = 0;
+    bool traceActive_ = false;
+
+    // True while serviceDma() is driving a granted master, so the observer can tag a
+    // cycle as DMA -- the origin is deliberately NOT on the BusCycle (a real
+    // backplane carries no such tag, bus.h), but the loop that GRANTED the bus knows.
+    bool inDma_ = false;
+
+    // Which board holds the bus right now, while inDma_ is true. serviceDma() sets it
+    // before it drives a granted master, so the observer can name WHO originated a DMA
+    // cycle (the CPU needs no entry -- a non-DMA cycle's master is always the CPU).
+    Board* dmaMaster_ = nullptr;
+
+    // The interning table behind CycleRec's `master`/`responder` handles. A board's id
+    // string is stored ONCE, the first time it drives or answers during a run, and the
+    // ring keeps only the small index -- so the always-on recorder never allocates per
+    // cycle and never holds a pointer that could dangle after a board is removed.
+    //
+    // boardHandles_ is the handle -> id table; it only ever GROWS (a ring record from an
+    // earlier run must still resolve), so handles are stable across runs. internPtrs_ is
+    // the pointer -> handle map used to answer "have I seen this board this run?"; it is
+    // rebuilt each run (armObserver clears it) because a raw Board* is only good for the
+    // run that produced it. internMru_/internMruH_ are a one-entry cache in front of it:
+    // consecutive cycles overwhelmingly hit the same board (a loop hammering one RAM
+    // card), so the common case is a single pointer compare and no scan at all.
+    std::vector<std::string> boardHandles_;
+    std::vector<std::pair<Board*, int>> internPtrs_;
+    Board* internMru_ = nullptr;
+    int internMruH_ = -1;
+    int internBoard(Board* b);
+
+    // HISTORY's ring. Fixed capacity, overwrite-oldest -- a flight recorder, always
+    // running while the machine runs, so it has the run-up to a stop without anyone
+    // having had to ask in advance. Below capacity the records sit in order at the
+    // front; once full, ringHead_ is the oldest and the ring wraps.
+    static constexpr size_t kHistoryCap = 8192;
+    std::vector<CycleRec> ring_;
+    size_t ringHead_ = 0;
+
+    // The CPU instruction recorder -- the sibling of the bus ring above, and it runs on
+    // the same terms: always on while the machine runs, overwrite-oldest, one record per
+    // instruction retired. Fed from the run loop at the boundary, before the instruction
+    // executes, so a record is the machine STEP would have shown for it.
+    static constexpr size_t kInsnHistoryCap = 8192;
+    std::vector<InsnRec> insnRing_;
+    size_t insnRingHead_ = 0;
+
+    // STEP-OVER's internal one-shot PC target, or -1 for none. See setStepTarget.
+    int stepTarget_ = -1;
+    CpuCore* stepTargetCore_ = nullptr;
+};
+
+// ^C AS AN OUT-OF-BAND STOP for a run with no other way to interrupt it -- a piped
+// monitor session (no raw terminal, so no ISIG, and no ATTN either), and an `--mcp`
+// server, whose stdin is the JSON-RPC channel itself, not a keyboard `run` can poll
+// for ATTN on. Install for exactly the span that should honour ^C this way (a RUN, a
+// STEP, or the whole of runMcp) and the previous handler comes back on scope exit, so
+// ^C at an ordinary prompt still kills the process exactly as it always did.
+//
+// A SECOND ^C KILLS. The first sets the flag and the run stops on it; but an `--mcp`
+// server holds this guard for its whole session, not for one call, so without that
+// rule a ^C at a server sitting idle -- or at one wedged somewhere the flag is never
+// read -- would be swallowed, and the process could not be stopped from the keyboard
+// at all. So the handler checks whether a previous ^C is STILL unconsumed: if
+// it is, it puts the default disposition back and re-raises, and the process dies the
+// way the operator plainly meant. Everything it does is what a handler is allowed to
+// do -- an atomic flag, signal(), raise() -- and nothing else runs on that thread.
+class SigintGuard {
+  public:
+    SigintGuard();
+    ~SigintGuard();
+    SigintGuard(const SigintGuard&)            = delete;
+    SigintGuard& operator=(const SigintGuard&) = delete;
+
+  private:
+    void (*prev_)(int) = nullptr;
+    bool installed_    = false;  // false: SIGINT was inherited ignored -- we left it that way
+};
+
+} // namespace altair

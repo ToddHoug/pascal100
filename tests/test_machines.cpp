@@ -1,0 +1,1346 @@
+#include "test.h"
+
+#include <algorithm>
+
+#include "boards/registry.h"
+#include "config/toml.h"
+#include "core/machines.h"
+#include "core/version.h"
+#include "host/console.h"
+#include "host/display.h"
+#include "host/terminal/stream.h"
+
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace altair;
+
+// The lines of one table of a saved file, so a key is looked for in its own table: [console]
+// and [terminal] have the same key names, and a board can have a `base`.
+static std::string savedTable(const std::string& text, const std::string& name) {
+    const std::string head = "\n[" + name + "]\n";
+    const size_t      at   = text.find(head);
+    if (at == std::string::npos) return "";
+    const size_t from = at + head.size() - 1;
+    return text.substr(from, text.find("\n[", from) - from + 1);
+}
+
+// BUILT-IN MACHINES ARE IN THE BINARY, NOT ON THE DISK.
+//
+// This file never opens a file, and that is the entire point. pascal100 ships as
+// ONE EXECUTABLE plus documentation: it must not go looking for a machines/
+// directory, an install prefix, or anything relative to argv[0]. If a built-in
+// machine could only be found next to the binary, then copying the binary
+// somewhere -- which is the ONLY thing anyone will do with it -- would break the
+// default machine, and it would break it at startup, which is the worst possible
+// time. These tests pass with the source tree deleted.
+//
+// The other half of the deal: a built-in is REAL TOML, run through the SAME
+// parser as your own config file. So if the config format changes under them,
+// these go red instead of the machines quietly rotting into a second dialect.
+
+void test_machines() {
+    SECTION("built-in machines -- compiled in, not looked up");
+
+    auto all = builtinMachines();
+    CHECK(all.size() == 1, "exactly one machine is compiled in: default");
+
+    // EVERY BUILT-IN MUST ACTUALLY LOAD, and this loop is not ceremony -- it is here
+    // because it WASN'T, and altmon.toml shipped broken for exactly as long as it
+    // took someone to run `pascal100 -m altmon` by hand.
+    //
+    // The bug was TOML, not hardware: a [[board]] was inserted ABOVE the `startup`
+    // key, so `startup` landed inside the board's table and the loader rejected it as
+    // an unknown board property. The file was well-formed, the board was right, and
+    // the machine was dead. This file checked `size > 0` and a blurb -- neither of
+    // which can tell you a machine does not boot.
+    //
+    // A built-in that does not load is not a config bug. It is a BROKEN BINARY: these
+    // are compiled in, so there is no file to fix.
+    for (const auto& b : all) {
+        CHECK(b.size > 0, "a built-in has bytes");
+        CHECK(std::string(b.blurb).size() > 0, "and a blurb for --list");
+
+        // AND THE BLURB IS A WHOLE SENTENCE, because it is ONE LINE and there is no
+        // second one. cmake/embed_machines.cmake takes the FIRST comment line of the
+        // .toml and nothing after it, so a description written across two lines does
+        // not wrap in `--list` -- it is cut, and the half nobody sees is the half that
+        // said what the machine is. Four of them were: `--list` and the manual's table
+        // of built-ins printed "... a cassette in the ACR, a Teletype", "... same 2SIO,
+        // same" and two more like them, for as long as it took to read the table.
+        //
+        // A cut sentence has no full stop at the end of it. That is the whole test, and
+        // it is cheap enough to run on every built-in forever.
+        std::string blurb = b.blurb;
+        CHECK(!blurb.empty() && blurb.back() == '.',
+              "...and the blurb ENDS -- one line, one sentence, no second line to wrap to");
+
+        Machine mm;
+        std::string e;
+        bool ok = loadMachine(b, mm, e);
+        if (!ok) std::printf("        %s: %s\n", b.name, e.c_str());
+        CHECK(ok, "...and it LOADS -- every built-in, not just the default");
+        if (!ok) continue;
+
+        // ---- AND IT SURVIVES CONFIG SAVE. ----
+        //
+        // The writer is generic over properties() and unitProperties(); the reader has
+        // to be generic over exactly the same pair, or CONFIG SAVE writes a file that
+        // CONFIG LOAD refuses. IT DID. `[board.unit.<name>]` was written for every
+        // board that had a unit with settings, and read back only for boards that had
+        // opted in via subUnitTables() -- which was the 2SIO, and nothing else. So
+        // saving ANY machine with a cassette or a disk in it produced this:
+        //
+        //     ps2int.toml: board 'acr0' (acr) has no [[board.unit]] table
+        //
+        // A save you cannot load is not a save. Every built-in now round-trips, and the
+        // reload is compared to the original rather than merely required not to error --
+        // a loader that silently dropped the units would pass the weaker test.
+        std::string text = saveTomlText(mm);
+        Machine     back;
+        std::string e2;
+        bool        reloaded = loadTomlText(text, std::string(b.name) + " (saved)", back, e2);
+        if (!reloaded) std::printf("        %s: %s\n", b.name, e2.c_str());
+        CHECK(reloaded, "...and CONFIG SAVE's own output loads straight back in");
+        if (!reloaded) continue;
+
+        CHECK(back.boards().size() == mm.boards().size(),
+              "...with every board still in the backplane");
+        CHECK(saveTomlText(back) == text,
+              "...and saving it again is byte-identical: the round trip is a FIXED POINT, "
+              "so nothing was silently dropped on the way through");
+    }
+
+    // ---- default: the CompuPro workbench (pascal100, 2026-11-09) ----
+    const BuiltinMachine* d = findMachine("default");
+    CHECK(d != nullptr, "there IS a default machine -- no config file required");
+    if (!d) return;
+
+    Machine m;
+    std::string err;
+    CHECK(loadMachine(*d, m, err), "and it loads through the ordinary TOML parser");
+    CHECK(m.name == "default", "it knows its name");
+
+    // A CPU, an Interfacer 1, a Disk 1, a host bridge and a memory card. The default machine
+    // is what `base = "default"` STARTS FROM, so this card list is a contract that other
+    // config files depend on. Adding a card here is not free.
+    CHECK(m.boards().size() == 5,
+          "a CPU, an Interfacer 1, a Disk 1, a HOST BRIDGE and a memory card");
+    CHECK(m.find("hb0") != nullptr,
+          "the host bridge is in the default machine -- it is the ONLY way to move a file "
+          "in or out of a running guest (DESIGN.md 12.2 defers the alternative)");
+    CHECK(m.find("fd0") != nullptr && m.find("fd0")->type() == "disk1",
+          "the Disk 1 CP/M boots from is in the backplane");
+    CHECK(m.cpu() != nullptr, "there is a processor in the default machine");
+    CHECK(m.isa() == "z80", "and it speaks Z80, so DISASM never has to be told");
+    CHECK(m.master() != nullptr, "and it can drive the bus");
+
+    // The console CP/M will print its banner on is in the backplane and connected.
+    Board* if1 = m.find("if1");
+    CHECK(if1 != nullptr && if1->type() == "interfacer1",
+          "and an Interfacer 1, because CP/M needs somewhere to talk");
+    if (if1) {
+        UnitDef u;
+        CHECK(if1->findUnit("a", u), "channel a exists");
+        CHECK(u.state == "console", "and it is connected to the console");
+    }
+
+    // 64K of RAM. 0000-00FF answers with the Disk 1's boot EPROM over PHANTOM* until the
+    // guest switches it off, so the RAM checks are above it.
+    (void)m.bus.memRead(0x0000);
+    CHECK(!m.bus.lastUnclaimed(), "a board drives 0000 -- the boot EPROM, after the reset");
+    m.bus.memWrite(0x0100, 0x76);
+    CHECK(m.bus.memRead(0x0100) == 0x76, "0100 is RAM -- it stores a write");
+    m.bus.memWrite(0xFFFF, 0x3E);
+    CHECK(m.bus.memRead(0xFFFF) == 0x3E, "FFFF is RAM too: all 64K");
+
+    // Case, and the absence of a machine, both answer honestly.
+    CHECK(findMachine("DEFAULT") != nullptr, "a machine name is not case-sensitive");
+    CHECK(findMachine("pascal100") == nullptr, "the Pascal-100 is a machine file now, not a built-in");
+    CHECK(findMachine("imsai") == nullptr, "and one we have not built is simply not there");
+    CHECK(findMachine("original") == nullptr, "and the Altair machines are not in pascal100");
+
+    SECTION("a file or a built-in? decided by SPELLING, never by the filesystem");
+
+    // If this were decided by probing the disk, `pascal100 default` would mean
+    // one thing today and something else the day a file called `default` appears
+    // in the working directory. A command line whose meaning depends on its
+    // surroundings is a trap, and it is the kind that gets sprung at 2am.
+    CHECK(!looksLikeFile("default"), "a bare word is a built-in name");
+    CHECK(!looksLikeFile("4k"), "even a short one");
+    CHECK(looksLikeFile("my.toml"), "a .toml is a file");
+    CHECK(looksLikeFile("MY.TOML"), "in any case");
+    CHECK(looksLikeFile("./default"), "a path is a file, even with a built-in's name");
+    CHECK(looksLikeFile("cfg/x"), "a slash anywhere makes it a file");
+    CHECK(!looksLikeFile("toml"), "and 'toml' alone is not a .toml -- do not match a bare suffix");
+
+    SECTION("a startup entry is a COMMAND LINE, so it can quote a filename");
+
+    // EVERY PERIOD TAPE IN THE TREE HAS A SPACE IN ITS NAME -- "4K BASIC Ver 3-1.tap",
+    // "8K BASIC Ver 3-2.tap" -- so the monitor's tokenizer needs the quotes around a path,
+    // and says so in as many words (cli/monitor.cpp: "a filename is the one place a quote
+    // is not decoration but the only way to write a path with a space in it").
+    //
+    // Which meant that until the escape below existed, THE ONE THING `startup` IS FOR
+    // could not be written. Every `"` toggled the string, escape or not, so
+    //
+    //     startup = ["MOUNT acr0:tape \"tests/media/basic/4K BASIC Ver 3-1.tap\""]
+    //
+    // parsed as `MOUNT acr0:tape \` and the machine booted with an empty recorder -- no
+    // error, just a tape that was never in the drive. docs/config.md's promise ("anything
+    // you can type, a config can do") was false for every artifact we ship.
+    const char* kQuoted = R"(
+[machine]
+name    = "quoted"
+startup = [
+  "MOUNT acr0:tape \"tests/media/basic/4K BASIC Ver 3-1.tap\"",
+  "LOAD \"tests/media/basic/LDR4K31.HEX\"",
+  "RUN 0",
+]
+)";
+
+    Machine     mq;
+    std::string eq;
+    CHECK(loadTomlText(kQuoted, "quoted", mq, eq), "a startup entry parses with escaped quotes");
+    CHECK(mq.startup.size() == 3, "...all three of them, and the escape does not split one in two");
+    if (mq.startup.size() == 3) {
+        CHECK(mq.startup[0] == "MOUNT acr0:tape \"tests/media/basic/4K BASIC Ver 3-1.tap\"",
+              "...and the QUOTES REACH THE MONITOR, which is the whole point: without them "
+              "the tokenizer sees three arguments and the path dies at the first space");
+        CHECK(mq.startup[2] == "RUN 0", "...and an entry with no escape in it is untouched");
+    }
+
+    // The round trip, which is where this broke the SAME way CONFIG SAVE broke on units:
+    // the writer emitted the quotes raw, so the file it produced closed the TOML string
+    // early and would not load back.
+    std::string qtext = saveTomlText(mq);
+    Machine     qback;
+    std::string eq2;
+    CHECK(loadTomlText(qtext, "quoted (saved)", qback, eq2),
+          "...and CONFIG SAVE's own output loads back in -- the writer escapes what the "
+          "reader unescapes, or it is not a round trip");
+    CHECK(qback.startup == mq.startup, "...with every command byte-identical");
+
+    // AN UNKNOWN ESCAPE IS AN ERROR, NOT A SHRUG. `\n` and `\t` mean nothing to a monitor
+    // command, and silently dropping the backslash would turn a Windows path written with
+    // single separators into a shorter, wrong path that fails somewhere else entirely.
+    Machine     mbad;
+    std::string ebad;
+    CHECK(!loadTomlText("[machine]\nname = \"x\"\nstartup = [\"LOAD \\nope\"]\n", "bad", mbad, ebad),
+          "an escape this parser does not know is refused");
+    CHECK(ebad.find("\\n") != std::string::npos, "...and the message names the offender");
+
+    SECTION("base = \"default\" -- start from a machine and say what is DIFFERENT");
+
+    // THE MACHINE IS THE HARD PART TO GET RIGHT, AND IT IS THE PART NOBODY WANTS TO
+    // RETYPE. A CP/M config is the default Altair with a floppy in drive 0 -- that is the
+    // whole of it -- and before `base` existed it had to restate five cards to say so.
+    //
+    // This is not a convenience. Hand-copying a backplane is how you end up with a machine
+    // that boots CP/M into a terminal that is not there, because the one card you forgot to
+    // copy was the 2SIO. That happened, to the very files this feature replaced.
+
+    const char* kDelta = R"(
+[machine]
+name = "delta"
+base = "default"
+
+[[board]]
+id = "fd0"
+)";
+    Machine     md2;
+    std::string ed;
+    CHECK(loadTomlText(kDelta, "delta", md2, ed), "a delta on the default machine loads");
+    CHECK(md2.name == "delta", "...and `name` beats the base's, whatever order the keys are in");
+    CHECK(md2.boards().size() == 5, "...with every card the base brought still in the backplane");
+    CHECK(md2.find("if1") != nullptr, "...including the console you did not have to remember");
+
+    // `id` WITH NO `type` IS "THE ONE ALREADY IN THE MACHINE". It must not fit a second
+    // card, and it must not silently do nothing.
+    Board* dsk = md2.find("fd0");
+    CHECK(dsk != nullptr && dsk->type() == "disk1", "an [[board]] with no `type` found the base's card");
+
+    // ...and it is an ERROR when there is nothing to find, rather than a quiet no-op --
+    // which is the difference between a typo you fix now and a machine that is missing a
+    // card you will look for later.
+    Machine     mno;
+    std::string eno;
+    CHECK(!loadTomlText("[machine]\nname = \"x\"\nbase = \"default\"\n\n[[board]]\nid = \"nope0\"\n",
+                        "x", mno, eno),
+          "...and an id that is in no base is refused, not ignored");
+
+    // TYPE + AN ID THE BASE BROUGHT = REPLACE THE CARD OUTRIGHT. This is what makes a
+    // memory board re-fittable: regions are a LIST, so appending a 24K region to a 56K
+    // board would OVERLAP it, not replace it. Naming the type says "this is the whole
+    // card now".
+    const char* kReplace = R"(
+[machine]
+name = "small"
+base = "default"
+
+[[board]]
+type = "memory"
+id   = "mem0"
+
+  [[board.region]]
+  type = "ram"
+  at   = 0000
+  size = "24K"
+)";
+    Machine     ms;
+    std::string es;
+    CHECK(loadTomlText(kReplace, "small", ms, es), "re-fitting a card the base brought loads");
+    CHECK(ms.boards().size() == 5, "...and REPLACES it -- there is not a second memory board");
+    ms.bus.memWrite(0x5FFF, 0x42);
+    CHECK(ms.bus.memRead(0x5FFF) == 0x42, "5FFF is the top of the new 24K");
+    (void)ms.bus.memRead(0x6000);
+    CHECK(ms.bus.lastUnclaimed(),
+          "...and 6000 is EMPTY: the base's 64K region is gone, not overlapped by the new "
+          "one. Two boards both answering 0000-5FFF is bus contention, and it is exactly "
+          "what appending would have built");
+    CHECK(ms.bus.lastUnclaimed(),
+          "...and the DBL PROM went with the card it was on. Replace means replace: if you "
+          "want the ROM back, re-state it");
+
+    // REMOVE takes a card out of the slot.
+    const char* kRemove = R"(
+[machine]
+name = "nodisk"
+base = "default"
+
+[[board]]
+id     = "fd0"
+remove = true
+)";
+    Machine     mr;
+    std::string er;
+    CHECK(loadTomlText(kRemove, "nodisk", mr, er), "a delta can pull a card out");
+    CHECK(mr.boards().size() == 4, "...and the backplane really is one card lighter");
+    CHECK(mr.find("fd0") == nullptr, "...the floppy controller is gone");
+    (void)mr.bus.ioRead(0xC0);
+    CHECK(mr.bus.lastUnclaimed(), "...and nobody answers port C0 any more -- it FLOATS, as an "
+                                  "empty slot does");
+
+    // A DUPLICATE ID WITHIN ONE FILE IS STILL AN ERROR, and this is the check REPLACE was
+    // deliberately scoped around. A second [[board]] with a copy-pasted id is a typo; the
+    // same thing against a BASE is intent. Conflating them would have thrown away the one
+    // diagnostic that catches the commonest mistake in a hand-written machine file.
+    Machine     mdup;
+    std::string edup;
+    CHECK(!loadTomlText("[machine]\nname = \"d\"\n\n[[board]]\ntype = \"memory\"\nid = \"mem0\"\n"
+                        "\n[[board]]\ntype = \"memory\"\nid = \"mem0\"\n",
+                        "dup", mdup, edup),
+          "two [[board]] tables with one id, in one file, is still refused");
+
+    // `remove` and `type` contradict each other, and saying both is not a preference.
+    Machine     mc;
+    std::string ec;
+    CHECK(!loadTomlText("[machine]\nname = \"c\"\nbase = \"default\"\n\n[[board]]\ntype = \"disk1\"\n"
+                        "id = \"fd0\"\nremove = true\n",
+                        "c", mc, ec),
+          "`remove` and `type` together are refused -- one takes the card out, the other "
+          "fits a new one");
+
+    // A BASE THAT DOES NOT EXIST IS AN ERROR, not an empty machine.
+    Machine     mb;
+    std::string eb;
+    CHECK(!loadTomlText("[machine]\nname = \"x\"\nbase = \"imsai\"\n", "x", mb, eb),
+          "a base we have no machine for is refused");
+
+    // AND A SAVED DELTA IS A MACHINE, NOT A DELTA. CONFIG SAVE writes the backplane it can
+    // see -- every card, base or not -- so the saved file has no `base` key and stands on
+    // its own. That is the only honest thing it can do: the base may be a FILE, and a file
+    // can change under you.
+    std::string dtext = saveTomlText(md2);
+    CHECK(dtext.find("base") == std::string::npos, "a saved machine does not refer to a base");
+    Machine     dback;
+    std::string ed2;
+    CHECK(loadTomlText(dtext, "delta (saved)", dback, ed2), "...and it loads on its own");
+    CHECK(dback.boards().size() == md2.boards().size(), "...with all five cards written out");
+
+    SECTION("CONFIG SAVE marks a value that is the default (#699)");
+        // A reader cannot tell a default from a setting someone chose, so a key that equals
+        // what a NEW board of the type starts with ends in `# default <release>`. The release
+        // is named because the file outlives the binary and a default can change.
+        const std::string mark = std::string("  # default ") + versionNumber();
+        Machine     mk;
+        std::string ek;
+        CHECK(loadTomlText("[machine]\nname = \"k\"\n\n[[board]]\ntype = \"disk1\"\nid = \"fd0\"\n"
+                           "routine = 5\n",
+                           "k", mk, ek),
+              "a Disk 1 with one changed setting loads");
+        const std::string ktext = saveTomlText(mk);
+        CHECK(ktext.find("boot = true" + mark + "\n") != std::string::npos,
+              "a key left at its default carries the mark, with the release");
+        CHECK(ktext.find("routine = 5\n") != std::string::npos,
+              "...and a key that was changed does not");
+        CHECK(ktext.find("type = \"disk1\"" + mark) == std::string::npos &&
+                  ktext.find("id   = \"fd0\"" + mark) == std::string::npos,
+              "...and type and id are never marked");
+
+        Machine     kback;
+        std::string ek2;
+        CHECK(loadTomlText(ktext, "k (saved)", kback, ek2),
+              "the marked file loads: the loader drops the comment");
+        CHECK(saveTomlText(kback) == ktext, "...and saving it again is byte-identical");
+
+        // Every type must build with no arguments, or its keys are silently never marked.
+        for (const auto& bt : boardTypes())
+            CHECK(makeBoard(bt.name) != nullptr,
+                  ("makeBoard builds '" + bt.name + "', so CONFIG SAVE can mark its defaults").c_str());
+
+    SECTION("CONFIG SAVE writes [display], and it loads back (#862)");
+    {
+        // [display] is the host's window, not a board, so the walk over the boards never
+        // reached it. A machine file that set `focus = true` lost it on a save and a load.
+        const bool focus0 = Display::focusPolicy(), kb0 = Display::keyboardToConsole(),
+                   crt0 = Display::crt();
+
+        // Load first: a load resets these settings, and it would overwrite what the test sets.
+        Machine     dm;
+        std::string de;
+        const BuiltinMachine* b = findMachine("default");
+        CHECK(b && loadMachine(*b, dm, de), "a machine to save");
+        Display::setFocusPolicy(true);
+        Display::setKeyboardToConsole(false);
+        Display::setCrt(true);
+        const std::string text = saveTomlText(dm);
+        CHECK(text.find("\n[display]\nfocus = true\nkeyboard = \"none\"\ncrt = true\n") !=
+                  std::string::npos,
+              "the save has a [display] section with all three keys");
+
+        // Flip them first: only the file can bring them to the values the save held.
+        Display::setFocusPolicy(false);
+        Display::setKeyboardToConsole(true);
+        Display::setCrt(false);
+        Machine     back;
+        std::string be;
+        CHECK(loadTomlText(text, "d (saved)", back, be), "the saved file loads");
+        CHECK(Display::focusPolicy(), "...focus came back");
+        CHECK(!Display::keyboardToConsole(), "...keyboard came back");
+        CHECK(Display::crt(), "...crt came back");
+        CHECK(saveTomlText(back) == text, "...and saving it again is byte-identical");
+
+        Display::setFocusPolicy(focus0);
+        Display::setKeyboardToConsole(kb0);
+        Display::setCrt(crt0);
+    }
+
+    SECTION("CONFIG SAVE writes the console's transforms, and not the operator's settings (#863)");
+    {
+        // basic4k sets `strip7out = true` in [console]. The save dropped it, and the copy
+        // printed MEMORY SIZ? for MEMORY SIZE?.
+        Console& con = Console::instance();
+        auto set = [&con](const char* name, const Value& v) {
+            for (auto& p : con.properties()) {
+                if (p.name != name) continue;
+                std::string e;
+                return p.set && p.set(v, e);
+            }
+            return false;
+        };
+        auto get = [&con](const char* name) {
+            for (auto& p : con.properties())
+                if (p.name == name) return p.get();
+            return Value::ofBool(false);
+        };
+        const Value strip0 = get("strip7out"), upper0 = get("upper"), bs0 = get("bsdel");
+
+        // Load first: the default machine has a [console] of its own, and it would
+        // overwrite what the test sets.
+        Machine     cm;
+        std::string ce;
+        const BuiltinMachine* b = findMachine("default");
+        CHECK(b && loadMachine(*b, cm, ce), "a machine to save");
+        CHECK(set("strip7out", Value::ofBool(true)) && set("upper", Value::ofBool(true)) &&
+                  set("bsdel", Value::ofStr("del")),
+              "three transforms set");
+        const std::string text  = saveTomlText(cm);
+        const std::string table = savedTable(text, "console");
+        CHECK(!table.empty(), "the save has a [console] table");
+        for (const char* key : {"upper", "strip7in", "strip7out", "crlf", "echo", "bell", "bsdel"})
+            CHECK(table.find(std::string("\n") + key + " = ") != std::string::npos,
+                  (std::string("the save has [console] ") + key).c_str());
+        CHECK(table.find("\nstrip7out = true\n") != std::string::npos &&
+                  table.find("\nbsdel = \"del\"\n") != std::string::npos,
+              "...with the values that were set");
+        for (const char* key : {"log", "history", "stop", "base"})
+            CHECK(table.find(std::string("\n") + key + " = ") == std::string::npos,
+                  (std::string("...and not the operator's ") + key).c_str());
+
+        set("strip7out", Value::ofBool(false));
+        set("upper", Value::ofBool(false));
+        set("bsdel", Value::ofStr("off"));
+        Machine     back;
+        std::string be;
+        CHECK(loadTomlText(text, "c (saved)", back, be), "the saved file loads");
+        CHECK(get("strip7out").b() && get("upper").b() && get("bsdel").s() == "del",
+              "...and the transforms came back");
+        CHECK(saveTomlText(back) == text, "...and saving it again is byte-identical");
+
+        set("strip7out", strip0);
+        set("upper", upper0);
+        set("bsdel", bs0);
+    }
+
+    SECTION("CONFIG SAVE writes [terminal], and it loads back");
+    {
+        // [terminal] is the same kind of table as [console], and the save left it out. A
+        // machine file with `strip7out = true` there lost it on a save and a load. On a
+        // guest that writes parity in bit 7, CR then prints as a glyph.
+        TerminalStream::Settings&      s  = TerminalStream::settings();
+        const TerminalStream::Settings s0 = s;
+
+        Machine     tm;
+        std::string te;
+        const BuiltinMachine* b = findMachine("default");
+        CHECK(b && loadMachine(*b, tm, te), "a machine to save");
+        s.strip7out = true;
+        s.upper     = true;
+        s.bell      = false;
+        s.bsdel     = BsMap::Del;
+        const std::string text  = saveTomlText(tm);
+        const std::string table = savedTable(text, "terminal");
+        CHECK(!table.empty(), "the save has a [terminal] table");
+        for (const char* key : {"upper", "strip7in", "strip7out", "crlf", "echo", "bell", "bsdel"})
+            CHECK(table.find(std::string("\n") + key + " = ") != std::string::npos,
+                  (std::string("the save has [terminal] ") + key).c_str());
+        CHECK(table.find("\nstrip7out = true\n") != std::string::npos &&
+                  table.find("\nbell = false\n") != std::string::npos &&
+                  table.find("\nbsdel = \"del\"\n") != std::string::npos,
+              "...with the values that were set");
+
+        s = TerminalStream::Settings{};
+        Machine     back;
+        std::string be;
+        CHECK(loadTomlText(text, "t (saved)", back, be), "the saved file loads");
+        CHECK(s.strip7out && s.upper && !s.bell && s.bsdel == BsMap::Del,
+              "...and the settings came back");
+        CHECK(saveTomlText(back) == text, "...and saving it again is byte-identical");
+
+        s = s0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SUB-UNIT TABLES HAVE A SCHEMA, AND IT IS THE ONLY ONE.
+//
+// `readonly` was real, it worked, it was in no generated reference, no MCP schema and no
+// SHOW -- because the keys of [[board.drive]] and [[board.region]] were known to nothing
+// but a chain of string compares inside each board. That is a SECOND SCHEMA, and the
+// project's central claim ("a board's properties ARE its TOML keys; no second schema
+// ---------------------------------------------------------------------------
+// A LOAD EITHER HAPPENS OR IT DOES NOT (config/toml.cpp, machine.h replaceWith).
+//
+// A machine file is a MACHINE -- the whole backplane, the thing CONFIG SAVE wrote down
+// -- and not a list of amendments to whatever happens to be running. It used to be the
+// second thing, and it cost two bugs that nothing here could see, because every test in
+// this file loads into a fresh `Machine` and a fresh Machine cannot tell the two apart.
+// These load into a machine that ALREADY HAS CARDS IN IT, which is the case the monitor
+// has and the tests did not.
+// ---------------------------------------------------------------------------
+void test_load_is_atomic() {
+    SECTION("a machine file is a MACHINE: it replaces, and it is all or nothing");
+
+    // A machine with something in it, and something to lose.
+    Machine     live;
+    std::string e;
+    CHECK(loadMachine(*findMachine("default"), live, e), "the default machine loads");
+    CHECK(live.boards().size() == 5, "...and has five cards to lose");
+    const Board* wasMem = live.find("mem0");
+    CHECK(wasMem != nullptr, "...one of which is the memory card");
+
+    // ---- THE FAILED LOAD CHANGES NOTHING ----
+    //
+    // THIS is the bug, and it was the nasty one: the load ran until it hit the bad
+    // card, and everything it had already fitted stayed. The command REPORTED AN ERROR
+    // AND CHANGED YOUR MACHINE ANYWAY -- leaving a backplane that was neither the one
+    // you had nor the one you asked for, which is the worst of the three outcomes.
+    // `sioGOOD` comes FIRST on purpose: a file that fails on its first line proves
+    // nothing, because there was never anything to leave behind.
+    const char* kHalfBad = R"(
+[machine]
+name = "halfbad"
+
+[[board]]
+type = "2sio"
+id   = "sioGOOD"
+port = 0x20
+
+[[board]]
+type = "nosuchcard"
+id   = "bad"
+)";
+    std::string why;
+    CHECK(!loadTomlText(kHalfBad, "halfbad", live, why), "a file naming a card that does "
+                                                         "not exist is refused");
+    CHECK(live.boards().size() == 5, "...and the machine still has its five cards");
+    CHECK(live.find("sioGOOD") == nullptr, "...WITHOUT the card the bad file had already "
+                                           "fitted before it died -- the load left nothing "
+                                           "behind");
+    CHECK(live.name == "default", "...and it is still the machine it was, by name");
+    CHECK(live.find("mem0") == wasMem, "...and the cards are the SAME cards, not rebuilt "
+                                       "ones: nothing was torn down and put back");
+
+    // ---- THE ROUND TRIP THE MANUAL PROMISES (docs/manual/configuring.md) ----
+    //
+    // `CONFIG SAVE mine.toml` then `CONFIG LOAD mine.toml` is a worked example we ship,
+    // under the words "it round-trips: load what it wrote and you get the machine back".
+    // It did not. Loading MERGED into the live backplane, so the file CONFIG SAVE had
+    // just written died on the first card it named: `a board with id 'fp0' already
+    // exists`. The round-trip test above this one passed throughout, because it loads
+    // into a fresh Machine -- so the promise was tested on the one road nobody takes.
+    std::string saved = saveTomlText(live);
+    CHECK(loadTomlText(saved, "mine.toml", live, why),
+          "the machine's own CONFIG SAVE output loads back into the RUNNING machine -- "
+          "the round trip the manual sells");
+    CHECK(live.boards().size() == 5, "...and it is still five cards, not ten");
+    CHECK(saveTomlText(live) == saved, "...and it is the same machine: save it again and "
+                                       "the text is identical");
+
+    // ---- `base` NOW WORKS HERE AT ALL ----
+    //
+    // Not a bonus -- a thing that was DEAD. `base` refuses to run once the machine has
+    // boards in it (it is what the boards are a change TO), so under the old merge every
+    // file with a `base` was unloadable at the prompt, and said so with an error about
+    // key order that had nothing to do with what was wrong.
+    const char* kDerived = R"(
+[machine]
+name = "derived"
+base = "default"
+
+[[board]]
+id   = "mem0"
+fill = "zero"
+)";
+    CHECK(loadTomlText(kDerived, "derived", live, why),
+          "a file with a `base` loads into a machine that already has cards");
+    CHECK(live.name == "derived", "...and it is the derived machine now");
+    CHECK(live.boards().size() == 5, "...with the base's cards, once each");
+
+    // ---- THE HOST SETTINGS FOLLOW THE SAME RULE (#864) ----
+    //
+    // They are not on the scratch machine: they are process-wide, so the loader wrote them
+    // as it read the file. A failed load changed them, and a file that did not name a key
+    // kept the last machine's value. Every check here starts from CHANGED settings, because
+    // a process that has its defaults cannot show either bug.
+    SECTION("a load gives the same host settings at the monitor as at startup (#864)");
+    const HostSettings before = saveHostSettings();
+    Console&           con    = Console::instance();
+    auto conSet = [&con](const char* key, const char* value) {
+        std::string err;
+        return setPropertyIn(con.properties(), "console", key, value, err);
+    };
+    auto conGet = [&con](const char* key) { return storedText(con.properties(), key, "?"); };
+    auto dump   = [&con] {
+        std::string text;
+        for (const auto& list : {con.properties(), Display::properties(), TerminalStream::properties()})
+            for (const Property& p : list)
+                if (p.get) text += p.name + "=" + p.get().text(p.radix) + "\n";
+        return text;
+    };
+    auto changeAll = [&] {
+        Display::setFocusPolicy(false);
+        Display::setKeyboardToConsole(false);
+        Display::setCrt(true);
+        TerminalStream::settings().strip7in = true;
+        return conSet("upper", "true") && conSet("crlf", "true") && conSet("bsdel", "bs") &&
+               conSet("stop", "2") && conSet("base", "octal") && conSet("history", "33");
+    };
+    const std::string logA = (std::filesystem::temp_directory_path() / "altair-864-a.log").string();
+    const std::string logB = (std::filesystem::temp_directory_path() / "altair-864-b.log").string();
+    std::filesystem::remove(logA);
+    std::filesystem::remove(logB);
+
+    CHECK(changeAll() && conSet("log", logA.c_str()), "the settings to protect are set");
+    const std::string changed = dump();
+    const std::string kBadHost = R"(
+[machine]
+name = "badhost"
+[console]
+strip7out = true
+upper = false
+stop = 3
+base = "hex"
+history = 7
+log = ")" + logB + R"("
+[display]
+focus = true
+keyboard = "console"
+crt = false
+[terminal]
+strip7out = true
+bell = false
+[[board]]
+type = "nosuchcard"
+id   = "bad"
+)";
+    CHECK(!loadTomlText(kBadHost, "badhost", live, why), "a bad file is refused");
+    CHECK(dump() == changed, "...and it changed no host setting in any of the three tables");
+    CHECK(conGet("log") == logA, "...and the log is the one that was open");
+
+    CHECK(loadTomlText("[machine]\nname = \"plain\"\n", "plain", live, why), "a plain file loads");
+    CHECK(conGet("upper") == "false" && conGet("crlf") == "false" && conGet("bsdel") == "off",
+          "a [console] key that the file does not name is at its default");
+    CHECK(!Display::focusPolicy() && Display::keyboardToConsole() && !Display::crt(),
+          "...and a [display] key");
+    CHECK(!TerminalStream::settings().strip7in, "...and a [terminal] key");
+    CHECK(conGet("base") == "octal" && conGet("history") == "33" && conGet("log") == logA &&
+              con.attn() == 2,
+          "...and stop, base, history and log are the operator's: they stay");
+
+    // The reset happens once, at the outermost file, so a `base` is not reset by the file
+    // on top of it. default says bsdel = "bs"; changeAll sets bs too, so make it del first
+    // and only the base can bring back bs.
+    CHECK(changeAll() && conSet("bsdel", "del"), "the settings are changed again");
+    CHECK(loadTomlText("[machine]\nname = \"b\"\nbase = \"default\"\n[console]\nbell = false\n",
+                       "b", live, why),
+          "a file with a base loads");
+    CHECK(conGet("bsdel") == "bs", "the base's key applies");
+    CHECK(conGet("bell") == "false", "...and so does the file's");
+    CHECK(conGet("upper") == "false", "...and a key that neither one names is at its default");
+    CHECK(loadTomlText("[machine]\nname = \"c\"\nbase = \"default\"\n[console]\nbsdel = \"off\"\n",
+                       "c", live, why) &&
+              conGet("bsdel") == "off",
+          "the file's key wins over the base's");
+
+    const std::string round = saveTomlText(live);
+    CHECK(changeAll(), "the settings are changed once more");
+    CHECK(loadTomlText(round, "round", live, why), "the save loads back");
+    CHECK(saveTomlText(live) == round, "...and the transforms in it replace the changed ones");
+
+    conSet("log", "off");
+    restoreHostSettings(before);
+    std::filesystem::remove(logA);
+    std::filesystem::remove(logB);
+}
+
+// ---------------------------------------------------------------------------
+// A MOVED CARD BRINGS ITS CRYSTAL WITH IT (issue #34).
+// ---------------------------------------------------------------------------
+// The scratch machine above is what makes a load all-or-nothing, and it cost this:
+// `clock_hz = 2000000` in a machine file set the property on the CPU card, the card
+// announced it to the SCRATCH machine's Clock, and replaceWith then moved the card onto
+// the real backplane -- whose Clock had never heard of it. `SHOW cpu0` read 2000000 off
+// the card, the run loop free-ran, and every word of both was true.
+//
+// IT SURVIVED BECAUSE EVERY TEST SET THE CRYSTAL AT THE MONITOR. `SET cpu0 clock_hz=...`
+// runs on a card that is already on the real backplane, so it was never the broken path
+// -- and neither was `CONFIG LOAD`, which powers the machine again afterwards and
+// republished by luck. The one road nothing drove was the one every operator takes:
+// put it in the file, start the simulator. So this test loads it FROM A FILE and asks
+// the CLOCK, not the card.
+void test_clock_survives_load() {
+    SECTION("clock_hz in a machine file reaches the CLOCK, not just the card (#34)");
+
+    const char* kPaced = R"(
+[machine]
+name = "paced"
+base = "default"
+
+[[board]]
+id       = "cpu0"
+clock_hz = 2000000
+idle     = false
+)";
+    Machine     m;
+    std::string err;
+    CHECK(loadTomlText(kPaced, "paced", m, err), "a machine file with a crystal loads");
+
+    // THE CARD. This half was never broken, and on its own it is exactly the reassuring
+    // half-truth that hid the bug for a day.
+    Board* cpu = m.find("cpu0");
+    CHECK(cpu != nullptr, "the CPU card is in the backplane");
+
+    // THE CLOCK. This is the half the run loop actually reads.
+    CHECK(!m.clock.free(), "the run loop PACES: a crystal in the file is a crystal in the clock");
+    CHECK(m.clock.hz() == 2000000, "...at the rate the file asked for");
+    CHECK(!m.clock.idle(), "and `idle` rides the same wire -- it was lost the same way");
+
+    // AND THE DEFAULT IS STILL FLAT OUT. The fix republishes on every attach, so the
+    // card that says nothing must go on saying nothing (clock.h: 0 is free-running, and
+    // it is the default).
+    Machine     f;
+    std::string e2;
+    CHECK(loadTomlText("[machine]\nname = \"flat\"\nbase = \"default\"\n", "flat", f, e2),
+          "a machine file with no crystal loads");
+    CHECK(f.clock.free(), "...and runs flat out, which is the default and stays the default");
+}
+
+// anywhere") was false for the most user-facing TOML in the program: the keys that carry
+// the disk, the ROM and the write-protect flag.
+//
+// So: the keys are DECLARED (Board::subUnitProperties), the declaration is ENFORCED
+// (Board::loadSubUnit, the one door), and these are the tests that keep it that way.
+// ---------------------------------------------------------------------------
+void test_subunit_schema() {
+    SECTION("sub-unit tables: the keys are declared, and the declaration is the schema");
+
+    // THE GENERIC ONE, AND THE ONLY ONE THAT PROTECTS A BOARD THAT DOES NOT EXIST YET.
+    // A card that announces a table and declares no keys for it is the old bug, exactly:
+    // it will load a machine file, refuse nothing, and document nothing. There is no way
+    // to write that card and have this pass.
+    for (const auto& t : boardTypes()) {
+        auto b = makeBoard(t.name);
+        for (const auto& table : b->subUnitTables()) {
+            auto schema = b->subUnitProperties(table);
+            // The message names the card, because a failure here is about ONE card and
+            // the loop is over all of them.
+            std::string why = "every [[board." + table + "]] on a " + t.name +
+                              " declares its keys -- a table with no schema documents "
+                              "nothing and validates nothing";
+            CHECK(!schema.empty(), why.c_str());
+            for (const auto& p : schema)
+                CHECK(!p.name.empty() && !p.help.empty(),
+                      "...and every key has a name and a line of help, because a generated "
+                      "reference prints both");
+        }
+    }
+
+    auto        b = makeBoard("disk1");  // pascal100: the 88-DCDD is gone; the Disk 1 has the same table
+    std::string err;
+
+    // THE KEYS ARE THE ONES THE MACHINE FILES ACTUALLY USE.
+    auto drive = b->subUnitProperties("drive");
+    bool haveRo = false, haveMedia = false;
+    for (const auto& p : drive) {
+        if (p.name == "readonly") {
+            haveRo = true;
+            CHECK(p.kind == Kind::Bool, "`readonly` is a bool, and now something knows it");
+        }
+        if (p.name == "media") {
+            haveMedia = true;
+            CHECK(p.kind == Kind::Enum && p.choices.size() == 10,
+                  "`media` is an enum, and its choices come from the CARD'S OWN format table");
+        }
+    }
+    CHECK(haveRo, "the write-protect flag is DECLARED -- this is the bug, in one check");
+    CHECK(haveMedia, "and so is `media`");
+
+    // ...AND THE MEDIA A DIFFERENT CARD OFFERS IS DIFFERENT, off one line of code. A
+    // hand-written enum would have had to be copied per card, and would have drifted.
+    auto d1a = makeBoard("disk1a");
+    auto mp  = d1a->subUnitProperties("drive");
+    for (const auto& p : mp)
+        if (p.name == "media")
+            CHECK(p.choices.size() > 10 &&
+                      std::find(p.choices.begin(), p.choices.end(), "5ss") != p.choices.end(),
+                  "a Disk 1A also offers the 5.25-inch media -- same line, different table");
+
+    // ENFORCED, AND AT THE ONE DOOR. Each of these used to be a hand-written check in a
+    // board (or, for two of them, no check at all).
+    CHECK(!b->loadSubUnit("drive", {{"unit", "0"}, {"readonly", "maybe"}}, err),
+          "`readonly = maybe` is refused -- the kind is declared, so the parser knows");
+    CHECK(!b->loadSubUnit("drive", {{"unit", "99"}, {"mount", "x.dsk"}}, err),
+          "a unit outside 0..drives-1 is refused -- the range is declared");
+    CHECK(!b->loadSubUnit("drive", {{"unit", "0"}, {"readnoly", "true"}}, err),
+          "a MISSPELLED key is refused rather than silently ignored");
+    CHECK(err.find("readonly") != std::string::npos,
+          "...and the refusal LISTS THE KEYS IT DOES TAKE, which is most of the cure: "
+          "`readonly` existed all along and could not be found");
+    CHECK(!b->loadSubUnit("region", {{"type", "ram"}}, err),
+          "a table this card does not have is refused by the same door");
+
+    // THE MEMORY CARD, THE OTHER HALF OF THE SECOND SCHEMA.
+    auto m = makeBoard("memory");
+    CHECK(!m->loadSubUnit("region", {{"type", "eprom"}, {"at", "0"}}, err),
+          "`type = eprom` is refused -- ram|rom is a declared enum now, not an if-chain");
+    CHECK(!m->loadSubUnit("region", {{"type", "ram"}, {"at", "0"}, {"sise", "48K"}}, err),
+          "and a misspelled `size` is refused, not ignored");
+    CHECK(m->loadSubUnit("region", {{"type", "ram"}, {"at", "0000"}, {"size", "48K"}}, err),
+          "...while the real thing still loads: `at` is hex and `size` takes a K, off the "
+          "property's own radix");
+
+    // ---- `writeprotect`: the operator's word for `readonly`, accepted in a file ----
+    //
+    // The vocabulary had drifted: everything a person reads says WRITE-PROTECTED (the CLI,
+    // SHOW MOUNTS, the manual, the notch on the diskette) and the machine file said
+    // `readonly`. Both spellings work now -- and the point of doing it in the SCHEMA rather
+    // than as one more string compare in the board is everything below: the same validator,
+    // the same error, one canonical name written back, and no board code at all.
+    bool declared = false;
+    for (const auto& p : drive)
+        if (p.name == "readonly")
+            for (const auto& a : p.aliases)
+                if (a == "writeprotect") declared = true;
+    CHECK(declared, "`writeprotect` is DECLARED as another spelling of `readonly` -- so the "
+                    "reference, the MCP schema and SHOW all say so without being told");
+
+    CHECK(b->loadSubUnit("drive", {{"unit", "0"}, {"writeprotect", "true"}}, err),
+          "and a [[board.drive]] may say `writeprotect`");
+    CHECK(b->loadSubUnit("drive", {{"unit", "1"}, {"WriteProtect", "true"}}, err),
+          "...in any case, like every other key");
+    CHECK(b->loadSubUnit("drive", {{"unit", "2"}, {"readonly", "true"}}, err),
+          "...and `readonly` still loads, which is the one thing this may not break: it is "
+          "in every machine file that already exists");
+
+    CHECK(!b->loadSubUnit("drive", {{"unit", "0"}, {"writeprotect", "maybe"}}, err),
+          "an alias goes through the SAME validator -- there is no second, laxer door");
+
+    // TWO SPELLINGS OF ONE KEY IN ONE TABLE. TOML refuses a repeated key, so this is the
+    // only way to write the same drive setting twice, and either answer would be the file
+    // saying two things while one of them silently happened.
+    CHECK(!b->loadSubUnit("drive", {{"unit", "0"}, {"readonly", "true"}, {"writeprotect", "false"}},
+                          err),
+          "`readonly` beside `writeprotect` is refused rather than guessed at");
+    CHECK(err.find("writeprotect") != std::string::npos && err.find("readonly") != std::string::npos,
+          "...and the refusal names both, because the reader has to know which two words "
+          "collided");
+
+    // THE OTHER ORDER, AND IT IS NOT THE SAME TEST. The alias is canonicalised as it is
+    // read, so with `writeprotect` FIRST the collision is found against a key that has
+    // already been renamed -- and the message said "`readonly` as well as `readonly`",
+    // sending the reader to look for a duplicate that was not in their file.
+    CHECK(!b->loadSubUnit("drive", {{"unit", "0"}, {"writeprotect", "false"}, {"readonly", "true"}},
+                          err),
+          "...whichever spelling comes first");
+    CHECK(err.find("writeprotect") != std::string::npos && err.find("readonly") != std::string::npos,
+          "...and it still quotes BOTH of the reader's own words, not the canonical one twice");
+
+    // ---- THE LINE IN THE ERROR IS THE KEY'S, NOT THE TABLE'S ----
+    //
+    // TOML puts a bare key in the last table opened, so a stray key can be a long way
+    // below its header. Two machine files pasted together did exactly that: the second
+    // file's `name` landed in the first file's [[board.drive]], and the error named the
+    // header's line, which was correct TOML and told the reader nothing.
+    //
+    //   line 4  [[board]]
+    //   line 7  [[board.drive]]
+    //   line 8  unit
+    //   line 12 the key under test
+    auto drive0 = [](const std::string& key) {
+        return "[machine]\nname = \"x\"\nbase = \"default\"\n[[board]]\nid = \"fd0\"\n\n"
+               "[[board.drive]]\nunit = 0\n\n# a long way down\n\n" + key + "\n";
+    };
+    {
+        Machine     mk;
+        std::string ek;
+        CHECK(!loadTomlText(drive0("name = \"stray\""), "t.toml", mk, ek),
+              "a key the drive table does not take is refused");
+        CHECK(ek.find("t.toml: line 12: ") == 0,
+              "...and the error gives the line of the KEY, which is where the mistake is");
+        CHECK(ek.find("; this key is in the [[board.drive]] table that starts at line 7") !=
+                  std::string::npos,
+              "...and says which table the key landed in, because a key that was never "
+              "meant for a drive makes no sense without that");
+    }
+    {
+        Machine     mk;
+        std::string ek;
+        CHECK(!loadTomlText(drive0("media = \"minidisk\""), "t.toml", mk, ek),
+              "a value the key does not take is refused");
+        CHECK(ek.find("t.toml: line 12: ") == 0, "...at the line of that key too");
+    }
+    {
+        // NOT ABOUT ONE KEY: the table has no `unit`, so there is no key to point at and
+        // the header is the right place to send the reader.
+        Machine     mk;
+        std::string ek;
+        CHECK(!loadTomlText("[machine]\nname = \"x\"\nbase = \"default\"\n[[board]]\nid = \"fd0\"\n\n"
+                            "[[board.drive]]\n\n\nmount = \"x.dsk\"\n",
+                            "t.toml", mk, ek),
+              "a drive table with no `unit` is refused");
+        CHECK(ek.find("t.toml: line 7: ") == 0,
+              "...at the line of the TABLE, because no one key is wrong");
+        CHECK(ek.find("this key is in") == std::string::npos,
+              "...and with no key to place, it does not say where one is");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `#>` NOTES ARE THE AUTHOR SPEAKING TO THE OPERATOR (config/toml.cpp, stripComment).
+//
+// An ordinary `#` comment is dropped, as it always was. A `#>` comment is captured and
+// handed back so the load command can echo it -- boot instructions, "type DIR at A>",
+// "disk B is blank". It is still a comment: it configures nothing and CONFIG SAVE does
+// not write it back. These pin the capture rules that the display sites depend on.
+// ---------------------------------------------------------------------------
+void test_toml_notes() {
+    SECTION("`#>` comment lines are captured for the operator, ordinary `#` are not");
+
+    const char* kNoted =
+        "# this is an ordinary comment and is DROPPED\n"
+        "#> Boots CP/M 2.2 from drive A.\n"
+        "#> Type DIR at the A> prompt.\n"
+        "#>\n"
+        "#> Disk B is blank and formatted.\n"
+        "[machine]\n"
+        "name = \"noted\"\n"
+        "base = \"default\"\n";
+
+    Machine                  m;
+    std::string              err;
+    std::vector<std::string> notes;
+    CHECK(loadTomlText(kNoted, "noted", m, err, &notes), "a file with `#>` notes loads");
+    CHECK(notes.size() == 4, "...and every `#>` line is captured, in order");
+    CHECK(notes[0] == "Boots CP/M 2.2 from drive A.", "...the single leading space is eaten");
+    CHECK(notes[1] == "Type DIR at the A> prompt.", "...the second line is next, in order");
+    CHECK(notes[2] == "", "...a bare `#>` is a blank line, not a dropped one");
+    CHECK(notes[3] == "Disk B is blank and formatted.", "...and the last line is last");
+
+    // The `#` inside a QUOTED value is not a comment at all, so it is neither stripped
+    // from the value nor mistaken for a note.
+    const char* kHashInPath =
+        "#> a real note\n"
+        "[machine]\n"
+        "name = \"hash\"\n"
+        "base = \"default\"\n"
+        "startup = [\"MOUNT fd0:disk \\\"a#b.dsk\\\"\"]\n";
+    Machine                  mh;
+    std::string              eh;
+    std::vector<std::string> hnotes;
+    CHECK(loadTomlText(kHashInPath, "hash", mh, eh, &hnotes), "a `#` inside a quoted path loads");
+    CHECK(hnotes.size() == 1 && hnotes[0] == "a real note",
+          "...the `#` in the path is NOT captured as a note");
+    CHECK(mh.startup.size() == 1 && mh.startup[0].find("a#b.dsk") != std::string::npos,
+          "...and the `#` survives IN the value, uncut");
+
+    // A trailing `#> note` after real code keeps the code and still captures the note.
+    const char* kTrailing =
+        "[machine]\n"
+        "name = \"trail\"  #> named after nothing in particular\n"
+        "base = \"default\"\n";
+    Machine                  mt;
+    std::string              et;
+    std::vector<std::string> tnotes;
+    CHECK(loadTomlText(kTrailing, "trail", mt, et, &tnotes), "a trailing `#>` on a key line loads");
+    CHECK(mt.name == "trail", "...the key's value is intact, the comment did not bleed in");
+    CHECK(tnotes.size() == 1 && tnotes[0] == "named after nothing in particular",
+          "...and the trailing note is captured");
+
+    // A `base` machine's OWN notes do not surface: notes belong to the file the operator
+    // loaded, not to everything it inherits. `default` has no `#>` of its own, so a file
+    // that inherits it and adds none of its own comes back with an empty list.
+    Machine                  mb;
+    std::string              eb;
+    std::vector<std::string> bnotes;
+    CHECK(loadTomlText("[machine]\nname = \"quiet\"\nbase = \"default\"\n", "quiet", mb, eb, &bnotes),
+          "a file that inherits and writes no notes of its own loads");
+    CHECK(bnotes.empty(), "...and surfaces no notes, its own or its base's");
+
+    // Notes are display-only: CONFIG SAVE regenerates the machine and writes no `#>`, so
+    // the round trip carries none -- exactly as it carries no ordinary comment.
+    std::string saved = saveTomlText(m);
+    CHECK(saved.find("#>") == std::string::npos, "CONFIG SAVE does not write `#>` notes back");
+    Machine                  reload;
+    std::string              er2;
+    std::vector<std::string> rnotes;
+    CHECK(loadTomlText(saved, "noted (saved)", reload, er2, &rnotes), "...and the saved file reloads");
+    CHECK(rnotes.empty(), "...with no notes, because none were written");
+}
+
+// ---------------------------------------------------------------------------
+// A machine-file error says WHICH LINE, and a table written twice is refused as that --
+// not as whatever the second copy happened to trip over.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The load must FAIL, and the message must hold every one of `wants`.
+bool refusedWith(const std::string& text, std::initializer_list<const char*> wants,
+                 std::string* shown = nullptr) {
+    Machine     m;
+    std::string err;
+    bool        ok = loadTomlText(text, "t.toml", m, err);
+    if (shown) *shown = err;
+    if (ok) return false;
+    for (const char* w : wants)
+        if (err.find(w) == std::string::npos) return false;
+    return true;
+}
+
+} // namespace
+
+void test_toml_errors() {
+    SECTION("a table written twice is refused, and both lines are named");
+
+    // Two machine files pasted together, cut down from the file that was reported.
+    CHECK(refusedWith("# a comment\n"              // 1
+                      "[machine]\n"                // 2
+                      "name = \"one\"\n"           // 3
+                      "base = \"default\"\n"       // 4
+                      "\n"                         // 5
+                      "[machine]\n"                // 6
+                      "name = \"one\"\n"
+                      "base = \"default\"\n",
+                      {"t.toml: line 6: [machine] is already at line 2"}),
+          "a second [machine] is named as that, with both lines");
+
+    for (const char* tbl : {"console", "display", "terminal"}) {
+        std::string text = "[machine]\nbase = \"default\"\n[" + std::string(tbl) + "]\n\n[" +
+                           std::string(tbl) + "]\n";
+        std::string want = "line 5: [" + std::string(tbl) + "] is already at line 3";
+        CHECK(refusedWith(text, {want.c_str()}), "...and so is a second host table");
+    }
+
+    CHECK(refusedWith("[machine]\n"
+                      "base = \"default\"\n"
+                      "[[board]]\n"
+                      "id = \"if1\"\n"
+                      "  [board.unit.a]\n"         // 5
+                      "  baud = 9600\n"
+                      "  [board.unit.A]\n"         // 7 -- the same unit, in another case
+                      "  baud = 300\n",
+                      {"line 7: [board.unit.a] is already at line 5"}),
+          "a unit table written twice under one [[board]] is refused");
+
+    {
+        Machine     m;
+        std::string err;
+        CHECK(loadTomlText("[machine]\n"
+                           "base = \"default\"\n"
+                           "[[board]]\n"
+                           "id = \"if1\"\n"
+                           "  [board.unit.a]\n"
+                           "  baud = 9600\n"
+                           "[[board]]\n"
+                           "id = \"if1\"\n"
+                           "  [board.unit.a]\n"
+                           "  baud = 300\n",
+                           "t.toml", m, err),
+              "...but a new [[board]] starts its unit tables over");
+        if (!err.empty()) std::printf("      %s\n", err.c_str());
+
+        // The base has a [console] of its own. A `base` is another file, so this is not twice.
+        Machine m2;
+        err.clear();
+        CHECK(loadTomlText("[machine]\nbase = \"default\"\n[console]\nbsdel = \"bs\"\n", "t.toml",
+                           m2, err),
+              "a file may restate a table its base wrote");
+        if (!err.empty()) std::printf("      %s\n", err.c_str());
+    }
+
+    SECTION("the brackets of a table header are checked: [[board]] is a list, [machine] is not");
+
+    // Issue #678: the header was read by its name only, so this loaded as two boards.
+    CHECK(refusedWith("[machine]\n"
+                      "name = \"t\"\n"
+                      "[board]\n"                  // 3
+                      "type = \"memory\"\n"
+                      "id = \"m0\"\n"
+                      "[board]\n"
+                      "type = \"memory\"\n"
+                      "id = \"m1\"\n",
+                      {"t.toml: line 3: [board] must be [[board]]"}),
+          "[board] written twice is refused, at the first one");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[board]\nid = \"if1\"\n",
+                      {"line 3: [board] must be [[board]]"}),
+          "a single [board] is refused too, and the error gives the form");
+    for (const char* sub : {"drive", "region", "socket"}) {
+        std::string text = "[machine]\nbase = \"default\"\n[[board]]\nid = \"fd0\"\n  [board." +
+                           std::string(sub) + "]\n";
+        std::string want = "line 5: [board." + std::string(sub) + "] must be [[board." +
+                           std::string(sub) + "]]";
+        CHECK(refusedWith(text, {want.c_str()}), "a list a board owns takes double brackets");
+    }
+    for (const char* tbl : {"machine", "console", "display", "terminal"}) {
+        std::string text = "[[" + std::string(tbl) + "]]\n";
+        std::string want = "line 1: [[" + std::string(tbl) + "]] must be [" + std::string(tbl) + "]";
+        CHECK(refusedWith(text, {want.c_str()}), "a table written one time takes single brackets");
+    }
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[[board]]\nid = \"if1\"\n"
+                      "  [[board.unit.a]]\n"
+                      "  baud = 9600\n",
+                      {"line 5: [[board.unit.a]] must be [board.unit.a]"}),
+          "a unit's table takes single brackets");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[widgets]\n[[widgets]]\n",
+                      {"line 3: unknown table [widgets]"}),
+          "a table we do not know is still reported as unknown, in either form");
+
+    SECTION("the loader's own words are exact case; a word wrong only in case is named (#782)");
+
+    const std::string hdr = "[machine]\nbase = \"default\"\n";
+    // A1: a wrong-case boolean used to be ignored, and the board stayed on the bus.
+    for (const char* v : {"TRUE", "True", "\"Yes\"", "\"on\"", "1"})
+        CHECK(refusedWith(hdr + "[[board]]\nid = \"hb0\"\nremove = " + v + "\n",
+                          {"line 5:", "`remove` takes true or false"}),
+              "remove takes the TOML boolean and nothing else");
+    // A2: two spellings of one key were two keys to the duplicate check; the last won.
+    CHECK(refusedWith(hdr + "[[board]]\nid = \"if1\"\nport = 0x20\nPORT = 0x30\n",
+                      {"line 6: 'PORT' is already set at line 5, as 'port'"}),
+          "port and PORT in one board are a repeated key");
+    CHECK(refusedWith(hdr + "[[board]]\nid = \"if1\"\n[board.unit.b]\nbaud = 300\nBAUD = 1200\n",
+                      {"line 7: 'BAUD' is already set at line 6, as 'baud'"}),
+          "...and in a unit table");
+    CHECK(refusedWith(hdr + "[console]\nstop = 3\nSTOP = 4\n",
+                      {"line 5: 'STOP' is already set at line 4, as 'stop'"}),
+          "...and in [console]");
+    // B1, B2: the file HAS the key; the message must not say it is missing.
+    CHECK(refusedWith(hdr + "[[board]]\nType = \"memory\"\nid = \"mem9\"\n",
+                      {"line 4: unknown key `Type`; did you mean `type`?"}),
+          "Type names itself, not a missing type");
+    CHECK(refusedWith(hdr + "[[board]]\nType = \"2sio\"\nid = \"if1\"\n",
+                      {"line 4: unknown key `Type`; did you mean `type`?"}),
+          "...on a base board too");
+    CHECK(refusedWith(hdr + "[[board]]\ntype = \"memory\"\nId = \"mem9\"\n",
+                      {"line 5: unknown key `Id`; did you mean `id`?"}),
+          "Id names itself, not a missing id");
+    CHECK(refusedWith(hdr + "[[board]]\nid = \"hb0\"\nRemove = true\n",
+                      {"line 5: unknown key `Remove`; did you mean `remove`?"}),
+          "Remove names itself");
+    // C1, C2
+    CHECK(refusedWith("[machine]\nName = \"x\"\nbase = \"default\"\n",
+                      {"line 2: unknown [machine] key 'Name'; did you mean 'name'?"}),
+          "a [machine] key in the wrong case is named");
+    CHECK(refusedWith("[Machine]\nbase = \"default\"\n",
+                      {"line 1: unknown table [Machine]; did you mean [machine]?"}),
+          "a table in the wrong case is named");
+    CHECK(refusedWith(hdr + "[[Board]]\nid = \"hb0\"\n",
+                      {"line 3: unknown table [[Board]]; did you mean [[board]]?"}),
+          "...with the brackets as written");
+    CHECK(refusedWith(hdr + "[Console]\n", {"did you mean [console]?"}),
+          "[Console] too");
+    // B5: the fix is lower-case `unit`, NOT double brackets.
+    {
+        std::string shown;
+        CHECK(refusedWith(hdr + "[[board]]\nid = \"if1\"\n[board.Unit.b]\nbaud = 300\n",
+                          {"line 5: unknown table [board.Unit.b]; did you mean [board.unit.b]?"},
+                          &shown),
+              "[board.Unit.b] is named, with the single brackets it needs");
+        CHECK(shown.find("double brackets") == std::string::npos,
+              "...and is not told to add brackets");
+    }
+    // B4: a sub-unit table in the wrong case.
+    CHECK(refusedWith(hdr + "[[board]]\nid = \"fd0\"\n[[board.Drive]]\n",
+                      {"has no [[board.Drive]] table; did you mean [[board.drive]]?"}),
+          "[[board.Drive]] names the table the board has");
+    // B3: an id is case-blind everywhere, REPLACE too.
+    {
+        Machine     m;
+        std::string err;
+        CHECK(loadTomlText(hdr + "[[board]]\ntype = \"2sio\"\nid = \"IF1\"\n", "t.toml", m, err),
+              "replacing a base board by an id in another case loads");
+        if (!err.empty()) std::printf("      %s\n", err.c_str());
+        int n = 0;
+        for (const auto& b : m.boards())
+            if (b->id == "IF1" || b->id == "if1") ++n;
+        CHECK(n == 1, "...and replaces it: one board, not two");
+    }
+    // The exact-case forms still work.
+    {
+        Machine     m;
+        std::string err;
+        CHECK(loadTomlText(hdr + "[[board]]\nid = \"hb0\"\nremove = true\n", "t.toml", m, err),
+              "remove = true still removes");
+        CHECK(!m.find("hb0"), "...the board");
+    }
+
+    SECTION("the syntax checks: a key twice, a key in no table, a header with a tail");
+
+    CHECK(refusedWith("[machine]\n"
+                      "name = \"a\"\n"
+                      "base = \"default\"\n"
+                      "name = \"b\"\n",
+                      {"line 4: 'name' is already set at line 2"}),
+          "a key written twice in one table is refused, with both lines");
+    CHECK(refusedWith("nmae = \"x\"\n[machine]\nbase = \"default\"\n",
+                      {"line 1: 'nmae' is not in a table"}),
+          "a key above the first table is refused, not dropped");
+    CHECK(refusedWith("[machine] name = \"x\"\n",
+                      {"line 1: unexpected text after the table header"}),
+          "text after a table header is refused");
+    CHECK(refusedWith("[machine]\n= 5\n", {"line 2: expected key = value"}),
+          "a line with no key is refused");
+    CHECK(refusedWith("[machine]\n"
+                      "base = \"default\"\n"
+                      "startup = [\"RUN FF00\",\n"
+                      "\n",
+                      {"line 3: unterminated array"}),
+          "a startup list that never closes is refused, at the line it opened");
+
+    SECTION("every loader error carries the line of the key or the table at fault");
+
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n\nwidget = 1\n",
+                      {"t.toml: line 4: unknown [machine] key 'widget'. Valid keys: base bus name startup"}),
+          "an unknown [machine] key");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[[board]]\nid = \"cpu0\"\n\nfrobnicate = 1\n",
+                      {"line 6: [[board]] cpu0:", "frobnicate"}),
+          "an unknown board property");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n\n[widgets]\n",
+                      {"line 4: unknown table [widgets]"}),
+          "an unknown table");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[[board]]\nid = \"fd0\"\n"
+                      "  [[board.drive]]\n"        // 5
+                      "  unit = 0\n"
+                      "  readnoly = true\n",         // 7
+                      {"line 7: fd0:", "readnoly"}),
+          "a bad sub-unit key, at the key and not at the sub-unit's table");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[[board]]\nid = \"if1\"\n"
+                      "  [board.unit.a]\n"
+                      "  buad = 9600\n",
+                      {"line 6: [board.unit.a] on if1:", "buad"}),
+          "a bad unit property");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[console]\nbsdle = \"bs\"\n",
+                      {"line 4: [console]:", "bsdle"}),
+          "a bad [console] key");
+    // Issue #768: the terminal's `cr = cr | crlf` is now the console's `crlf = on | off`.
+    // A file that still says `cr` stops at that line and is told what to write instead.
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[terminal]\ncr = \"crlf\"\n",
+                      {"line 4: [terminal]:", "'cr' is now 'crlf'", "crlf=on"}),
+          "the terminal's old `cr` key, with the new key and value");
+    CHECK(refusedWith("[machine]\nbase = \"default\"\n[[board]]\nid = \"nope\"\n",
+                      {"line 3: [[board]] nope: no board with that id"}),
+          "a MODIFY of a board that is not there, at its [[board]]");
+    CHECK(refusedWith("[machine]\nbase = \"no-such-machine\"\n",
+                      {"line 2: base: no built-in machine"}),
+          "a base that does not exist");
+    CHECK(refusedWith("[[board]]\n"
+                      "type = \"memory\"\n"
+                      "id = \"mem0\"\n"
+                      "[machine]\n"
+                      "base = \"default\"\n",
+                      {"line 5: `base` must come before the first [[board]]"}),
+          "`base` below a [[board]] still gets its own message, now with its line");
+
+    SECTION("a chain of base FILES: one prefix for a loop, one per level for a bad file (#627)");
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "pascal100-base-chain";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    auto put = [&](const char* file, const char* base) {
+        std::ofstream(dir / file) << "[machine]\nname = \"x\"\nbase = \"" << base << "\"\n";
+    };
+    auto loadErr = [&](const char* file) {
+        std::ifstream     f(dir / file);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        Machine     mc;
+        std::string e;
+        CHECK(!loadTomlText(ss.str(), (dir / file).string(), mc, e), "the chain is refused");
+        return e;
+    };
+    auto count = [](const std::string& s, const std::string& what) {
+        int n = 0;
+        for (size_t at = s.find(what); at != std::string::npos; at = s.find(what, at + 1)) ++n;
+        return n;
+    };
+    const std::string tooDeep = ": more than 8 levels deep -- do two files name each other?";
+    auto endsWith = [](const std::string& s, const std::string& tail) {
+        return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+    };
+
+    put("a.toml", "b.toml");
+    put("b.toml", "a.toml");
+    std::string e = loadErr("a.toml");
+    CHECK(endsWith(e, "a.toml: line 3: base = \"b.toml\"" + tooDeep),
+          "two files that name each other: the file that was loaded, its line, its base");
+    CHECK(count(e, "line 3:") == 1, "...and that prefix is there once, not once per level");
+
+    put("p.toml", "q.toml");
+    put("q.toml", "r.toml");
+    put("r.toml", "p.toml");
+    e = loadErr("p.toml");
+    CHECK(endsWith(e, "p.toml: line 3: base = \"q.toml\"" + tooDeep),
+          "a loop of three: the base named is the loaded file's own, not the deepest one");
+    CHECK(count(e, "line 3:") == 1, "...with one prefix");
+
+    put("c.toml", "nope.toml");
+    put("d.toml", "c.toml");
+    e = loadErr("d.toml");
+    CHECK(count(e, "line 3:") == 2 && e.find("c.toml: line 3: base: cannot open") != std::string::npos,
+          "a base that cannot be opened still shows each level on the way to it");
+    fs::remove_all(dir, ec);
+}

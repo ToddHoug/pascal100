@@ -1,0 +1,91 @@
+# UCSD Pascal III.0 on the Digicomp Pascal-100, with its console in a built-in VT52 window.
+#
+#     cd examples/pascal && pascal100 pascal.toml
+#     -> a VT52 window opens and Pascal starts in it: "Welcome WORK, to U.C.S.D. Pascal
+#        System III.0", then the Command: line. The pascal100> prompt stays in the terminal
+#        that you started the program from.
+#
+# THIS FILE IS THE WHOLE MACHINE: the user's Pascal-100 system as it is today (2026-11). The
+# Pascal-100 card (a Z80 and the MicroEngine), an Interfacer 1, a Disk 1 and 128K of RAM.
+#
+# THE BOOT. RUN 0 starts the Disk 1 boot EPROM. It reads track 0 of drive 0, the Z80 loads the
+# Pascal boot and BIOS, and the MicroEngine starts the Pascal system.
+#
+# THE TERMINAL is a VT52 because the disk's screen codes are VT52: the Pascal SETUP program
+# cannot make VT100 codes. It needs a build with SDL and a display; a headless build refuses
+# it. Use pascal-console.toml there.
+#
+# THE DISK is pascal-dd.dsk, a double-density UCSD Pascal III.0 system disk built for this
+# hardware (the One-BIOS disk). It passed on the real Pascal-100 on 2026-11-06. Drive 0 is
+# read/write. Keep a copy of the image if you want to go back to the original.
+#
+# NOT IN THIS MACHINE, as on the real box: no System Support 1 (the BIOS uses no port in 50-5F),
+# and no SSM IO4. The BIOS still has printer code for an IO4 at 04-07, so printer output can
+# hang, as it does on the real box.
+#> UCSD Pascal III.0 on the Pascal-100, in a VT52 window -- the window that just opened.
+#> The monitor stays here. STOP (^E) brings the keyboard back here; RUN continues Pascal.
+#> To finish, type QUIT here. Start the program again to restart Pascal.
+
+[machine]
+name    = "pascal"
+bus     = "ieee696"          # IEEE 696 (S-100); the Pascal-100 Map drives A16
+startup = ["RUN 0"]
+
+[display]
+crt   = true
+focus = true
+
+# THE PASCAL-100 card (docs/boards/digicomp-pascal100.md): a Z80 and the WD MicroEngine. The
+# System Control Port is at D0 and the Map Output Port at D1. After a reset the Z80 has control
+# and the Map is off, so the Z80 boots from the Disk 1 EPROM exactly as CP/M does (manual
+# ch. V B.1).
+[[board]]
+type     = "pascal100"
+id       = "cpu0"
+clock_hz = 0
+
+# THE CONSOLE: channel A of an Interfacer 1 at 00-01, in a VT52 window. `title` names the
+# window, on your title bar and on a grey bar at the top of the screen. Channel B at 02-03 is
+# not connected.
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "terminal?emulation=vt52&size=80x24&width=1100"
+  title   = "UCSD Pascal III.0 console"
+
+# The Backspace key sends DEL; the BIOS wants BS. [console] is stdio, [terminal] is the window.
+[console]
+bsdel = "bs"
+
+[terminal]
+bsdel = "bs"
+
+# THE DISK 1 at C0, boot routine 4: the EPROM reads track 0 of drive 0 by DMA and falls into
+# it. From there the disk's own hard boot (FBOOT) reads SBQB and the Z80 BIOS to 280H.
+[[board]]
+type = "disk1"
+id   = "fd0"
+port = C0
+
+  [[board.drive]]
+  unit  = 0
+  mount = "pascal-dd.dsk"
+
+# THE MEMORY: 128K of static RAM on one board, 000000-01FFFF, as in the real machine (a CompuPro
+# RAM 23). The same machine has also run with two 64K RAM 16 boards: that is two [[board]]
+# tables, each `ext = true` and 64K, one at 000000 and one at 010000. The EPROM shadows
+# 0000-00FF on reads only (honors_phantom).
+[[board]]
+type           = "memory"
+id             = "mem0"
+fill           = "random"
+honors_phantom = "read"
+ext            = true
+sixteen_bit    = true
+
+  [[board.region]]
+  type = "ram"
+  at   = 000000
+  size = "128K"
