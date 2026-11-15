@@ -69,7 +69,10 @@ jobs:
           grep -F -- '-- SDL3 found -- video boards enabled (windowed)' configure.log
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        # Only the program goes in the package. A bare --parallel gives Make no job limit: every
+        # compile starts at once, and the Linux runner killed the build (exit 143) twice on
+        # 2026-11-15. Four jobs, one target.
+        run: cmake --build build --config Release --target pascal100 --parallel 4
 
       - name: Package
         run: tools/build-package.sh --pdf docs/pascal100-manual.pdf --target ${{ matrix.target }} dist-out
