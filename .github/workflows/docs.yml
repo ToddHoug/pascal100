@@ -187,7 +187,7 @@ jobs:
           a rebuild that differed solely by its date/hash stamp was discarded."
 
           # master may have moved while this run built (two merges seconds apart), and a push
-          # from the older commit is then rejected as not a fast-forward (#650). Two cases:
+          # from the older commit is then rejected as not a fast-forward (altairsim #650). Two cases:
           #  - a later push touched the documents: its own run (queued by the docs-pdf group)
           #    rebuilds every PDF from the newer tree, so this run has nothing left to do.
           #  - a later push touched nothing here: no run will follow, so these PDFs must

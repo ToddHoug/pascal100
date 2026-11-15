@@ -28,7 +28,7 @@ name: CI
 # `paths:` filter would.
 #
 # THE MASTER RUN ALSO KEEPS THE COMPILER CACHE WARM. A PR can read only its own cache entries
-# and master's. When master merges skipped the build (#543), master's cache went stale, and
+# and master's. When master merges skipped the build (altairsim #543), master's cache went stale, and
 # every PR compiled almost from scratch -- see the build job.
 # pascal100: CI STARTS BY HAND ONLY (2026-11-09). The repository is private, so every minute
 # counts against the account's free allowance. Start a run with `gh workflow run ci.yml --ref
@@ -42,11 +42,11 @@ on:
 
 # A DOCUMENTATION MERGE THAT CHANGED NO FILES DOES NOT BUILD AGAIN. Merging an up-to-date docs
 # PR makes a commit whose tree is byte-identical to the PR head CI just passed on Linux; `scope`
-# sees that (tools/ci-merge-already-tested.sh) and `build` is skipped (issue #543). A CODE merge
+# sees that (tools/ci-merge-already-tested.sh) and `build` is skipped (altairsim issue #543). A CODE merge
 # builds three legs even then: its PR may have built only Linux, and master's cache needs it.
 #
 # A CORE MERGE THAT CHANGED NO FILES BUILDS BUT DOES NOT TEST AGAIN. Its PR passed the suite on
-# all three platforms with these exact files, so the tests would prove nothing new (issue #641).
+# all three platforms with these exact files, so the tests would prove nothing new (altairsim issue #641).
 # The build still runs, on all three, because it is what saves master's compiler cache.
 #
 # A NEWER PUSH TO A PR CANCELS THE OLDER RUN, which nobody will read. Pushes to master are
@@ -134,7 +134,7 @@ jobs:
           #
           # A core merge of such a tree is not skipped either, but it builds only: its PR ran the
           # suite on all three platforms, so the build job leaves out the tests and the binary
-          # upload and keeps the build, which saves the cache (issue #641).
+          # upload and keeps the build, which saves the cache (altairsim issue #641).
           tested=false
           build_only=false
           if [ "$level" = "docs" ]; then
@@ -168,7 +168,7 @@ jobs:
     #   - ctest --parallel (see the Test step).
     #
     # THE CACHE IS ONE FILE PER LEG ON DISK, NOT SCCACHE'S ACTIONS-CACHE BACKEND. That backend
-    # (SCCACHE_GHA_ENABLED) stores every object file as its own cache entry. MEASURED on PR #639:
+    # (SCCACHE_GHA_ENABLED) stores every object file as its own cache entry. MEASURED on altairsim PR #639:
     # Windows 238 of 238 writes failed (0% hits, a 5m12s build -- every run cold), Linux 87 and
     # macOS 104 writes failed, and hit rates were 21% and 16%; 11,631 tiny entries had piled up.
     # Now sccache keeps a plain local directory, restored from and saved to one actions/cache
@@ -267,7 +267,7 @@ jobs:
           # -DWERROR=on makes a warning fail the build on every leg -- this is where the
           # zero-warnings rule is enforced. It is OFF in CMakeLists.txt by default so a
           # local or unfamiliar toolchain still builds; each of GCC, Clang and MSVC has its
-          # own warning set, and here all three must be clean at once (issue #222).
+          # own warning set, and here all three must be clean at once (altairsim issue #222).
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DWERROR=on \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \

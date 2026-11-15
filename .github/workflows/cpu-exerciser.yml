@@ -50,7 +50,7 @@ on:
 #   workflow_dispatch:
 
 # The merge of an up-to-date PR changes no files, and the PR already ran the exercisers on
-# those exact bytes -- so the `tested` gate below skips them (issue #543, and ci.yml, which
+# those exact bytes -- so the `tested` gate below skips them (altairsim issue #543, and ci.yml, which
 # does the same). A newer push to a PR cancels the older run; master runs are per-commit.
 concurrency:
   group: cpu-exerciser-${{ github.event.pull_request.number || github.sha }}
