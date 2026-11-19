@@ -6,7 +6,7 @@ The Pascal-100 is one S-100 board set with two processors: a Zilog Z80 and a Wes
 **Pascal MicroEngine** (WD9000). The MicroEngine runs UCSD Pascal III.0 P-code in hardware. Only one
 processor is active at a time, and the guest switches between them.
 
-**Status:** version 0.1.0, the first release. The Pascal-100 machine (`examples/pascal/pascal.toml`)
+**Status:** version 0.2.0. The Pascal-100 machine (`examples/pascal/pascal.toml`)
 boots a UCSD Pascal III.0 system disk on the MicroEngine. The CompuPro machines run CP/M 2.2 on the
 Z80, and CP/M-86, CP/M 8-16 and MP/M 8-16 on the 8088 of the CompuPro CPU 8085/88. We test only
 macOS by hand (see [Platforms](#platforms)). The board document is
@@ -43,8 +43,7 @@ make your own.
 | `examples/cpm22/cpm22-buffered.toml` | CompuPro CP/M 2.2K: Z80, Interfacer 1, Disk 1, host bridge, 64K. |
 | `examples/cpm22/cpm22-terminal.toml` | The same machine, with the console in a VT100 window. |
 | `examples/cpm86/cpm86.toml` | CompuPro CP/M-86 1.1 on the CPU 8085/88, in a window. |
-| `examples/cpm8-16/cpm816.toml` | CompuPro CP/M 8-16 1.1R: 8086 programs on the 8088, 8080 programs on the 8085. |
-| `examples/cpm8-16-disk3/cpm816-disk3.toml` | CompuPro CP/M 8-16 1.1PD from a Quantum Q540 hard disk on a Disk 3. |
+| `examples/cpm8-16/cpm816.toml` | CompuPro CP/M 8-16 1.1PD from a Quantum Q540 hard disk on a Disk 3: 8086 programs on the 8088, 8080 programs on the 8085. |
 | `examples/mpm8-16/mpm816.toml` | CompuPro MP/M 8-16 2.1F from a Fujitsu M20 hard disk: three users in three windows. |
 | `examples/pascal/pascal.toml` | The Pascal-100 system: the Pascal-100 card, Disk 1, Interfacer 1, 128K, in a VT52 window. |
 | `examples/debugger/debugger.toml` | A small program and its symbols, to learn the monitor's debugger. |
@@ -75,6 +74,22 @@ get it when you start `pascal100` with no machine.
 
 The prompt `pascal100>` is the monitor. Type `HELP` for the commands.
 
+## Building out a working Pascal-100 system to run UCSD Pascal III
+
+The UCSD Pascal III.0 disk that came with the Pascal-100 does not boot as supplied: each owner
+had to write the parts that connect Pascal to their own disk controller and serial board. The
+build guide takes you through that work in the simulator, from the three distribution disks to
+CP/M and Pascal work disks, in phases that each end with a working system. You do not need any
+real hardware.
+
+- [`builds/pascal-iii/`](builds/pascal-iii/README.md): what to download, and what each phase gives you.
+- [`pascal-iii-buildkit.zip`](builds/pascal-iii/pascal-iii-buildkit.zip): the kit, with the CP/M
+  starting disk, the machine file, the BIOS and boot sources and the guide. The two Pascal-100
+  disks come from the Internet Archive; the folder's README gives the file names.
+- [`HOWTO-Build-the-System.md`](builds/pascal-iii/HOWTO-Build-the-System.md): the guide.
+
+More builds will follow in [`builds/`](builds/README.md).
+
 ## Build
 
 You need a C++20 compiler and CMake 3.20 or later. No other package is necessary.
@@ -97,14 +112,15 @@ your own Pascal-100 system disk instead, set `PASCAL100_BOOT_DISK` to a copy of 
 
 ## Platforms
 
-**We test only macOS on Apple silicon by hand.** Windows 11 x64 and Linux x64 are targets. At
-this time, we do not have a Windows 11 or Linux system to test on.
+**We use pascal100 by hand only on macOS on Apple silicon.** The Windows 11 x64 and Linux x64
+packages are built and tested on a real Windows 11 PC, with Linux in WSL2 on the same PC, but
+nobody has used their windows by hand yet.
 
 | Package | How it was tested |
 |---|---|
 | macOS, Apple silicon | Built and used on a Mac. Each change passes the test suite there before it is merged. |
-| Windows 11 x64 | Built by GitHub Actions (MSVC). The fast tests pass there, and CP/M boots from the unpacked package. Not tried on a real Windows 11 system. |
-| Linux x64 | Built by GitHub Actions (GCC). The fast tests pass there, and CP/M boots from the unpacked package. Not tried on a real Linux system. |
+| Windows 11 x64 | Built on a Windows 11 PC (MSVC, Visual Studio 2026). The fast tests pass there, and CP/M boots from the unpacked package. Not used by hand. |
+| Linux x64 | Built in Ubuntu 22.04 under WSL2 on the same PC (GCC). The fast tests pass there, and CP/M boots from the unpacked package. Not used by hand. |
 
 If you use pascal100 on Windows or Linux, please open an issue and say what works and what does not.
 
@@ -112,7 +128,7 @@ If you use pascal100 on Windows or Linux, please open an issue and say what work
 browser if Apple has not notarized it. Remove the download mark from the folder that you unpacked:
 
 ```
-xattr -dr com.apple.quarantine pascal100-0.1.0-macos-arm64
+xattr -dr com.apple.quarantine pascal100-0.2.0-macos-arm64
 ```
 
 You can also do it in System Settings:
@@ -131,8 +147,8 @@ altairsim and its Altair machines, and say so at the top. These files apply to p
 - `docs/QUICK-START.md`: boot CP/M with one command.
 - `docs/boards/digicomp-pascal100.md`: the Pascal-100 board.
 - `docs/manual/ref/`: the boards, machines and commands, generated from the binary.
-- `docs/howto/`: step-by-step guides, including how to build the Pascal-100 system from its
-  distribution disks.
+- `builds/`: step-by-step guides, each with a build kit, from the distribution disks to a
+  working system. The first builds UCSD Pascal III on the Pascal-100.
 - `DESIGN.md`: the design of the simulator, with a heritage note at the top.
 
 ## Why the name pascal100
