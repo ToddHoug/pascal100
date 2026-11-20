@@ -21,6 +21,7 @@ and within a group the boards are in **alphabetical order**.
 | Type | What it is |
 |---|---|
 | [`8085`](#8085) | Generic 8085 CPU board |
+| [`cpu286`](#cpu286) | CompuPro CPU 286: an 80286 on a 16-bit bus |
 | [`cpu8588`](#cpu8588) | CompuPro CPU 8085/88: 8085 + 8088, one on line |
 | [`cpu8687`](#cpu8687) | CompuPro CPU 86/87: an 8086 on a 16-bit bus |
 | [`pascal100`](#pascal100) | Digicomp Pascal-100: Z80 + WD MicroEngine, one active |
@@ -79,6 +80,26 @@ Generic 8085 CPU board. Decodes nothing -- it drives the bus. The 88-CPU's twin,
 | `clock_hz` | int | `0` | `0` .. `100000000` | Crystal on the board. 0 runs flat out -- as fast as the host can. |
 | `idle` | bool | `true` | `on` \| `off` | Stand down when the guest is only polling an empty keyboard. On by default -- the guest cannot tell, and a prompt stops burning a core. |
 | `achieved_hz` | int | — | — | LIVE: T-states per real second the run loop last reached -- the crystal you got, beside the one you asked for. Read-only; 0 until it has run. **(read-only — not a key you may set)** |
+
+
+### `cpu286`
+
+CompuPro CPU 286 (451B): an 80286 in real mode (unit 80286) with 8- and 16-bit IEEE 696 transfers (SIXTN*; byte-serial, even byte first, otherwise). Starts at FFFFF0. Its own ports, which decode A0-A15 (unless j2): the Memory Manager (a byte to an even port 01F8-01FE: D0-D3 = A20-A23, on the lines mm_lines says, J3-J6) and the 80287 ports 00F8-00FF (no 80287: reads float). sockets (J7): page FF from the on-board EPROM pair (rom). waits: jumper J1. No interrupt controller: INT* (pin 73) and NMI* reach the 80286. Runs no 8-bit software. IEEE 696 bus
+
+**Units:** `80286` (cpu)
+
+#### Board properties
+
+| Key | Kind | Default | Legal | Meaning |
+|---|---|---|---|---|
+| `mm_lines` | int | `0xF` | `0x0` .. `0xF` | Jumpers J3-J6: which of A20-A23 the Memory Manager drives (bit 0 = A20 = J6 ... bit 3 = A23 = J3); the 80286 drives the others. As shipped F (all A-C): the first fetch after reset is at 0FFFF0. 0 (all B-C): at FFFFF0 |
+| `j2` | bool | `false` | `on` \| `off` | J2 fitted: the 80287 ports (00F8-00FF) and the Memory Manager (01F8-01FF) go back to the S-100 bus, and the Memory Manager cannot be written. Standard off |
+| `sockets` | bool | `false` | `on` \| `off` | J7 fitted: page FF (FF0000-FFFFFF) is the on-board sockets, holding `rom`. As shipped off: page FF is memory on the S-100 bus |
+| `rom` | string |  | text | The EPROM pair in U37/U38, as one 16-bit image: Intel HEX, S-records, a flat binary or builtin:<name>. Offset 0 = FF0000; 16K, 32K or 64K, repeated through page FF. Empty = no chips |
+| `waits` | string | `B` | text | Jumper J1, the positions fitted (additive): A 1 memory, B 1 I/O, C 1 all, D 2 memory, E 2 I/O, F 2 all, G 4 sockets, H 1 memory write + 1 I/O. Empty = none (an illegal S-100 cycle). Default B |
+| `clock_hz` | int | `0` | `0` .. `100000000` | The 80286's clock: 8000000, 10000000 or 12500000 as sold. 0 runs flat out |
+| `idle` | bool | `true` | `on` \| `off` | Stand down when the guest is only polling an empty keyboard. On by default. |
+| `achieved_hz` | int | — | — | LIVE: T-states per real second the run loop last reached. Read-only; 0 until it has run. **(read-only — not a key you may set)** |
 
 
 ### `cpu8588`
@@ -251,8 +272,8 @@ CompuPro Disk 1A: an NEC uPD765A floppy controller for 8" and 5.25" drives, sing
 |---|---|---|---|---|
 | `port` | int | `0xC0` | `0x0` .. `0xFC` | Base address (S3-2..7). The board decodes four ports: BASE+0 .. BASE+3 (default C0) |
 | `rom` | string | `builtin:DISK1A` | text | The boot EPROM: builtin:DISK1A (default), or a 2764 image file (Intel HEX, S-records or binary) |
-| `routine` | int | `0` | `0` .. `15` | Boot routine (S1-2..5): the 512-byte page of the EPROM at 0000. 0-3 are 8080/Z80 code |
-| `boot` | bool | `true` | `on` \| `off` | Boot EPROM enable (S3-8). On (default): the ROM answers reads at 0000-01FF over PHANTOM* after a reset. Off: a plain disk controller |
+| `routine` | int | `0` | `0` .. `15` | Boot routine (S1-2..5): the 512-byte page of the EPROM. In builtin:DISK1A, 0-3 are 8080/8085/Z80 code and 4-7 are 8086/286 code |
+| `boot` | bool | `true` | `on` \| `off` | Boot EPROM enable (S3-8). On (default): after a reset the ROM answers every memory read (A0-A8 pick the byte) over PHANTOM*, until OUT BASE+3 with D0 = 0. Off: a plain disk controller |
 | `dma_priority` | int | `15` | `0` .. `15` | DMA priority (S2-4..7): the TMA bus-arbitration priority, 0-15; the higher one gets the bus first. All four switches OFF = 15 (default, CompuPro's setting). Two bus masters must not share a priority |
 | `sense_switch` | bool | `true` | `on` \| `off` | S3-1, read in status bit 2. On (default, reads 0): the CompuPro ROM tells the OS to use a System Support 1 console. Off: an Interfacer 3/4 |
 | `mini_motor_control` | bool | `true` | `on` \| `off` | Jumper J11, in the 5.25" MTR ON line. On (default, J11 installed): bit 7 of the Motor Control Register runs the 5.25" motors, and they stop about 15 seconds after the last access. Off: the 5.25" motors run all the time. The 8" motors always follow bits 4-7 |
