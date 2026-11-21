@@ -336,6 +336,7 @@ add_library(altair_core STATIC
   src/core/value.cpp
   src/core/expr.cpp
   src/core/debug.cpp
+  src/core/privatecpu.cpp     # a processor on a board's own bus, for the debugger (DESIGN.md 3.0.4)
   src/core/debuglog.cpp
   src/core/spindle.cpp
   src/isa/isa8080.cpp
@@ -444,6 +445,9 @@ add_library(altair_core STATIC
   # The CompuPro System Support 1 carries one (src/chips/msm5832.h).
   src/chips/msm5832.cpp
   src/chips/sig2651.cpp
+  # The Signetics SCN2681 DUART -- two UART channels, a counter/timer, a 7-bit input and an
+  # 8-bit output port. The CompuPro SPUZ carries one (src/chips/scn2681.h).
+  src/chips/scn2681.cpp
   # The Intel 8253 -- a three-channel programmable interval timer, counts computed from
   # the clock rather than stepped. The CompuPro System Support 1 carries one.
   src/chips/intel8253.cpp
@@ -492,6 +496,9 @@ add_library(altair_core STATIC
   # AND a 32-byte boot PROM that shadows low RAM over PHANTOM*. See src/boards/tarbell.h.
   src/boards/tarbell.cpp
   src/boards/jade-dd.cpp
+  # CompuPro SPUZ -- a slave Z80H with its own RAM and 2681, behind a 64K window and FC30-FC41
+  # (DESIGN.md 3.0.4). The second board with a processor on a private bus, after the Jade DD.
+  src/boards/compupro-spuz.cpp
   src/boards/floppy-drive.cpp
   src/boards/io4.cpp           # SSM IO-4: real chip-backed dual-UART serial board (2P+2S; serial section)
   # OUR OWN CARD -- the only one in this list that is not a period board, and the
@@ -746,10 +753,12 @@ add_executable(altair_tests
   tests/test_upd765.cpp
   tests/test_bitserial.cpp
   tests/test_i8257.cpp
+  tests/test_scn2681.cpp
   tests/test_am9511a.cpp
   tests/test_am9512.cpp
   tests/test_tarbell.cpp
   tests/test_jadedd.cpp
+  tests/test_spuz.cpp
   tests/test_cpu8088.cpp
   tests/test_cpu80286.cpp
   tests/test_disk1.cpp
