@@ -270,6 +270,15 @@ void test_cpu286() {
         CHECK(cs == 0x0000 && ip == 0x0004, "...and the next came from the ROM at 0002 (XOR AX,AX)");
     }
 
+    SECTION("cpu286: flat out, the clock divides by 8 MHz (the slowest crystal sold); clock_hz paces");
+    {
+        Rig286b g;
+        CHECK(g.m.clock.free() && g.m.clock.hz() == 8000000, "clock_hz 0: flat out at 8 MHz");
+        std::string err;
+        CHECK(setProperty(*g.card, "clock_hz", "12500000", err), err.c_str());
+        CHECK(!g.m.clock.free() && g.m.clock.hz() == 12500000, "clock_hz 12500000: paced at it");
+    }
+
     SECTION("cpu286: BREAK IO on a 16-bit port -- FC3E stops on OUT DX to FC3E, 3E still matches the low byte");
     {
         // The 80286 puts all 16 bits of DX on A0-A15 for OUT DX. A breakpoint above FF names
