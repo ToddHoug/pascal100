@@ -10,12 +10,13 @@
 #include "core/debug.h"
 #include "core/machine.h"
 #include "core/statefile.h"
+#include "io16_board.h"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -75,32 +76,6 @@ std::string romFile(const char* name, std::initializer_list<uint8_t> code) {
     return path.string();
 }
 
-// Ports 60-61: a word I/O board that answers SIXTN* at 60 while `sixteen` is set. Counts
-// its 16-bit and byte cycles.
-struct WordPort60 : Board {
-    bool sixteen = true;
-    uint8_t reg[2] = {0, 0};
-    int wide = 0, bytes = 0;
-    std::string type() const override { return "test-wordport"; }
-    std::vector<Property> properties() override { return {}; }
-    bool decodes(const BusCycle& c) const override {
-        return (c.type == Cycle::IoRead || c.type == Cycle::IoWrite) && (c.addr & 0xFFFE) == 0x60;
-    }
-    bool answersSixtn(const BusCycle&) const override { return sixteen; }
-    uint8_t read(const BusCycle& c) override { ++bytes; return reg[c.addr & 1]; }
-    void write(const BusCycle& c) override { ++bytes; reg[c.addr & 1] = c.data; }
-    void read16(const BusCycle&, uint8_t& even, uint8_t& odd) override {
-        ++wide;
-        even = reg[0];
-        odd  = reg[1];
-    }
-    void write16(const BusCycle& c) override {
-        ++wide;
-        reg[0] = c.data;
-        reg[1] = c.dataHi;
-    }
-};
-
 } // namespace
 
 void test_cpu286() {
@@ -138,26 +113,6 @@ void test_cpu286() {
         CHECK(r.why == StopReason::Halted, "it ran on at 100106 and halted");
         CHECK(g.card->memoryManager() == 0x1, "the latch holds 1");
         CHECK(g.peek(0x100200) == 0x01 && g.peek(0x000200) == 0x00, "the write went to 100200");
-    }
-
-    SECTION("cpu286: a word OUT/IN at an even port -- one 16-bit I/O cycle with SIXTN*");
-    {
-        for (bool sixteen : {true, false}) {
-            Rig286b g;
-            auto* p = new WordPort60;
-            p->id = "wp";
-            p->sixteen = sixteen;
-            g.m.adopt(std::unique_ptr<Board>(p));
-            g.load(0x0FFFF0, {0xBA, 0x60, 0x00, 0xB8, 0x34, 0x12, 0xEF, 0xB8, 0x00, 0x00, 0xED, 0xA3, 0x00, 0x03, 0xF4});
-            RunResult r = g.run();
-            CHECK(r.why == StopReason::Halted, "it halts");
-            CHECK(p->reg[0] == 0x34 && p->reg[1] == 0x12, "AL went to port 60, AH to port 61");
-            CHECK(g.peek(0x0300) == 0x34 && g.peek(0x0301) == 0x12, "IN AX,DX read them back");
-            if (sixteen)
-                CHECK(p->wide == 2 && p->bytes == 0, "SIXTN*: one 16-bit cycle each way");
-            else
-                CHECK(p->wide == 0 && p->bytes == 4, "no SIXTN*: two byte cycles each way");
-        }
     }
 
     SECTION("cpu286: the memory manager -- an odd port, and only D0-D3");
@@ -384,5 +339,65 @@ void test_cpu286() {
         for (const auto& b : g.m.debug.breakpoints())
             if (b.id == bp) listed = b.describe().find("FC3E") != std::string::npos;
         CHECK(listed, "BREAK lists it with all four digits");
+    }
+
+    SECTION("cpu286: 16-bit I/O -- one cycle to a SIXTN* board; the card's own ports stay local");
+    {
+        struct IoSeen { Cycle type; uint16_t addr; bool xtrq; };
+        std::vector<IoSeen> s;
+        auto watch = [&s](Rig286b& g) {
+            return g.m.bus.observe([&s](const BusCycle& c) {
+                if (c.type == Cycle::IoRead || c.type == Cycle::IoWrite)
+                    s.push_back({c.type, c.addr, c.xtrq});
+            });
+        };
+
+        // MOV AX,BEEF  OUT 70,AX  IN AX,70  MOV [0200],AX  HLT -- at 0FFFF0, 14 bytes.
+        Rig286b g;
+        auto* io = new Io16Board;
+        io->id = "io16";
+        g.m.adopt(std::unique_ptr<Board>(io));
+        int h = watch(g);
+        g.load(0x0FFFF0, {0xB8, 0xEF, 0xBE, 0xE7, 0x70, 0xE5, 0x70, 0xA3, 0x00, 0x02, 0xF4});
+        RunResult r = g.run(10);
+        g.m.bus.unobserve(h);
+        CHECK(r.why == StopReason::Halted && io->reg[0] == 0xEF && io->reg[1] == 0xBE &&
+                  g.peek(0x0200) == 0xEF && g.peek(0x0201) == 0xBE,
+              "OUT 70,AX then IN AX,70: the word went out and came back");
+        CHECK(s.size() == 2 && s[0].type == Cycle::IoWrite && s[0].xtrq &&
+                  s[1].type == Cycle::IoRead && s[1].xtrq && io->writes16 == 1 &&
+                  io->reads16 == 1 && io->reads == 0 && io->writes == 0,
+              "each in ONE 16-bit I/O cycle (sXTRQ*)");
+
+        // MOV DX,01F8  OUT DX,AX  HLT: the memory manager is the card's own port, so the word
+        // is two byte cycles (the S-100 cycles still run), never a 16-bit request.
+        Rig286b k;
+        s.clear();
+        h = watch(k);
+        k.load(0x0FFFF0, {0xBA, 0xF8, 0x01, 0xEF, 0xF4});
+        r = k.run(10);
+        k.m.bus.unobserve(h);
+        CHECK(r.why == StopReason::Halted && s.size() == 2 && s[0].addr == 0x01F8 &&
+                  s[1].addr == 0x01F9 && !s[0].xtrq && !s[1].xtrq,
+              "OUT DX,AX to 01F8 (own port): two byte cycles, no sXTRQ*, no unclaimed halt");
+
+        // REP OUTSW (80286 string I/O) feeding a 16-bit FIFO port: one cycle per word.
+        // MOV DX,0070  MOV SI,0200  MOV CX,3  CLD  REP OUTSW  HLT
+        Rig286b f;
+        auto* fifo = new Io16Board;
+        fifo->id = "io16";
+        f.m.adopt(std::unique_ptr<Board>(fifo));
+        f.load(0x000200, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66});
+        s.clear();
+        h = watch(f);
+        f.load(0x0FFFF0, {0xBA, 0x70, 0x00, 0xBE, 0x00, 0x02, 0xB9, 0x03, 0x00, 0xFC, 0xF3, 0x6F,
+                          0xF4});
+        r = f.run(20);
+        f.m.bus.unobserve(h);
+        bool allWide = s.size() == 3;
+        for (const IoSeen& e : s) allWide = allWide && e.xtrq && e.addr == 0x0070;
+        CHECK(r.why == StopReason::Halted && allWide && fifo->writes16 == 3 &&
+                  fifo->writes == 0 && fifo->reg[0] == 0x55 && fifo->reg[1] == 0x66,
+              "REP OUTSW: three words, three 16-bit I/O cycles to port 70");
     }
 }

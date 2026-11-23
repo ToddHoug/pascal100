@@ -67,13 +67,12 @@ Override three functions:
 - `read16(c, even, odd)`: give the byte at the even address `c.addr` and the byte at `c.addr | 1`.
 - `write16(c)`: store `c.data` at the even address and `c.dataHi` at the odd address.
 
-The bus calls them only for an even address. The `memory` board's
-`sixteen_bit` property is the example.
-
-The bus asks the same three functions about an I/O cycle (`c.type` is `IoRead` or `IoWrite`,
-and `c.addr` is an even port). A memory board never decodes an I/O cycle, so it is never asked.
-A board that decodes both memory and I/O checks `c.type` in `answersSixtn()`. The `cadzilla`
-board, which answers at its ACRTC data port only, is the I/O example.
+The bus calls them only for an even address. The same three functions serve a memory cycle
+and an I/O cycle: `c.type` tells which. A board that decodes both kinds, and answers SIXTN\* on
+only one of them, must check `c.type` (the PC Video answers on memory only). For I/O, the even
+byte is the even port and the odd byte is the port after it. The `memory` board's
+`sixteen_bit` property is the memory example. The `cadzilla` board, which answers at its ACRTC
+data port only, is the I/O example.
 
 ## The registry-wide test
 
@@ -105,11 +104,13 @@ The master then moves the two bytes itself. The standard does not give the order
 bytes, so the master chooses it: `byteSerialRead16(phys, evenFirst)` and
 `byteSerialWrite16(phys, even, odd, evenFirst)` do the two byte cycles in that order.
 
-For I/O, call `ioRead16(addr)` or `ioWrite16(addr, even, odd)`. `addr` is A0-A15, as for
-`ioRead`, and it goes through the address translator's `ioAddress()`. An odd port, a port that
-the translator owns (`ownsIo`), or no SIXTN\* runs no cycle, as for memory. The master then
-does its own byte cycles: the 8086 and 80286 do two (port, then port + 1), and the MicroEngine
-does one, as its manual says.
+For I/O, call `ioRead16(port)` or `ioWrite16(port, even, odd)`, with the same rules. They also
+run no cycle for an odd port, or for a port that the master's own card owns
+(`AddressTranslator::ownsIo`, on either byte). With no SIXTN\*, the master does two `ioRead` or
+`ioWrite` cycles itself. A translator's `ioAddress()` runs once, and only when the 16-bit cycle
+runs: the CPU cards add their I/O wait states there. So a translator that changes the I/O
+address cannot use these functions. The x86 cards (`src/cpu/x86_impl.h`, `BusIo`) are the
+example.
 
 ## An address translator
 

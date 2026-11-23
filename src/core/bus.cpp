@@ -827,8 +827,8 @@ uint8_t Bus::peekX(uint32_t phys) const {
 }
 
 // ---------------------------------------------------------------------------
-// IEEE 696: the 16-bit transfer (2.6), memory and I/O. One cycle when the decoding slave
-// answers SIXTN*; otherwise nothing at all, and the master does the byte-serial response.
+// IEEE 696: the 16-bit transfer (2.6). One cycle when the decoding slave answers
+// SIXTN*; otherwise nothing at all, and the master does the byte-serial response.
 // ---------------------------------------------------------------------------
 
 Board* Bus::decoderFor16(BusCycle& c) {
@@ -897,73 +897,6 @@ bool Bus::memWrite16(uint32_t phys, uint8_t even, uint8_t odd, uint8_t status) {
     return true;
 }
 
-// The I/O transfer (2.6 covers every data cycle). Decode first, as in memRead16: with no
-// SIXTN* no cycle runs at all. The translator's own I/O never gets one: the card's local
-// devices are 8-bit, and the master's byte path is what reaches them.
-Board* Bus::ioDecoderFor16(const BusCycle& c) {
-    if (dirty_) rebuild();
-    const Slot& s = (c.type == Cycle::IoRead ? ioRead_ : ioWrite_)[c.addr & 0xFF];
-    if (!s.slow) {
-        if (verify_) verifySlot(c, s);
-        return s.who;
-    }
-    // A slow port: the exact scan. Contention, a shared port or a board that drives only
-    // some lines gets no 16-bit cycle -- the byte cycles that follow take the exact path.
-    Decode d = scan(c);
-    if (d.n != 1 || d.first->sharesPort(c)) return nullptr;
-    if (c.type == Cycle::IoRead && d.first->drivesBits(c) != 0xFF) return nullptr;
-    return d.first;
-}
-
-Transfer16 Bus::ioRead16(uint16_t addr, uint8_t status) {
-    Transfer16 r;
-    if (xlat_) [[unlikely]] {
-        addr = xlat_->ioAddress(addr, Cycle::IoRead);
-        if (xlat_->ownsIo(addr, Cycle::IoRead)) return r;
-    }
-    if (addr & 1) return r;   // a word is at an even port (A0 = 0, 2.6.4.2)
-
-    BusCycle c{Cycle::IoRead, addr, 0, false};
-    c.xtrq   = true;
-    c.status = status;
-    Board* who = ioDecoderFor16(c);
-    if (!who || !who->answersSixtn(c)) return r;   // no SIXTN*: the master's byte cycles
-    if (preVeto_ && preVeto_(c)) throw CycleBreakBefore{};
-
-    unclaimed_ = false;
-    contended_ = false;
-    responder_ = who;
-    who->read16(c, r.even, r.odd);
-    r.sixtn  = true;
-    c.data   = r.even;  // what got driven -- see settle()
-    c.dataHi = r.odd;
-    settle(c);
-    return r;
-}
-
-bool Bus::ioWrite16(uint16_t addr, uint8_t even, uint8_t odd, uint8_t status) {
-    if (xlat_) [[unlikely]] {
-        addr = xlat_->ioAddress(addr, Cycle::IoWrite);
-        if (xlat_->ownsIo(addr, Cycle::IoWrite)) return false;
-    }
-    if (addr & 1) return false;
-
-    BusCycle c{Cycle::IoWrite, addr, even, false};
-    c.xtrq   = true;
-    c.dataHi = odd;
-    c.status = status;
-    Board* who = ioDecoderFor16(c);   // decode first, as in ioRead16
-    if (!who || !who->answersSixtn(c)) return false;
-    if (preVeto_ && preVeto_(c)) throw CycleBreakBefore{};
-
-    unclaimed_ = false;
-    contended_ = false;
-    responder_ = who;
-    who->write16(c);
-    settle(c);
-    return true;
-}
-
 Transfer16 Bus::byteSerialRead16(uint32_t phys, bool evenFirst, uint8_t status) {
     Transfer16 r;
     const uint32_t even = phys & ~1u, odd = even + 1;
@@ -987,6 +920,74 @@ void Bus::byteSerialWrite16(uint32_t phys, uint8_t even, uint8_t odd, bool evenF
         memWriteX(o, odd, status);
         memWriteX(e, even, status);
     }
+}
+
+// ---------------------------------------------------------------------------
+// IEEE 696: the 16-bit I/O transfer. The same protocol on an I/O cycle (2.6: "possible on
+// every data cycle"). No SIXTN* -> nothing ran, and the master runs two byte cycles.
+// ---------------------------------------------------------------------------
+
+Board* Bus::io16Responder(const BusCycle& c) {
+    if (c.addr & 1) return nullptr;  // a word is at an even port (A0 = 0)
+    // The master card's own port, on either byte, is on its local bus, not the S-100 bus;
+    // the byte-serial pair handles it through ownsIo() as it always has.
+    if (xlat_ && (xlat_->ownsIo(c.addr, c.type) ||
+                  xlat_->ownsIo((uint16_t)(c.addr + 1), c.type)))
+        return nullptr;
+    if (dirty_) rebuild();
+    const Slot& s = (c.type == Cycle::IoRead ? ioRead_ : ioWrite_)[c.addr & 0xFF];
+    Board* who = nullptr;
+    if (!s.slow) {
+        if (verify_) verifySlot(c, s);
+        who = s.who;
+    } else {
+        // A slow port: contention, a shared port or a board that decodes A8-A15. The exact
+        // scan sees the whole address; more than one decoder gets no 16-bit cycle, and the
+        // byte cycles that follow report the contention as they always do.
+        Decode d = scan(c);
+        if (d.n == 1) who = d.first;
+    }
+    return who && who->answersSixtn(c) ? who : nullptr;
+}
+
+Transfer16 Bus::ioRead16(uint16_t addr, uint8_t status) {
+    Transfer16 r;
+    BusCycle c{Cycle::IoRead, addr, 0, false};
+    c.xtrq   = true;
+    c.status = status;
+    Board* who = io16Responder(c);
+    if (!who) return r;  // no SIXTN*: the master goes byte-serial
+    if (preVeto_ && preVeto_(c)) throw CycleBreakBefore{};
+    // ONE I/O cycle: the card's wait states for it (ioAddress), once. See bus.h.
+    if (xlat_) [[unlikely]] (void)xlat_->ioAddress(addr, Cycle::IoRead);
+
+    unclaimed_ = false;
+    contended_ = false;
+    responder_ = who;
+    who->read16(c, r.even, r.odd);
+    r.sixtn  = true;
+    c.data   = r.even;  // what got driven -- see settle()
+    c.dataHi = r.odd;
+    settle(c);
+    return r;
+}
+
+bool Bus::ioWrite16(uint16_t addr, uint8_t even, uint8_t odd, uint8_t status) {
+    BusCycle c{Cycle::IoWrite, addr, even, false};
+    c.xtrq   = true;
+    c.dataHi = odd;
+    c.status = status;
+    Board* who = io16Responder(c);
+    if (!who) return false;
+    if (preVeto_ && preVeto_(c)) throw CycleBreakBefore{};
+    if (xlat_) [[unlikely]] (void)xlat_->ioAddress(addr, Cycle::IoWrite);
+
+    unclaimed_ = false;
+    contended_ = false;
+    responder_ = who;
+    who->write16(c);
+    settle(c);
+    return true;
 }
 
 // Out of line on purpose: see memRead in bus.h.

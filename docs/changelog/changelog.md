@@ -28,14 +28,29 @@ as in `cpm86`, with a CADzilla at `70` set for 16-bit I/O (`host_bus = 16`). Its
 black at 1024x768. A program draws with word `OUT DX,AX` to port `72`. `cadzilla86-console.toml`
 puts the console on stdio.
 
-**New: 16-bit I/O transfers on the bus.** A board can now answer SIXTN\* to an I/O cycle, as to a
-memory cycle. The MicroEngine's word `FEpp` and a word `IN`/`OUT` of the 8086 and the 80286 at an
-even port ask for 16 bits. When the board answers, one cycle moves the word. When it does not,
-the processor does what it did before: one byte cycle (the MicroEngine) or two (the 8086 and
-80286). `TRACE` and `HISTORY BUS` show a 16-bit I/O transfer as `IR16` or `IW16`.
+**New: the MicroEngine asks for 16 bits on I/O.** The word `FEpp` of the MicroEngine is a 16-bit
+request (sXTRQ\*) at the even port `pp`. When the board answers SIXTN\*, one cycle moves the
+word. When it does not, the MicroEngine does one byte cycle, as before.
 
 **Snapshots are now format 10.** A format 10 snapshot holds the data width of the CADzilla's
 ACRTC. An older snapshot with a `cadzilla` board restores everything but that board.
+
+---
+
+## 0.4.1
+
+**New: 16-bit I/O transfers on the 8086 and the 80286.** IEEE 696 lets a master ask for 16 bits
+on an I/O cycle, as on a memory cycle (sXTRQ\*). Before, the bus had only the memory form, so a
+word `IN` or `OUT` on the CPU 86/87 or the CPU 286 was always two byte cycles. Now a word at an
+even port is one 16-bit request. When the board at that port answers SIXTN\*, one I/O cycle moves
+both bytes. When it does not, the card does two byte cycles, the even port first, as before. This
+applies to `IN`, `OUT`, `INSW` and `OUTSW`, also with `REP`. A word at an odd port, or at the
+card's own ports, is still two byte cycles. The CPU 8085/88 has an 8088 (an 8-bit data bus), so
+it does not change. No board in pascal100 answers SIXTN\* on an I/O cycle yet: this release adds
+what a 16-bit I/O board needs (the developer's guide, *The IEEE 696 bus*). On the CPU 286 this
+is an inference: its manual describes 16-bit transfers for memory only.
+`TRACE` and `HISTORY BUS` show a 16-bit I/O cycle as `IN16` or `OUT16`, and a `BREAK IO` on
+either of its two ports stops it.
 
 ---
 
