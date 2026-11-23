@@ -164,6 +164,7 @@ Type the part before the bracket.
 
 | Type | What it is |
 |---|---|
+| `cadzilla` | CADzilla: HD63484 ACRTC graphics board with a Bt453 RAMDAC |
 | `pcvideo` | CompuPro PC Video: 6845 color display, PC keyboard |
 
 **Other**

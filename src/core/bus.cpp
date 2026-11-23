@@ -827,8 +827,8 @@ uint8_t Bus::peekX(uint32_t phys) const {
 }
 
 // ---------------------------------------------------------------------------
-// IEEE 696: the 16-bit transfer (2.6). One cycle when the decoding slave answers
-// SIXTN*; otherwise nothing at all, and the master does the byte-serial response.
+// IEEE 696: the 16-bit transfer (2.6), memory and I/O. One cycle when the decoding slave
+// answers SIXTN*; otherwise nothing at all, and the master does the byte-serial response.
 // ---------------------------------------------------------------------------
 
 Board* Bus::decoderFor16(BusCycle& c) {
@@ -886,6 +886,73 @@ bool Bus::memWrite16(uint32_t phys, uint8_t even, uint8_t odd, uint8_t status) {
     c.dataHi = odd;
     c.status = status;
     Board* who = decoderFor16(c);  // decode first, as in memRead16
+    if (!who || !who->answersSixtn(c)) return false;
+    if (preVeto_ && preVeto_(c)) throw CycleBreakBefore{};
+
+    unclaimed_ = false;
+    contended_ = false;
+    responder_ = who;
+    who->write16(c);
+    settle(c);
+    return true;
+}
+
+// The I/O transfer (2.6 covers every data cycle). Decode first, as in memRead16: with no
+// SIXTN* no cycle runs at all. The translator's own I/O never gets one: the card's local
+// devices are 8-bit, and the master's byte path is what reaches them.
+Board* Bus::ioDecoderFor16(const BusCycle& c) {
+    if (dirty_) rebuild();
+    const Slot& s = (c.type == Cycle::IoRead ? ioRead_ : ioWrite_)[c.addr & 0xFF];
+    if (!s.slow) {
+        if (verify_) verifySlot(c, s);
+        return s.who;
+    }
+    // A slow port: the exact scan. Contention, a shared port or a board that drives only
+    // some lines gets no 16-bit cycle -- the byte cycles that follow take the exact path.
+    Decode d = scan(c);
+    if (d.n != 1 || d.first->sharesPort(c)) return nullptr;
+    if (c.type == Cycle::IoRead && d.first->drivesBits(c) != 0xFF) return nullptr;
+    return d.first;
+}
+
+Transfer16 Bus::ioRead16(uint16_t addr, uint8_t status) {
+    Transfer16 r;
+    if (xlat_) [[unlikely]] {
+        addr = xlat_->ioAddress(addr, Cycle::IoRead);
+        if (xlat_->ownsIo(addr, Cycle::IoRead)) return r;
+    }
+    if (addr & 1) return r;   // a word is at an even port (A0 = 0, 2.6.4.2)
+
+    BusCycle c{Cycle::IoRead, addr, 0, false};
+    c.xtrq   = true;
+    c.status = status;
+    Board* who = ioDecoderFor16(c);
+    if (!who || !who->answersSixtn(c)) return r;   // no SIXTN*: the master's byte cycles
+    if (preVeto_ && preVeto_(c)) throw CycleBreakBefore{};
+
+    unclaimed_ = false;
+    contended_ = false;
+    responder_ = who;
+    who->read16(c, r.even, r.odd);
+    r.sixtn  = true;
+    c.data   = r.even;  // what got driven -- see settle()
+    c.dataHi = r.odd;
+    settle(c);
+    return r;
+}
+
+bool Bus::ioWrite16(uint16_t addr, uint8_t even, uint8_t odd, uint8_t status) {
+    if (xlat_) [[unlikely]] {
+        addr = xlat_->ioAddress(addr, Cycle::IoWrite);
+        if (xlat_->ownsIo(addr, Cycle::IoWrite)) return false;
+    }
+    if (addr & 1) return false;
+
+    BusCycle c{Cycle::IoWrite, addr, even, false};
+    c.xtrq   = true;
+    c.dataHi = odd;
+    c.status = status;
+    Board* who = ioDecoderFor16(c);   // decode first, as in ioRead16
     if (!who || !who->answersSixtn(c)) return false;
     if (preVeto_ && preVeto_(c)) throw CycleBreakBefore{};
 

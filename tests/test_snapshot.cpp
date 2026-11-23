@@ -292,6 +292,32 @@ void test_snapshot() {
         std::filesystem::remove(path);
     }
 
+    SECTION("snapshot: a format 9 file restores everything but the cadzilla board");
+    {
+        Machine m;
+        std::string err;
+        m.add("z80", "cpu0", err);
+        addRam(m, "mem0", 0x0000, 0x1000);
+        CHECK(m.add("cadzilla", "cad0", err), "a cadzilla board is added");
+        m.power();
+        setReg(m, "A", 0x3D);
+        std::string path = tmpSnap("pascal100-snap-cz9.snap");
+        CHECK(m.snapshot(path, err), "snapshot writes");
+
+        // Format 9: the ACRTC gained its host bus width in format 10 (and pascal100 had no
+        // cadzilla board before it), so the table names the board, not only the length check.
+        CHECK(rewriteSnap(path, [](uint32_t& ver, std::vector<Section>&) { ver = 9; }),
+              "relabel it format 9");
+        setReg(m, "A", 0x00);
+        std::vector<std::string> notes;
+        CHECK(m.restore(path, err, notes), "a format 9 file is read");
+        CHECK(getReg(m, "A") == 0x3D, "cpu0 came back");
+        CHECK(notes.size() == 1 && hasNote(notes, "'cad0' (cadzilla): its state is in snapshot format 9"),
+              "and the cadzilla board is named");
+
+        std::filesystem::remove(path);
+    }
+
     SECTION("snapshot: a board section of the wrong length is not misread");
     {
         Machine m;

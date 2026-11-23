@@ -1,9 +1,10 @@
 # Writing a video board
 
-> **pascal100 has no video board.** CADzilla, the Dazzler and the VDM-1 were removed, with
-> their source, tests and board docs, so the files this chapter names are not in this
-> repository. It describes altairsim, and it is kept as a guide to the host video service for a
-> video board added later.
+> **pascal100:** CADzilla is in pascal100 (`src/boards/cadzilla.{h,cpp}`), with a 16-bit I/O
+> path that altairsim does not have (`docs/boards/cadzilla.md`, "The 16-bit transfer"). The
+> Dazzler and the VDM-1 were removed, with their source, tests and board docs, so the parts of
+> this chapter that name them describe altairsim. The CompuPro PC Video (`pcvideo`) is the other
+> video board here.
 
 The lamp chapter built a board that latches a byte. This one builds a board that **paints** —
 and it is the same board with one more connection: a host video service it draws into. The
@@ -25,7 +26,7 @@ method each, and the other two are the Limitations section.
 | # | Question | CADzilla's answer | Where it lands |
 |---|---|---|---|
 | 1 | **Name.** The chip or the common name, never a catalog number. "board", never "card" (`DESIGN.md` §0.3) | `cadzilla` | `type()`, the registry, the filename |
-| 2 | **I/O footprint** — which ports, and *separately* which answer `IN` vs `OUT`: the bus decodes by cycle type | one 8-port block from `port`: `+0`/`+2` the ACRTC (both directions, different registers each way), `+1` the board's own MODE register (write-only), `+4`..`+7` the Bt453 (both directions); `+3`, the high byte of a 16-bit transfer an 8-bit host never makes, answers nothing | `decodes()`, `ioMap()` |
+| 2 | **I/O footprint** — which ports, and *separately* which answer `IN` vs `OUT`: the bus decodes by cycle type | one 8-port block from `port`: `+0`/`+2` the ACRTC (both directions, different registers each way), `+1` the board's own MODE register (write-only), `+4`..`+7` the Bt453 (both directions); `+3` answers only as the high byte of a 16-bit transfer at `+2` (**pascal100:** SIXTN\*, `answersSixtn()`) | `decodes()`, `ioMap()` |
 | 3 | **Memory footprint.** On-board screen RAM the CPU addresses (VDM-1 decodes a 1 KB window), a framebuffer in main RAM (Dazzler decodes none, reads RAM), or private memory (CADzilla decodes none, and the CPU never sees it) | none | `decodes()`, `memMap()` |
 | 4 | **Where pixels come from and how you know they moved.** A write to on-board RAM latches a dirty flag; main RAM has to be polled against a shadow; a chip with its own memory tells you | `Hd63484::takeDirty()`, `Bt453::takeDirty()` | `pump()` |
 | 5 | **Geometry.** Native w×h — fixed, decoded from registers each frame, or **the monitor's**: a board with a real CRT controller can carry a fixed-frequency display and place the chip's picture in it. `PixelFormat::Indexed8` (an index into the palette) or `PixelFormat::Rgb32` (the color itself) — §3 says when a board needs the second | the `mode` strap's VESA frame (one of the three primary VESA resolutions, 1024x768 by default); the ACRTC's picture placed by HDS/VDS against the mode's porches | `render()`, `acquire()` |

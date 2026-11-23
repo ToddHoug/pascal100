@@ -6,6 +6,7 @@
 #include "boards/compupro-interfacer3.h"
 #include "boards/compupro-interfacer4.h"
 #include "boards/compupro-disk1.h"
+#include "boards/cadzilla.h"
 #include "boards/compupro-pcvideo.h"
 #include "boards/compupro-ss1.h"
 #include "boards/terminal-font.h"
@@ -109,6 +110,9 @@ const struct {
     {"jadedd", test_jadedd},
     {"spuz", test_spuz},
     {"pcvideo", test_pcvideo},
+    {"cadzilla", test_cadzilla},
+    {"hd63484", test_hd63484},
+    {"bt453", test_bt453},
     {"cpu8088", test_cpu8088},
     {"cpu80286", test_cpu80286},
     {"disk1", test_disk1},
@@ -168,6 +172,7 @@ int main(int argc, char** argv) {
     // while it drives the VT100 engine directly (no window, no endpoint) to read the grid.
     altair::TerminalStream::setDisplay(&g_display);
     altair::PcVideoBoard::setDisplay(&g_display);
+    altair::CadzillaBoard::setDisplay(&g_display);
     altair::TerminalStream::setFont(&altair::bundledTerminalFont());
 
     // The REAL media resolver, for the same reason -- and the SAME one the CLI

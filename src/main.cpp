@@ -5,6 +5,7 @@
 #include "boards/compupro-interfacer4.h"
 #include "boards/compupro-disk1.h"
 #include "boards/compupro-ss1.h"
+#include "boards/cadzilla.h"
 #include "boards/compupro-pcvideo.h"
 #include "boards/compupro-spuz.h"
 #include "boards/terminal-font.h"
@@ -338,6 +339,7 @@ int main(int argc, char** argv) {
     // endpoint cleanly rather than opening a serial line with nothing behind it.
     TerminalStream::setDisplay(&g_display);
     PcVideoBoard::setDisplay(&g_display);
+    CadzillaBoard::setDisplay(&g_display);
     TerminalStream::setFont(&bundledTerminalFont());
 
     // 60 frames a second, and no more. A real VDM-1 scanned at the monitor's rate no

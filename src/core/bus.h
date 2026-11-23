@@ -90,7 +90,8 @@ struct BusCycle {
     // decode the extended address (2.2.2.4), with no change to the board.
     uint8_t ext = 0;
     // sXTRQ* (pin 58): the master asks for a 16-bit transfer. Set only on the one cycle
-    // of a 16-bit transfer that a slave answered with SIXTN* (Bus::memRead16).
+    // of a 16-bit transfer that a slave answered with SIXTN* (Bus::memRead16, and
+    // Bus::ioRead16 for an I/O cycle).
     bool xtrq = false;
     // The ODD-addressed byte of that 16-bit cycle (OD7-OD0 on DI7-DI0, 2.2.4, 2.6). `data`
     // then holds the EVEN-addressed byte (ED7-ED0 on DO7-DO0). Like `data`, back-filled
@@ -324,6 +325,16 @@ public:
     // which byteSerialRead16/Write16 are the helper.
     Transfer16 memRead16(uint32_t phys, uint8_t status = 0);
     bool memWrite16(uint32_t phys, uint8_t even, uint8_t odd, uint8_t status = 0);
+
+    // The same request on an I/O cycle ("A 16-bit request is possible on every data cycle,
+    // I/O ... included", 2.6). `addr` is A0-A15, as for ioRead; it goes through the
+    // translator's ioAddress() first. An odd port, a port the translator owns (the card's
+    // own I/O, AddressTranslator::ownsIo), or no SIXTN* from the board that decodes it:
+    // sixtn = false and NO cycle has run. The master then does what its own design does
+    // with no SIXTN* -- two byte cycles (the 8086), or one (the MicroEngine, which then
+    // moves a single byte).
+    Transfer16 ioRead16(uint16_t addr, uint8_t status = 0);
+    bool ioWrite16(uint16_t addr, uint8_t even, uint8_t odd, uint8_t status = 0);
 
     // The byte-serial response: two ordinary byte cycles, at the even address and the odd
     // one after it, in the order the MASTER chooses. A word is at an even address (A0 = 0,
@@ -726,6 +737,9 @@ private:
     // Who decodes this memory cycle, for a 16-bit request: the cached answer, or the exact
     // scan on a slow page (null unless exactly one board drives). Sets c.phantom.
     Board* decoderFor16(BusCycle& c);
+    // The same for an I/O cycle: the cached port, or the exact scan on a slow one (null
+    // unless exactly one board decodes it and, on a read, drives all eight lines).
+    Board* ioDecoderFor16(const BusCycle& c);
 
     bool dirty_ = true;
     bool verify_ = false;

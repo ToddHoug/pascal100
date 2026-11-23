@@ -79,6 +79,33 @@ struct PortSpy : Board {
     std::vector<uint8_t> data;
 };
 
+// Ports 64-65: a 16-bit I/O board that answers SIXTN* at 64. Records every cycle.
+struct Port16Spy : Board {
+    std::string type() const override { return "test-port16spy"; }
+    bool decodes(const BusCycle& c) const override {
+        return (c.type == Cycle::IoWrite || c.type == Cycle::IoRead) && (c.addr & 0xFE) == 0x64;
+    }
+    bool answersSixtn(const BusCycle& c) const override { return (c.addr & 0xFF) == 0x64; }
+    void write(const BusCycle& c) override { log.push_back({c.addr, c.data, 0, false}); }
+    uint8_t read(const BusCycle& c) override {
+        log.push_back({c.addr, 0, 0, false});
+        return 0x77;
+    }
+    void write16(const BusCycle& c) override { log.push_back({c.addr, c.data, c.dataHi, true}); }
+    void read16(const BusCycle& c, uint8_t& even, uint8_t& odd) override {
+        log.push_back({c.addr, 0, 0, true});
+        even = 0xCD;
+        odd  = 0xAB;
+    }
+    std::vector<Property> properties() override { return {}; }
+    struct Rec {
+        uint16_t addr;
+        uint8_t  lo, hi;
+        bool     wide;
+    };
+    std::vector<Rec> log;
+};
+
 // Pulls pINT (pin 73) or NMI* (pin 12) on request.
 struct WireBoard : Board {
     std::string type() const override { return "test-wires"; }
@@ -367,10 +394,31 @@ void test_pascal100() {
         CHECK(spy->addrs.size() == 2 && spy->addrs[1] == 0x5555,
               "a read also has port 55 on both address halves");
         CHECK(me.readWord(0xFE55) == 0x5A5A && spy->addrs.size() == 3,
-              "FE55: no SIXTN on I/O, so one byte, the same cycle");
+              "FE55: no SIXTN from this board, so one byte, the same cycle");
         g.scp(0xC0);
         CHECK(me.readWord(0xFF55) == 0x5A5A, "the Map does not apply to the I/O window");
         CHECK(g.peek(0x1FEAA) == 0x00, "and no memory cycle went to byte 1FEAA");
+    }
+
+    SECTION("pascal100 -- MicroEngine I/O: FEpp to a board that answers SIXTN (ch. II E.2, IX)");
+    {
+        P100Rig g;
+        auto* spy = adopt<Port16Spy>(g.m, "spy16");
+        WordPort& me = g.card->mePort();
+        me.writeWord(0xFE64, 0x1234);
+        CHECK(spy->log.size() == 1 && spy->log[0].wide && spy->log[0].addr == 0x6464 &&
+                  spy->log[0].lo == 0x34 && spy->log[0].hi == 0x12,
+              "FE64: one 16-bit cycle, the low byte at the even port, the port on both halves");
+        CHECK(me.readWord(0xFE64) == 0xABCD && spy->log.size() == 2 && spy->log[1].wide,
+              "a read: one 16-bit cycle, the even byte is the low half");
+        CHECK(me.readWord(0xFF64) == 0x7777 && spy->log.size() == 3 && !spy->log[2].wide,
+              "FF64 is still one 8-bit cycle");
+        CHECK(me.readWord(0xFE65) == 0x7777 && spy->log.size() == 4 && !spy->log[3].wide &&
+                  spy->log[3].addr == 0x6565,
+              "FE65: an odd port gets no SIXTN, so one 8-bit cycle");
+        me.writeWord(0xFF64, 0x5678);
+        CHECK(spy->log.size() == 5 && !spy->log[4].wide && spy->log[4].lo == 0x78,
+              "FF64 write: one byte, the low half");
     }
 
     SECTION("pascal100 -- the MicroEngine gives control back by writing word FFD0");

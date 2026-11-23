@@ -207,13 +207,19 @@ struct BusMemory {
     template <typename IntT> IntT read(uint32_t address) { return read2<IntT>(address, address); }
 };
 
-// I/O: a 16-bit port on A0-A15; a word is two byte cycles, port then port+1. The 8088 always
-// does this. The 8086 and 80286 ask for 16 bits at an even port, and the CPU 86/87 and CPU
-// 286 run the same two byte cycles when no board answers SIXTN*; no I/O board in pascal100
-// does, so the bus has no 16-bit I/O cycle (docs/boards/compupro-cpu8687.md).
+// I/O: a 16-bit port on A0-A15. The 8088 always moves a word as two byte cycles, port then
+// port+1. The 8086 and 80286 ask for 16 bits at an even port (sXTRQ*, Bus::ioRead16): a board
+// that answers SIXTN* moves both bytes in one cycle, the even port's byte low. With no SIXTN*
+// the CPU 86/87 and CPU 286 run the same two byte cycles, the even port first -- as for
+// memory (oneCycle above) -- and that costs the second cycle (docs/boards/compupro-cpu8687.md).
 struct BusIo {
     Wire& w;
     template <typename IntT> void out(uint16_t port, IntT value) {
+        if constexpr (sizeof(IntT) >= 2) {
+            if (w.wide && (port & 1) == 0 &&
+                w.bus->ioWrite16(port, uint8_t(value), uint8_t(value >> 8), kStOut))
+                return;
+        }
         w.bus->ioWrite(port, uint8_t(value), kStOut);
         if constexpr (sizeof(IntT) >= 2) {
             ++w.words;
@@ -221,6 +227,12 @@ struct BusIo {
         }
     }
     template <typename IntT> IntT in(uint16_t port) {
+        if constexpr (sizeof(IntT) >= 2) {
+            if (w.wide && (port & 1) == 0) {
+                const Transfer16 t = w.bus->ioRead16(port, kStIn);
+                if (t.sixtn) return IntT(t.even | (t.odd << 8));
+            }
+        }
         IntT v = w.bus->ioRead(port, kStIn);
         if constexpr (sizeof(IntT) >= 2) {
             ++w.words;

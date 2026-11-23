@@ -44,6 +44,7 @@ make your own.
 |---|---|
 | `examples/cpm22/cpm22.toml` | CompuPro CP/M 2.2K: Z80, Interfacer 1, Disk 1, host bridge, 64K, in a VT100 window. |
 | `examples/cpm86/cpm86.toml` | CompuPro CP/M-86 1.1 on the CPU 86/87, in a window. |
+| `examples/cadzilla86/cadzilla86.toml` | CompuPro CP/M-86 1.1 on the CPU 86/87 with a CADzilla graphics board, set for 16-bit I/O. |
 | `examples/cpm8-16/cpm816.toml` | CompuPro CP/M 8-16 1.1PD from a Quantum Q540 hard disk on a Disk 3: 8086 programs on the 8088, 8080 programs on the 8085. |
 | `examples/mpm8-16/mpm816.toml` | CompuPro MP/M 8-16 2.1F from a Fujitsu M20 hard disk: three users in three windows. |
 | `examples/cdos8-16/cdos816.toml` | CompuPro Concurrent DOS 8-16 4.1 on the CPU 286 from a Q540 hard disk: the PC Video and three terminals, PC Mode, the SPUZ, three printers. |

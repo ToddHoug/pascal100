@@ -126,6 +126,7 @@ examples/**
 # CompuPro 8-16 systems on the CPU 8085/88. DRI and CompuPro files only, not MIT: each
 # example's README says so, and says what was removed from the original master.
 !examples/cpm86/cpm86-11.dsk
+!examples/cadzilla86/cpm86-11.dsk
 !examples/mpm8-16/mpm816-boot.dsk
 !examples/mpm8-16/m20.dsk
 !examples/cpm8-16/cpm816pd-boot.dsk

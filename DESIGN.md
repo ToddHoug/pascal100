@@ -609,8 +609,10 @@ None of this bars a board that *happens* to be a later S-100 design from being m
 >
 > **Built:** `BusCycle.ext/xtrq/dataHi`; the physical paths (`memReadX`/`memWriteX`/`peekX`)
 > with segment tables built only for a board that says `decodesExtended()`; the 16-bit
-> transfer (`memRead16`/`memWrite16`, the master's byte-serial helpers); the
-> `AddressTranslator` hook (the Pascal-100's Map); 24-bit DMA (Disk 1, Disk 1A); the `memory`
+> transfer (`memRead16`/`memWrite16`, the master's byte-serial helpers), and the same transfer
+> on an I/O cycle (`ioRead16`/`ioWrite16`, 2026-11-22: "a 16-bit request is possible on every
+> data cycle", 2.6), which the MicroEngine's `FEpp` and the 8086/80286 word `IN`/`OUT` ask for and
+> the CADzilla answers at its ACRTC data port; the `AddressTranslator` hook (the Pascal-100's Map); 24-bit DMA (Disk 1, Disk 1A); the `memory`
 > board with `ext = true`, one board of any size up to 16M (2026-11-12). The monitor, debugger
 > and MCP tools show physical addresses (six digits) for the commands that need no processor,
 > and the processor's 16-bit addresses for the rest.

@@ -22,6 +22,7 @@ Read these too:
 | Memory address | A0-A23: 256 segments of 64K |
 | I/O address | A0-A15. The processor drives A8-A15. Boards decode A0-A7. |
 | Memory transfer | 8 bits, or 16 bits when the slave answers SIXTN\* |
+| I/O transfer | 8 bits, or 16 bits at an even port when the slave answers SIXTN\* |
 | `Bus::addrMask()` | `0xFFFFFF` |
 
 `BusCycle` carries the IEEE 696 parts in three fields:
@@ -69,6 +70,11 @@ Override three functions:
 The bus calls them only for an even address. The `memory` board's
 `sixteen_bit` property is the example.
 
+The bus asks the same three functions about an I/O cycle (`c.type` is `IoRead` or `IoWrite`,
+and `c.addr` is an even port). A memory board never decodes an I/O cycle, so it is never asked.
+A board that decodes both memory and I/O checks `c.type` in `answersSixtn()`. The `cadzilla`
+board, which answers at its ACRTC data port only, is the I/O example.
+
 ## The registry-wide test
 
 The `every board type` section of `tests/test_ieee696.cpp` adds every registry type to a machine.
@@ -98,6 +104,12 @@ functions run no cycle. `memRead16` returns `sixtn == false`, and `memWrite16` r
 The master then moves the two bytes itself. The standard does not give the order of the two
 bytes, so the master chooses it: `byteSerialRead16(phys, evenFirst)` and
 `byteSerialWrite16(phys, even, odd, evenFirst)` do the two byte cycles in that order.
+
+For I/O, call `ioRead16(addr)` or `ioWrite16(addr, even, odd)`. `addr` is A0-A15, as for
+`ioRead`, and it goes through the address translator's `ioAddress()`. An odd port, a port that
+the translator owns (`ownsIo`), or no SIXTN\* runs no cycle, as for memory. The master then
+does its own byte cycles: the 8086 and 80286 do two (port, then port + 1), and the MicroEngine
+does one, as its manual says.
 
 ## An address translator
 

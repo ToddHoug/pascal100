@@ -159,8 +159,9 @@ uint32_t Pascal100Board::meByteToPhys(uint32_t b) const {
 
 // Words FE00-FFFF are I/O (ch. II E.2), decoded on the logical address, before the Map.
 // FFpp is an 8-bit cycle to port pp, the port on both address halves. FEpp asks for 16
-// bits; with no SIXTN "a single byte is transferred ... otherwise identical" -- and no
-// board in this simulator answers SIXTN on an I/O cycle, so it is the same 8-bit cycle.
+// bits (sXTRQ*, Bus::ioRead16): a board that answers SIXTN moves the word in one cycle,
+// the low byte at the even port pp (ch. IX: low-order-even). With no SIXTN "a single byte
+// is transferred ... otherwise identical" (ch. II E.2) -- the same 8-bit cycle as FFpp.
 // A single-byte read strobes both data latches U128 and U140 (ch. IV I.1, the table), so
 // the byte is in both halves of the word. Read from that table; not yet checked on a
 // real board.
@@ -169,9 +170,14 @@ uint16_t Pascal100Board::MeSide::readWord(uint16_t w) {
     if (!bus) return 0xFFFF;
     if (w >= 0xFE00) {
         uint8_t pp = (uint8_t)w;
+        const uint16_t addr = (uint16_t)((pp << 8) | pp);
         card->meIo_ = true;
         ClearOnExit io{card->meIo_};
-        uint8_t v = bus->ioRead((uint16_t)((pp << 8) | pp), StInp | StWo);
+        if (w < 0xFF00) {
+            Transfer16 t = bus->ioRead16(addr, StInp | StWo);
+            if (t.sixtn) return (uint16_t)(t.even | (t.odd << 8));
+        }
+        uint8_t v = bus->ioRead(addr, StInp | StWo);
         return (uint16_t)((v << 8) | v);
     }
     uint32_t phys = card->meByteToPhys((uint32_t)w * 2);
@@ -185,9 +191,11 @@ void Pascal100Board::MeSide::writeWord(uint16_t w, uint16_t v) {
     if (!bus) return;
     if (w >= 0xFE00) {
         uint8_t pp = (uint8_t)w;
+        const uint16_t addr = (uint16_t)((pp << 8) | pp);
         card->meIo_ = true;
         ClearOnExit io{card->meIo_};
-        bus->ioWrite((uint16_t)((pp << 8) | pp), (uint8_t)v, StOut);  // the low half (U127)
+        if (w < 0xFF00 && bus->ioWrite16(addr, (uint8_t)v, (uint8_t)(v >> 8), StOut)) return;
+        bus->ioWrite(addr, (uint8_t)v, StOut);  // the low half (U127)
         return;
     }
     uint32_t phys = card->meByteToPhys((uint32_t)w * 2);

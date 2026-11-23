@@ -13,6 +13,7 @@ cheatsheet.md            the same reference as plain text, for an AI assistant t
 LICENSE                  the MIT license of pascal100.
 LICENSE-SDL3             the license of SDL3, which is built into the program.
 LICENSE-CLK              the license of the 8088 code from Clock Signal, which is built into the program.
+LICENSE-MAME-HD63484     the notice for the source of the HD63484 model's structure (MAME).
 examples/                machines that boot, with their media.
 hostbridge/              the file-transfer utilities: source, HEX and COM.
 tools/                   scripts that show a mirror, and scripts that open LBR files.
@@ -37,6 +38,9 @@ a fault from that prompt. Each document tells you at the top where to start.
 to open the terminal window. SDL3 is built into the program, so its license is in the package
 as `LICENSE-SDL3`. The 8088 uses the x86 code of **Clock Signal** (CLK) by Thomas Harte. That
 code is also built into the program, so its license is in the package as `LICENSE-CLK`.
+`LICENSE-MAME-HD63484` is in the package for a similar reason. The model of the HD63484 video
+controller (on the CADzilla board) uses the structure of the MAME model, and the MAME license
+tells you to keep its notice with that code.
 
 The **Developer Guide** is not in the package. It is with the source, at the address in
 [What is not in the package: the source](#what-is-not-in-the-package-the-source). You need it

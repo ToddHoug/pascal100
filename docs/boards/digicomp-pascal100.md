@@ -107,8 +107,10 @@ The Map Output Port is at `port+1`. Both are decoded on A0-A7 only.
   and byte 2w+1 (high half). The board asks for one 16-bit cycle (SIXTN). If no board answers, it
   does two byte cycles, even byte first (ch. IV E). Words `FE00`-`FFFF` are I/O and the Map does
   not apply to them. Word `FFpp` is an 8-bit cycle to port pp, with pp on both address halves.
-  Word `FEpp` asks for 16 bits. No board here answers SIXTN on an I/O cycle, so `FEpp` is the
-  same 8-bit cycle. A read puts the byte in both halves of the word.
+  Word `FEpp` asks for 16 bits on port pp (`Bus::ioRead16`). If the board answers SIXTN (the
+  CADzilla at its ACRTC data port does), one cycle moves the word: the low byte at port pp, the
+  high byte at pp+1. If not, `FEpp` is the same 8-bit cycle as `FFpp`. An 8-bit read puts the
+  byte in both halves of the word.
 - **Interrupts** (ch. II F, ch. IV O). pINT goes to the Z80's IRQ and NMI to the Z80's NMI. An
   NMI always resets U208B. A pINT resets it when auto-transfer is on. Both are levels: while
   one is up, the MicroEngine cannot keep control. `C4` then `44` sets a request that the board

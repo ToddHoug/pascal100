@@ -62,6 +62,7 @@
 
 DIR  examples/cpm22      <=  examples/cpm22
 DIR  examples/cpm86      <=  examples/cpm86
+DIR  examples/cadzilla86 <=  examples/cadzilla86
 DIR  examples/cpm8-16    <=  examples/cpm8-16
 DIR  examples/mpm8-16    <=  examples/mpm8-16
 DIR  examples/cdos8-16   <=  examples/cdos8-16
@@ -161,6 +162,7 @@ FILE  cheatsheet.md        <=  docs/manual/ref/cheatsheet.md
 FILE  LICENSE              <=  LICENSE
 FILE  LICENSE-SDL3         <=  LICENSE-SDL3
 FILE  LICENSE-CLK          <=  third_party/clk/LICENCE
+FILE  LICENSE-MAME-HD63484 <=  LICENSE-MAME-HD63484
 
 # The cheatsheet ALSO ships as a rendered PDF, pascal100-cheatsheet.pdf -- the same content a
 # person can open in a file manager. It is NOT a FILE line: like pascal100-manual.pdf and
@@ -177,6 +179,10 @@ FILE  LICENSE-CLK          <=  third_party/clk/LICENCE
 # LICENSE-CLK is the MIT licence of Clock Signal (CLK, Thomas Harte). pascal100's 8088 is CLK's
 # x86 instruction set, compiled into the binary (third_party/clk), so its notice ships for the
 # same reason as SDL3's.
+
+# LICENSE-MAME-HD63484 is the BSD-3 notice of MAME's hd63484.cpp, the structural basis of the
+# CADzilla board's HD63484 model (src/chips/hd63484.{h,cpp}, docs/sources.md). The licence
+# requires the notice to go with the code, and the code is compiled into the binary.
 
 # ---------------------------------------------------------------------------
 # TOKENS -- a machine/media reference, no longer written into prose.

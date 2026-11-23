@@ -267,6 +267,25 @@ execute_process(
 expect_contains("${out}" "the cpm86 example did not boot CP/M-86 as its README says"
                 "CP/M 86 1.1PAA" "Total Memory: 1 MEGABYTE" "DDT86    CMD")
 
+# cadzilla86: the cpm86 machine with a CADzilla at 70 in 16-bit mode. It boots the same CP/M-86,
+# and the board is there with the ACRTC in 16-bit MPU mode (`acrtc_bus` 16 after the reset).
+example_816(cadzilla86 cadzilla86-console.toml cadzilla86.toml "cadzilla")
+mcp_session("${dist}/cadzilla86.jsonl"
+  [=[{"name":"run","arguments":{"from":1048560,"until":"A>","timeout_ms":60000}}]=]
+  [=[{"name":"run","arguments":{"input":"DIR\r","until":"A>","timeout_ms":20000}}]=]
+  [=[{"name":"monitor","arguments":{"command":"SHOW cad0"}}]=])
+execute_process(
+  COMMAND           "${SIM}" cadzilla86-console.toml --mcp
+  WORKING_DIRECTORY "${dist}/examples/cadzilla86"
+  INPUT_FILE        "${dist}/cadzilla86.jsonl"
+  OUTPUT_VARIABLE   out
+  ERROR_VARIABLE    out
+  TIMEOUT           120
+)
+expect_contains("${out}" "the cadzilla86 example did not boot CP/M-86 as its README says"
+                "CP/M 86 1.1PAA" "Total Memory: 1 MEGABYTE" "DDT86    CMD"
+                "host_bus         16" "acrtc_bus        16")
+
 # CP/M 8-16 1.1PD from the Q540: the Disk 3 BIOS finds the board, and A: is the hard disk.
 example_816(cpm8-16 cpm816-console.toml cpm816.toml "disk3")
 mcp_session("${dist}/cpm816d3.jsonl"

@@ -297,11 +297,19 @@ std::string Debugger::formatCycle(const CycleRec& r, const std::vector<std::stri
     {
         // The address is A0-A23 (6 digits) and an I/O address is A0-A15 (4 digits, the
         // high byte is what the CPU drove on A8-A15). The data column is 5 wide: one
-        // byte, or for a 16-bit transfer the even byte then the odd byte (type MR16/MW16).
+        // byte, or for a 16-bit transfer the even byte then the odd byte (type MR16/MW16, or
+        // IR16/IW16 for an I/O cycle: the even port, then the odd port).
         char data[8];
         if (r.xtrq) std::snprintf(data, sizeof data, "%02X %02X", r.data, r.dataHi);
         else        std::snprintf(data, sizeof data, "%02X   ", r.data);
-        if (r.xtrq) what = r.type == Cycle::MemRead ? "MR16" : "MW16";
+        if (r.xtrq) {
+            switch (r.type) {
+            case Cycle::MemRead:  what = "MR16"; break;
+            case Cycle::MemWrite: what = "MW16"; break;
+            case Cycle::IoRead:   what = "IR16"; break;
+            default:              what = "IW16"; break;
+            }
+        }
         if (none)
             std::snprintf(buf, sizeof buf, "%10llu  %-4s        = %s", (unsigned long long)r.t,
                           what, data);
@@ -412,8 +420,8 @@ void Debugger::matchCycleBreak(const BusCycle& c) {
         const bool io16 = io && b.hi > 0xFF;
         uint32_t a = io16 ? c.addr : io ? c.port() : c.phys();  // memory: A0-A23
         // A 16-bit transfer (IEEE 696 sXTRQ*) moves the even byte AND the odd byte in one
-        // cycle, so it matches a breakpoint on either address.
-        const uint32_t aEnd = (!io && c.xtrq) ? a + 1 : a;
+        // cycle, so it matches a breakpoint on either address -- or on either port.
+        const uint32_t aEnd = c.xtrq ? a + 1 : a;
         if (aEnd < b.lo || a > b.hi) continue;
 
         // A CONDITIONAL cycle breakpoint (BREAK ... IF|LOADS) cannot be decided here: this

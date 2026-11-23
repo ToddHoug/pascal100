@@ -186,6 +186,13 @@ The boards are in groups, in the same order as the sections below.
 |---|---|
 | `ss1` | CompuPro System Support 1: a real-time clock, a serial channel, an interval timer, two interrupt controllers and a math socket |
 
+**Video**
+
+| Type | What it is |
+|---|---|
+| `pcvideo` | CompuPro PC Video: a color or monochrome display with a PC keyboard port, at the addresses of the IBM Color Graphics Adapter |
+| `cadzilla` | CADzilla: an HD63484 ACRTC graphics board with a Bt453 color table. 8-bit or 16-bit I/O. Needs a display |
+
 **Host integration**
 
 | Type | What it is |
@@ -1163,6 +1170,121 @@ over the window. The pen sees only lit dots.
 
 **The character generator** is `builtin:pcvideo`, a public-domain font in the layout of the
 board's PROM. To use a dump of a real PROM, give its file in `font`.
+
+### `cadzilla`: an HD63484 ACRTC graphics board
+
+This board is **a new custom product based on period components**, not a period product. It
+uses two real chips from the middle of the 1980s. The **Hitachi HD63484 ACRTC** is a CRT
+controller with a *drawing processor* and up to 2 MB of its own frame memory. The **Brooktree
+Bt453** is a RAMDAC: a color table of 256 entries, with three video DACs on one chip.
+
+The PC Video shows a picture from RAM that the processor addresses. The CADzilla board keeps
+its picture in its own memory, and the processor never addresses a pixel. The guest **draws
+with commands**, for example "move here", "draw a line to there" and "clear this block". The
+guest writes each command into the FIFO of the ACRTC, one word at a time, and the chip draws.
+
+The board decodes one block of 8 I/O ports from `port` (default `70`):
+
+| Port | What it is |
+|---|---|
+| `port` | The ACRTC address register (write) and status register (read). Always 8 bits. |
+| `port+1` | The board's own MODE register, write only. It holds the sync polarity, the access mode of the board's fetch logic, and the two overlay bits `OLEN` (bit 3) and `OLSEL` (bit 4). A bus reset sets it to 0. |
+| `port+2` | The ACRTC control register that the address names, or the FIFOs. In 8-bit mode, it moves one byte at a time. The high byte is at an even address, and the low byte is at the odd address. In 16-bit mode, it moves one word in one 16-bit transfer. |
+| `port+3` | The high byte of a 16-bit transfer at `port+2`. An 8-bit transfer here is not decoded. |
+| `port+4` to `port+7` | The Bt453: the address register, the color table (red, green, then blue), the address again, and the overlay colors. |
+
+The timing and display registers of the ACRTC increment the address after each access. For
+this reason, one address write loads a whole block of these registers.
+
+**8-bit and 16-bit transfers.** The board answers a 16-bit I/O transfer at `port+2`, and at no
+other port. The `host_bus` strap (switch 6 of SW1) sets the data width of the ACRTC:
+
+- `host_bus = 8` (the default). The ACRTC moves one byte for each access. Use it with a Z80,
+  which makes only 8-bit transfers. A 16-bit transfer still gets one cycle, but the ACRTC takes
+  only the low byte. The high byte of a write is lost, and the high byte of a read is `FF`.
+- `host_bus = 16`. The ACRTC moves one 16-bit word for each access: a whole register, or a whole
+  FIFO word. Use it with the MicroEngine of the Pascal-100 (word `FEpp`, with `pp` = `port+2`) or
+  with the 8086 or 80286 (`OUT DX,AX` and `IN AX,DX`, with `DX` = `port+2`). The low byte is at
+  `port+2`, and the high byte is at `port+3`. The ACRTC does not accept 8-bit transfers in this
+  mode. An 8-bit write to `port+2` puts `FF` in the high byte of the register.
+
+The ACRTC reads `host_bus` only during a reset. After `SET <id> host_bus=16`, do a reset. Until
+then, the `wiring` line tells you that the mode has not changed. The live value `acrtc_bus`
+shows the mode that the ACRTC uses now.
+
+The `io_decode` strap (switch 7 of SW1) sets the address that the board decodes. With `8` (the
+default), the board decodes A0-A7. With `16`, A8-A15 must also be `00`. The Pascal-100 puts the
+port number on A8-A15 as well. For this reason, with `io_decode = 16`, the Pascal-100 reaches
+the board only when `port` is `00`.
+
+The ACRTC sends out an 8-bit value for each pixel. The Bt453 changes that value into a color from
+its table. A guest sets its colors when it loads the table. A new table changes the colors of the
+picture with no redraw.
+
+**The monitor is part of the board.** The `mode` property sets a fixed-frequency VESA display:
+`640x480`, `800x600` or `1024x768` (the default). Set it in the machine file or with `SET`. The
+window always has the size of the mode, as the frame of a real monitor does. The timing
+registers of the ACRTC set where the picture is in that frame. A picture that starts where the
+back porch of the mode ends fills the frame. A picture that starts one cycle early or late moves,
+and its edge is cut off.
+
+The shift register of the board is wired for **8 bits per pixel and 8 words for each fetch**. A
+guest must set the ACRTC to 8 bits per pixel and an address increment of +8. Each fetch reads 8
+words that start at a multiple of 8, so the board ignores the low 3 bits of a start address.
+`SHOW <id>` has a `wiring` line. The line shows `ok`, or it names the setting that is wrong.
+
+**The overlay** is a second picture of 1 bit for each pixel, in its own memory. Where an overlay
+bit is 1, the Bt453 shows its **overlay color 2** in place of the color from the table. The
+overlay shows only when the `OLEN` bit of the MODE register is 1. To draw the overlay, the guest
+uses an ACRTC screen with the CHR bit set in its memory width register. The board sends each
+drawing access to that screen to the overlay memory, not to the frame memory. The `OLSEL` bit
+of the MODE register selects which half of the overlay memory the guest draws. Do not enable
+that screen for display: the board then shows frame memory in its area, and the `wiring` line
+names the screen. To set overlay color 2, write `02` to `port+4`, then red, green and blue to
+`port+7`.
+
+**The board needs a display.** An SDL3 build opens a window with the board's id as its title. A
+build with no display runs in the same way and shows nothing. The frame memory is 2 MB, and you
+cannot change it.
+
+`SHOW <id>` gives these straps and live values:
+
+| Name | What it is |
+|---|---|
+| `port`, `mode`, `draw_rate`, `width` | Straps. You set them in the machine file or with `SET`. |
+| `host_bus` | A strap: `8` (the default) or `16`, the data width of the ACRTC. Switch 6 of SW1 on the real board. |
+| `io_decode` | A strap: `8` (the default) or `16`, the address that the board decodes. Switch 7 of SW1. |
+| `interrupt` | A strap. It sets the S-100 line for the IRQ\* output of the board: `none` (the default), `int`, or `vi0` to `vi7`. On the real board, it is switch 8 of SW1. |
+| `video` | Live. `on` when the ACRTC shows a picture. |
+| `picture` | Live. The size of the picture, and its position in the frame. |
+| `acrtc_bus` | Live. The data width that the ACRTC took at its last reset: `8` or `16`. |
+| `wiring` | Live. `ok`, or the ACRTC setting that does not agree with the board. |
+| `hspol`, `vspol`, `amode`, `olen`, `olsel` | Live. The bits of the MODE register. |
+| `status` | Live. The ACRTC status register. |
+| `irq` | Live. Whether the board asserts an interrupt now. |
+
+**The `draw_rate` strap sets the drawing speed.** With `full` (the default), the ACRTC completes
+each command immediately. The write FIFO is always empty, and the guest never waits for the
+chip. This is the fastest setting when you develop a program. With `real`, each command takes
+the time that the Hitachi data sheet gives for it. The ACRTC draws only in the memory cycles
+that the display does not use. These depend on the access mode and on the priority bit of the
+operation mode register. While the chip draws, the next command words stay in the write FIFO.
+The FIFO status bits and the command-end bit (CED) change at the times that the real chip
+changes them. Use `real` for a guest that is sensitive to time, for example a game:
+
+```
+SET cad0 draw_rate=real
+```
+
+The ACRTC clock comes from the pixel clock of the `mode`. It is the pixel clock divided by 8 in
+single access mode, or by 4 in interleaved access mode. The processor's `clock_hz` does not
+change the drawing time that the guest sees. At each `clock_hz`, a drawing command takes the
+same number of processor instructions. With `clock_hz = 0`, the host does not wait, and the
+guest sees no change.
+
+To add the board to a machine, type `BOARDS ADD cadzilla cad0`. The board does every drawing
+command of the ACRTC: lines, rectangles, circles, ellipses, arcs, area paint, patterns, and
+block and area copies.
 
 ## Host integration
 

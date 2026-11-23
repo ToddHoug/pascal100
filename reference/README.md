@@ -76,6 +76,14 @@ model wrong).
 | [AMD 9512](AMD%209512.md) | AMD **Am9512** floating-point processor (Intel **8232**): single and double precision add/subtract/multiply/divide in the proposed-IEEE format (E = 0 is zero; no denormals documented), **round to nearest even**, the 16 command codes, the status register (S Z D U V), END (active **high**), ERR and PAUSE̅-follows-CS̅, the cycle table and execution examples, measured times. ⚠ The data sheet's DSUB example has the wrong sign; ⚠ the result after overflow or underflow is undocumented. The second chip the [CompuPro System Support 1](CompuPro%20System%20Support%201.md) socket takes. |
 
 
+## Video / display
+
+| Reference | What it covers |
+|---|---|
+| [Hitachi HD63484 ACRTC](Hitachi%20HD63484%20ACRTC.md) | Hitachi **HD63484 Advanced CRT Controller**, the full 47-page datasheet: the two-location host interface (RS=0 address register / status register, RS=1 the 16-bit data path to the register AR selects), the status bits `CER ARD CED LPD RFF RFR WFR WFE`, the 16-byte (8-word) read and write FIFOs, the control registers (FIFO entry `r00`, CCR `r02`, OMR `r04`, DCR `r06`), the timing registers `r80–r9C` and display-control RAM `rC0–rEE` with measured bit-field boundaries, the drawing-parameter registers, the four logical screens over a 2 MB frame buffer at 1/2/4/8/16 bits per pixel, and the complete command table (Tables 3–7: register-access, data-transfer and graphic-drawing commands with opcodes and parameters). The chip behind `src/chips/hd63484.{h,cpp}` on the [CADzilla board](../docs/boards/cadzilla.md). |
+| [Hitachi HD63484 ACRTC User's Manual](Hitachi%20HD63484%20ACRTC%20User%27s%20Manual.md) | The **register and command semantics** the datasheet's layout leaves out: 8-bit MPU-mode byte sequencing, the FIFO/status-flag rules, field-by-field CCR/OMR/DCR meanings, timing and display-control RAM, the eight operation modes / four color modes / eight area modes, and a **worked example for every one of the 38 commands** (Section 6). Partial — stops at source page 308; the Electrical Specification section was not needed and was not transcribed. The primary source for the specific register values cited throughout `src/chips/hd63484.{h,cpp}` and `docs/boards/cadzilla.md`. |
+| [Brooktree Bt453 RAMDAC](Brooktree%20Bt453%20RAMDAC.md) | Brooktree **Bt453** 256 × 24 color-palette RAMDAC: the four MPU locations by `C1 C0` (`00`/`10` address register, `01` palette RAM, `11` overlay registers), the **hidden modulo-3 red/green/blue phase** (reset by an address *write*, not a read), increment-after-blue and the `$FF→$00` wrap, overlay addressing on ADDR1..0 only, the pixel/overlay truth table (OL≠0 overrides P0–P7), and the video-output levels. **No read-mask register** — that is the Bt458/471. The look-up table behind `src/chips/bt453.{h,cpp}` on the [CADzilla board](../docs/boards/cadzilla.md). |
+
 ## Floppy and disk
 
 | Reference | What it covers |

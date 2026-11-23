@@ -70,6 +70,7 @@ cheatsheet.md                         every monitor command on one page
 LICENSE                               ours (MIT)
 LICENSE-SDL3                          SDL3's zlib licence
 LICENSE-CLK                           Clock Signal's MIT licence (the 8088 code)
+LICENSE-MAME-HD63484                  MAME's BSD-3 notice (the HD63484 model's structure)
 hostbridge/                           file-transfer utilities: source, HEX, COM
 tools/                                the mirror-watch scripts, the LBR tools, and their README.pdf
 skills/pascal100/                     the MCP briefing as an Agent Skill
@@ -80,6 +81,8 @@ examples/...                          the shipped example machines, with their m
 The PDFs are built by CI and committed; no build machine makes them. `LICENSE-SDL3` is there
 because SDL3 is linked into the binary (§3.2): its code ships, so its licence does. `LICENSE-CLK`
 is there for the same reason: the 8088 is Clock Signal's x86 code (`third_party/clk`).
+`LICENSE-MAME-HD63484` is there because the CADzilla's HD63484 model has the structure of MAME's,
+and that BSD-3 licence asks for its notice to go with the code.
 
 **The contents change in `docs/package.map`, never in `tools/build-package.sh`.** A new shipped
 path must also be named in `docs/manual/package.md`; `docs-package` fails the build otherwise.

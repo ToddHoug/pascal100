@@ -10,6 +10,35 @@ register, the bit or the command that was wrong.
 
 ---
 
+## Unreleased
+
+**New: the CADzilla graphics board (`cadzilla`), with 16-bit I/O.** CADzilla is a new design built
+from two chips of the mid 1980s: the Hitachi **HD63484 ACRTC**, a CRT controller with a drawing
+processor and 2 MB of its own frame memory, and the Brooktree **Bt453** color table. It is the
+altairsim board, with its overlay, its three VESA monitor modes and `draw_rate = real`. It uses
+one block of 8 I/O ports (default `70`) and no memory. In pascal100 it also does what the real
+board does on a 16-bit bus: it answers SIXTN\* to a 16-bit I/O transfer at its ACRTC data port
+(`port+2`, with the high byte at `port+3`). The new `host_bus` strap (`8` or `16`, switch 6 of SW1)
+sets the data width that the ACRTC takes at reset. With `16`, one transfer moves a whole register
+word or FIFO word. The new `io_decode` strap (`8` or `16`, switch 7) makes the board decode
+A8-A15 as well. `SHOW <id>` has a new live line, `acrtc_bus`. `docs/boards/cadzilla.md`.
+
+**New: the `cadzilla86` example (`examples/cadzilla86`).** CompuPro CP/M-86 1.1 on the CPU 86/87,
+as in `cpm86`, with a CADzilla at `70` set for 16-bit I/O (`host_bus = 16`). Its window opens
+black at 1024x768. A program draws with word `OUT DX,AX` to port `72`. `cadzilla86-console.toml`
+puts the console on stdio.
+
+**New: 16-bit I/O transfers on the bus.** A board can now answer SIXTN\* to an I/O cycle, as to a
+memory cycle. The MicroEngine's word `FEpp` and a word `IN`/`OUT` of the 8086 and the 80286 at an
+even port ask for 16 bits. When the board answers, one cycle moves the word. When it does not,
+the processor does what it did before: one byte cycle (the MicroEngine) or two (the 8086 and
+80286). `TRACE` and `HISTORY BUS` show a 16-bit I/O transfer as `IR16` or `IW16`.
+
+**Snapshots are now format 10.** A format 10 snapshot holds the data width of the CADzilla's
+ACRTC. An older snapshot with a `cadzilla` board restores everything but that board.
+
+---
+
 ## 0.4.0
 
 **New: CompuPro Concurrent DOS 8-16 4.1 (`examples/cdos8-16`).** A complete multi-user

@@ -1,0 +1,99 @@
+# CompuPro CP/M-86 1.1 on the CPU 86/87 with a CADzilla, console on the terminal you start it in.
+#
+#     cd examples/cadzilla86 && pascal100 cadzilla86-console.toml
+#     -> "Total Memory: 1 MEGABYTE", then the A> prompt. On a build with SDL3 the CADzilla's
+#        window, cad0, opens black at 1024x768.
+#
+# THIS FILE IS THE WHOLE MACHINE. It is the same machine and the same disk as cadzilla86.toml.
+# Only the console is different: channel A of the Interfacer 1 stays on `console`, your stdio.
+# On a build with no window the CADzilla runs the same and shows nothing.
+#
+# HOW IT BOOTS. The 8086 starts at FFFF0. While the Disk 1 boots, its boot ROM answers every
+# memory read, so the 8086 runs the ROM's routine 0 (console on the Interfacer 1). The routine
+# reads the boot tracks, and the loader on them loads CPM.SYS and starts CP/M-86. The disk is
+# the CompuPro CP/M-86 1.1PAA master, disk 2 of 2, with R, W and HDIR added. CP/M-86 does not
+# know the CADzilla: a program drives it through its ports.
+
+[machine]
+name    = "cadzilla86-console"
+# The bus is IEEE 696 (S-100): the 8086 uses A0-A19, the Disk 1 DMA A0-A23.
+startup = ["RUN FFFF0"]   # the 8086 reset address; RUN 0 does not boot an 8086
+
+# THE CPU 86/87: an 8086 on a 16-bit bus; no 8087 (docs/boards/compupro-cpu8687.md).
+[[board]]
+type = "cpu8687"
+id   = "cpu"
+
+# THE CONSOLE: channel A of an Interfacer 1 at 00-01, on your stdio. Channel B is not connected.
+[[board]]
+type = "interfacer1"
+id   = "if1"
+
+  [board.unit.a]
+  connect = "console"
+
+# THE DISK 1 at C0, boot routine 0: the 8086 routine with the console on the Interfacer 1.
+[[board]]
+type    = "disk1"
+id      = "fd0"
+port    = C0
+routine = 0
+
+  [[board.drive]]
+  unit  = 0
+  mount = "cpm86-11.dsk"
+
+# THE SYSTEM SUPPORT 1 at 50-5F, for its clock (CLOCK.CMD; the time is the host's own). Its
+# serial port is not connected: the console is on the Interfacer 1.
+[[board]]
+type = "ss1"
+id   = "ss1"
+base = 50
+
+  [board.unit.serial]
+  connect = "null"
+
+# THE CADZILLA at 70-77 (docs/boards/cadzilla.md): an HD63484 ACRTC with 2 MB of its own frame
+# memory, and a Bt453 color table. 70 is the ACRTC address register (OUT) and status (IN), 71
+# the board's MODE register (OUT only), 72-73 the ACRTC data port, 74-77 the Bt453.
+#
+# `host_bus = "16"` (SW1-6 off): the ACRTC comes out of reset in 16-bit mode, so an 8086 word
+# OUT DX,AX or IN AX,DX with DX = 72 moves a whole register word or FIFO word in ONE 16-bit bus
+# cycle (the board answers SIXTN*; AL is the low byte, at 72). Write the address register at 70
+# with a byte OUT. In this mode an 8-bit OUT to 72 puts FF in the high byte of the register:
+# use word I/O there. The monitor's OUT is 8-bit, so for a recipe typed at the monitor, set
+# `host_bus = "8"` here instead.
+#
+# `io_decode = "8"` (SW1-7 off): the board decodes A0-A7 only. `interrupt = "none"` (SW1-8 off):
+# IRQ* is not connected. `draw_rate = "full"`: each drawing command is done at once; "real"
+# gives each one its HD63484 data-sheet time.
+[[board]]
+type      = "cadzilla"
+id        = "cad0"
+port      = 70
+mode      = "1024x768"
+host_bus  = "16"
+io_decode = "8"
+draw_rate = "full"
+interrupt = "none"
+
+# THE HOST BRIDGE at B0, for R, W and HDIR (R.CMD, W.CMD and HDIR.CMD on the disk). hostdir ""
+# = the folder you started pascal100 in.
+[[board]]
+type    = "hostbridge"
+id      = "hb0"
+port    = B0
+hostdir = ""
+
+# 1 MB of RAM at 00000-FFFFF. `ext = true`: the board decodes A16-A23, as the 8088 needs.
+[[board]]
+type           = "memory"
+id             = "mem0"
+ext            = true
+fill           = "zero"
+honors_phantom = "read"
+
+  [[board.region]]
+  type = "ram"
+  at   = 000000
+  size = "1M"

@@ -277,7 +277,9 @@ constexpr char     kMagic[8]     = {'A', 'L', 'T', 'R', 'S', 'N', 'P', '1'};
 // 7: every UART keeps two transmit deadlines, the holding and the shift register (#899).
 // 8: the `ss1` 2651 keeps the TxEN state of its transmitter: a byte held, a byte sent (#908).
 // 9: the `cpu286` 80286 keeps its MSW, IDTR, GDTR, queue refill and shutdown.
-constexpr uint32_t kFormatVersion = 9;
+// 10: the `cadzilla` board is back: its ACRTC keeps the Pr06/Pr0C/Pr0D bits that RPR reads
+//     back, and its host bus width (the DACK* strap and the mode latched at reset).
+constexpr uint32_t kFormatVersion = 10;
 
 // The format in which each board's state last changed in a way that a length check cannot
 // see. RESTORE does not trust such a board's section in an older file; the board starts at
@@ -288,7 +290,7 @@ uint32_t stateSince(const std::string& type) {
     static const struct {
         const char* type;
         uint32_t    since;
-    } kRows[] = {{"acr", 2}, {"sol", 2}, {"sbc", 3}, {"ss1", 8}, {"cadzilla", 5}, {"z80", 6},
+    } kRows[] = {{"acr", 2}, {"sol", 2}, {"sbc", 3}, {"ss1", 8}, {"cadzilla", 10}, {"z80", 6},
                  {"cpu286", 9}};
     for (const auto& row : kRows)
         if (type == row.type) return row.since;
